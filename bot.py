@@ -9,6 +9,7 @@ import shutil
 import tempfile
 import json
 import traceback
+import urllib.request
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -41,13 +42,48 @@ AUTO_DOWNLOAD_DOMAINS = (
     "instagram.com",
     "youtube.com",
     "youtu.be",
+    "arazu.io",
 )
 
 BLACKLISTED_DOMAINS = (
     "kkinstagram.com",
 )
 
-URL_RE = re.compile(r"https?://[^\s]+")
+URL_RE    = re.compile(r"https?://[^\s]+")
+# Matches a reddit link anywhere in HTML: href="https://[old.]reddit.com/r/.../comments/..."
+REDDIT_RE = re.compile(r'href="(https?://(?:old\.)?reddit\.com/r/[^/]+/comments/[^"]+)"')
+
+
+async def resolve_arazu(url: str) -> str:
+    """
+    Fetch an arazu.io page and extract the embedded Reddit URL from it.
+    Returns the Reddit URL if found, otherwise returns the original url.
+    """
+    if "arazu.io" not in url:
+        return url
+    try:
+        print(f"[arazu] Resolving: {url}")
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; CoveBot/1.0)"},
+        )
+        loop = asyncio.get_event_loop()
+        # Run the blocking HTTP request in a thread so we don't block the event loop
+        html = await loop.run_in_executor(
+            None,
+            lambda: urllib.request.urlopen(req, timeout=10).read().decode(errors="replace"),
+        )
+        match = REDDIT_RE.search(html)
+        if match:
+            reddit_url = match.group(1)
+            # Normalise old.reddit.com → reddit.com so yt-dlp is happy
+            reddit_url = reddit_url.replace("old.reddit.com", "www.reddit.com")
+            print(f"[arazu] Resolved to: {reddit_url}")
+            return reddit_url
+        print("[arazu] Could not find Reddit link in page.")
+    except Exception as e:
+        print(f"[arazu] Fetch error: {e}")
+    return url
 
 
 def extract_supported_url(content: str) -> str | None:
@@ -88,10 +124,6 @@ async def run_subprocess(cmd: list) -> tuple:
 
 
 async def get_video_info(url: str) -> dict | None:
-    """
-    Fetch video metadata (duration, title) without downloading.
-    Returns None if info can't be retrieved.
-    """
     cmd = [
         "yt-dlp",
         "--no-download",
@@ -168,7 +200,11 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
 
     log.append(f"[INFO] Boost tier: {guild.premium_tier if guild else 0} — limit: {target_mb}MB")
 
-    # ── Pre-flight duration check ────────────────────────────────────
+    # ── Resolve arazu.io links to their real Reddit URL ───────────────
+    url = await resolve_arazu(url)
+    log.append(f"[INFO] URL: {url}")
+
+    # ── Pre-flight duration check ─────────────────────────────────
     print(f"[cove] Fetching metadata for: {url}")
     info = await get_video_info(url)
     if info:

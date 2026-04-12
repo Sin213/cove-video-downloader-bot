@@ -385,7 +385,8 @@ class CoveBot(discord.Client):
                 name=f"{message.author.display_name} posted:",
                 icon_url=message.author.display_avatar.url
             )
-            await message.channel.send(embed=embed, file=discord.File(filepath))
+            await message.channel.send(embed=embed)
+            await message.channel.send(file=discord.File(filepath))
             await message.delete()
 
         async def on_too_big(duration_str: str):

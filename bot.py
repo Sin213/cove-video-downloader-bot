@@ -18,10 +18,22 @@ GUILD_ID = int(os.getenv("GUILD_ID", "0"))
 # Cookies file for yt-dlp (export from browser via "Get cookies.txt LOCALLY")
 COOKIES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
 
-# Target just under Discord's 10MB free tier limit
-TARGET_MB   = 9.5
-TARGET_SIZE = int(TARGET_MB * 1024 * 1024)
-AUDIO_KBPS  = 128  # reserved for audio track
+AUDIO_KBPS = 128  # reserved for audio track
+
+# Discord upload limits by guild boost tier (leave headroom below hard cap)
+BOOST_TIER_LIMITS_MB = {
+    0: 9.5,   # No boosts    — 10 MB hard cap
+    1: 9.5,   # Tier 1       — 10 MB hard cap
+    2: 49.0,  # Tier 2       — 50 MB hard cap
+    3: 99.0,  # Tier 3       — 100 MB hard cap
+}
+
+
+def get_target_mb(guild: discord.Guild | None) -> float:
+    """Return the safe upload target in MB for the given guild's boost tier."""
+    if guild is None:
+        return BOOST_TIER_LIMITS_MB[0]
+    return BOOST_TIER_LIMITS_MB.get(guild.premium_tier, 9.5)
 
 
 def clean_env():
@@ -59,9 +71,9 @@ async def get_duration(filepath: str, env: dict) -> float:
         return None
 
 
-async def compress_to_target(src: str, dest: str, env: dict) -> tuple:
+async def compress_to_target(src: str, dest: str, env: dict, target_mb: float) -> tuple:
     """
-    Encode src to dest targeting just under 10MB using ffmpeg.
+    Encode src to dest targeting just under the guild's upload limit using ffmpeg.
     Calculates exact video bitrate from duration so the result is
     always uploadable to Discord regardless of original quality.
     """
@@ -69,13 +81,15 @@ async def compress_to_target(src: str, dest: str, env: dict) -> tuple:
     if not duration or duration <= 0:
         return False, "Could not read video duration."
 
-    # Total budget in kilobits, minus audio
-    total_kbits  = TARGET_MB * 8 * 1024
-    audio_kbits  = AUDIO_KBPS * duration
-    video_kbits  = total_kbits - audio_kbits
-    video_kbps   = max(100, int(video_kbits / duration))  # floor at 100kbps
+    target_size = int(target_mb * 1024 * 1024)
 
-    print(f"[ffmpeg] Duration: {duration:.1f}s | Video bitrate: {video_kbps}kbps | Audio: {AUDIO_KBPS}kbps")
+    # Total budget in kilobits, minus audio
+    total_kbits = target_mb * 8 * 1024
+    audio_kbits = AUDIO_KBPS * duration
+    video_kbits = total_kbits - audio_kbits
+    video_kbps  = max(100, int(video_kbits / duration))  # floor at 100kbps
+
+    print(f"[ffmpeg] Target: {target_mb}MB | Duration: {duration:.1f}s | Video bitrate: {video_kbps}kbps | Audio: {AUDIO_KBPS}kbps")
 
     cmd = [
         "ffmpeg", "-y",
@@ -86,7 +100,7 @@ async def compress_to_target(src: str, dest: str, env: dict) -> tuple:
         "-an",
         "-f", "null", "/dev/null",
     ]
-    code, out = await run_subprocess(cmd, env)
+    await run_subprocess(cmd, env)
 
     cmd2 = [
         "ffmpeg", "-y",
@@ -116,9 +130,13 @@ async def compress_to_target(src: str, dest: str, env: dict) -> tuple:
     return True, f"{final_mb:.2f} MB"
 
 
-async def download_and_compress(url: str) -> tuple:
+async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
     env = clean_env()
     log = []
+    target_mb = get_target_mb(guild)
+    target_size = int(target_mb * 1024 * 1024)
+
+    log.append(f"[INFO] Guild boost tier: {guild.premium_tier if guild else 0} — upload limit: {target_mb}MB")
 
     with tempfile.TemporaryDirectory(prefix="cove_") as tmp:
         output_template = str(Path(tmp) / "%(title)s.%(ext)s")
@@ -144,7 +162,6 @@ async def download_and_compress(url: str) -> tuple:
         log.append(out.strip())
 
         if code != 0:
-            # Friendly message for YouTube bot detection
             if "Sign in to confirm" in out or "bot" in out.lower():
                 log.append("[ERROR] YouTube bot detection triggered. YouTube downloads from this server are currently blocked.")
             return None, "\n".join(log)
@@ -158,10 +175,17 @@ async def download_and_compress(url: str) -> tuple:
         orig_mb = os.path.getsize(src) / (1024 * 1024)
         log.append(f"[INFO] Downloaded: {orig_mb:.1f} MB")
 
-        # ── Compress to target size ──────────────────────────────────
+        # ── Skip compression if already within limit ──────────────────
+        if os.path.getsize(src) <= target_size:
+            log.append(f"[INFO] File is under {target_mb}MB — skipping compression.")
+            dest = tempfile.mktemp(suffix=".mp4", prefix="cove_upload_")
+            shutil.copy2(src, dest)
+            return dest, "\n".join(log)
+
+        # ── Compress to target size ───────────────────────────────────
         compressed = str(Path(tmp) / "compressed.mp4")
-        log.append(f"[INFO] Compressing to ≤{TARGET_MB}MB...")
-        ok, result = await compress_to_target(src, compressed, env)
+        log.append(f"[INFO] Compressing to ≤{target_mb}MB...")
+        ok, result = await compress_to_target(src, compressed, env, target_mb)
 
         if ok:
             log.append(f"[OK] Final size: {result}")
@@ -212,7 +236,7 @@ async def download_cmd(interaction: discord.Interaction, url: str):
     except (discord.errors.NotFound, discord.errors.HTTPException):
         return
 
-    filepath, log = await download_and_compress(url)
+    filepath, log = await download_and_compress(url, interaction.guild)
 
     if not filepath or not os.path.exists(filepath):
         error_lines = [l for l in log.splitlines() if l.startswith("[ERROR]")]

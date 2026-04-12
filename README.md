@@ -1,6 +1,6 @@
 # Cove Video Downloader — Bot
 
-Discord bot that downloads and compresses videos via **yt-dlp** and **HandBrakeCLI**.
+Discord bot that downloads and compresses videos via **yt-dlp** and **ffmpeg**.
 
 ![Python](https://img.shields.io/badge/python-3.10%2B-orange?style=flat-square&logo=python)
 ![Platform](https://img.shields.io/badge/platform-Linux%20%28Arch%2FEOS%29-blue?style=flat-square&logo=archlinux)
@@ -14,7 +14,15 @@ Discord bot that downloads and compresses videos via **yt-dlp** and **HandBrakeC
 /download <url>
 ```
 
-The bot downloads the video, compresses it with H.265, and uploads it directly to the channel. If the file is still over Discord's limit after compression, it replies with an error message.
+The bot downloads the video, compresses it with H.264 (2-pass CBR via ffmpeg), and uploads it directly to the channel. The upload size limit is automatically determined by the server's boost tier:
+
+| Boost Tier | Upload Limit |
+|---|---|
+| Tier 0 / 1 (no boosts) | 9.5 MB |
+| Tier 2 (7 boosts) | 49 MB |
+| Tier 3 (14 boosts) | 99 MB |
+
+If the downloaded file is already within the limit, compression is skipped entirely. If compression still can't bring it under the limit, the bot replies with an error.
 
 ---
 
@@ -23,7 +31,7 @@ The bot downloads the video, compresses it with H.265, and uploads it directly t
 ### 1. Install dependencies
 
 ```bash
-sudo pacman -S python yt-dlp handbrake-cli ffmpeg
+sudo pacman -S python yt-dlp ffmpeg
 pip install discord.py python-dotenv
 ```
 
@@ -50,9 +58,9 @@ python bot.py
 
 ## Requirements
 
-- `yt-dlp` and `HandBrakeCLI` must be on your system PATH
+- `yt-dlp` and `ffmpeg` (with `ffprobe`) must be on your system PATH
 - Bot needs **Send Messages**, **Attach Files**, and **Use Slash Commands** permissions
-- File size limit: 10MB (Discord free tier). Videos over this limit after compression will not be uploaded.
+- Upload size limit is automatically adjusted based on the server's Nitro boost tier
 
 ---
 

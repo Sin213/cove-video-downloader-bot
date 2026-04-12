@@ -60,7 +60,6 @@ async def upload_to_catbox(filepath: str) -> str | None:
                 async with session.post(CATBOX_API, data=form) as resp:
                     if resp.status == 200:
                         url = (await resp.text()).strip()
-                        # Catbox returns the direct URL on success
                         if url.startswith("https://"):
                             return url
     except Exception:
@@ -135,7 +134,6 @@ async def download_and_compress(url: str) -> tuple[str | None, str]:
             final = src
             log.append("[WARN] Compression failed. Using original.")
 
-        # Move to persistent path before TemporaryDirectory cleanup
         dest = tempfile.mktemp(suffix=".mp4", prefix="cove_upload_")
         shutil.copy2(final, dest)
         return dest, "\n".join(log)
@@ -173,7 +171,13 @@ client = CoveBot()
 )
 @app_commands.describe(url="The video URL to download")
 async def download_cmd(interaction: discord.Interaction, url: str):
-    await interaction.response.defer(thinking=True)
+    # Defer immediately — Discord requires acknowledgement within 3 seconds.
+    # If the clock is skewed or the interaction already expired, bail cleanly.
+    try:
+        await interaction.response.defer(thinking=True)
+    except (discord.errors.NotFound, discord.errors.HTTPException):
+        # Interaction expired before we could acknowledge it — nothing to do.
+        return
 
     filepath, log = await download_and_compress(url)
 

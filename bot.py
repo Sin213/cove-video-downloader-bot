@@ -21,6 +21,7 @@ COOKIES_FILE  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookie
 COOKIES_EXIST = os.path.exists(COOKIES_FILE)
 
 AUDIO_KBPS = 128
+MAX_DURATION_SECONDS = 600  # 10 minutes — reject anything longer
 
 BOOST_TIER_LIMITS_MB = {
     0: 9.5,
@@ -29,7 +30,6 @@ BOOST_TIER_LIMITS_MB = {
     3: 99.0,
 }
 
-# Domains that trigger auto-download from messages
 AUTO_DOWNLOAD_DOMAINS = (
     "twitter.com",
     "x.com",
@@ -41,7 +41,6 @@ AUTO_DOWNLOAD_DOMAINS = (
     "youtu.be",
 )
 
-# Domains that are silently ignored — no download attempt, no error message
 BLACKLISTED_DOMAINS = (
     "kkinstagram.com",
 )
@@ -52,7 +51,6 @@ URL_RE = re.compile(r"https?://[^\s]+")
 def extract_supported_url(content: str) -> str | None:
     for match in URL_RE.finditer(content):
         url = match.group(0).rstrip(").,>")
-        # Silently skip blacklisted domains
         if any(domain in url for domain in BLACKLISTED_DOMAINS):
             return None
         if any(domain in url for domain in AUTO_DOWNLOAD_DOMAINS):
@@ -85,6 +83,32 @@ async def run_subprocess(cmd: list) -> tuple:
     )
     stdout, _ = await proc.communicate()
     return proc.returncode, stdout.decode(errors="replace")
+
+
+async def get_video_info(url: str) -> dict | None:
+    """
+    Fetch video metadata (duration, title) without downloading.
+    Returns None if info can't be retrieved.
+    """
+    cmd = [
+        "yt-dlp",
+        "--no-download",
+        "--print", "%(.{duration,title})j",
+        "--no-check-certificates",
+        url,
+    ]
+    if COOKIES_EXIST:
+        cmd = cmd[:-1] + ["--cookies", COOKIES_FILE, url]
+
+    code, out = await run_subprocess(cmd)
+    if code != 0:
+        return None
+    try:
+        # yt-dlp --print outputs one JSON object per line; take the last non-empty
+        lines = [l.strip() for l in out.strip().splitlines() if l.strip()]
+        return json.loads(lines[-1]) if lines else None
+    except Exception:
+        return None
 
 
 async def get_duration(filepath: str) -> float | None:
@@ -142,6 +166,19 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
     target_size = int(target_mb * 1024 * 1024)
 
     log.append(f"[INFO] Boost tier: {guild.premium_tier if guild else 0} — limit: {target_mb}MB")
+
+    # ── Pre-flight duration check (fast metadata fetch, no download) ────
+    print(f"[cove] Fetching metadata for: {url}")
+    info = await get_video_info(url)
+    if info:
+        duration = info.get("duration")
+        title    = info.get("title", "Unknown")
+        if duration and duration > MAX_DURATION_SECONDS:
+            mins = int(duration // 60)
+            secs = int(duration % 60)
+            print(f"[cove] Rejected: '{title}' is {mins}m{secs}s — over {MAX_DURATION_SECONDS//60}min limit")
+            log.append(f"[TOOBIG] {mins}m{secs}s")
+            return None, "\n".join(log)
 
     tmp = tempfile.mkdtemp(prefix="cove_")
     output_template = str(Path(tmp) / "%(title)s.%(ext)s")
@@ -229,13 +266,23 @@ def cleanup_tmp(filepath: str):
 
 
 async def process_url(url: str, guild: discord.Guild | None,
-                      on_success, on_error):
+                      on_success, on_error, on_too_big=None):
     try:
         filepath, log = await download_and_compress(url, guild)
     except Exception as e:
         tb = traceback.format_exc()
         print(f"[cove] UNHANDLED EXCEPTION:\n{tb}")
         await on_error(f"Unexpected error: {e}")
+        return
+
+    # Check for too-big rejection
+    toobig_lines = [l for l in log.splitlines() if l.startswith("[TOOBIG]")]
+    if toobig_lines:
+        duration_str = toobig_lines[0].replace("[TOOBIG] ", "")
+        if on_too_big:
+            await on_too_big(duration_str)
+        else:
+            await on_error(f"Video too big NYO ({duration_str}, max {MAX_DURATION_SECONDS//60}min)")
         return
 
     if not filepath or not os.path.exists(filepath):
@@ -295,9 +342,22 @@ class CoveBot(discord.Client):
         )
 
         async def on_success(filepath: str):
-            # No mention — just upload the file cleanly
             await message.channel.send(file=discord.File(filepath))
             await message.delete()
+
+        async def on_too_big(duration_str: str):
+            await asyncio.gather(
+                message.edit(suppress=False),
+                message.remove_reaction("⏳", self.user),
+                return_exceptions=True
+            )
+            try:
+                await message.reply(
+                    f"🚫 Video too big NYO ({duration_str}, max {MAX_DURATION_SECONDS//60}min)",
+                    mention_author=False
+                )
+            except discord.HTTPException:
+                await message.channel.send(f"🚫 Video too big NYO ({duration_str}, max {MAX_DURATION_SECONDS//60}min)")
 
         async def on_error(msg: str):
             await asyncio.gather(
@@ -310,7 +370,9 @@ class CoveBot(discord.Client):
             except discord.HTTPException:
                 await message.channel.send(f"❌ {msg}")
 
-        asyncio.create_task(process_url(url, message.guild, on_success, on_error))
+        asyncio.create_task(
+            process_url(url, message.guild, on_success, on_error, on_too_big)
+        )
 
 
 client = CoveBot()

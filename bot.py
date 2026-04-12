@@ -379,8 +379,9 @@ class CoveBot(discord.Client):
 
         async def on_success(filepath: str):
             await message.channel.send(
-                content=f"**{message.author.display_name}** posted:",
-                file=discord.File(filepath)
+                content=f"{message.author.mention} posted:",
+                file=discord.File(filepath),
+                allowed_mentions=discord.AllowedMentions.none()
             )
             await message.delete()
 

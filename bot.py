@@ -23,6 +23,8 @@ COOKIES_EXIST = os.path.exists(COOKIES_FILE)
 AUDIO_KBPS = 128
 MAX_DURATION_SECONDS = 600  # 10 minutes — reject anything longer
 
+NYO_EMOJI = "<:NYO:1312902725750624316>"
+
 BOOST_TIER_LIMITS_MB = {
     0: 9.5,
     1: 9.5,
@@ -104,7 +106,6 @@ async def get_video_info(url: str) -> dict | None:
     if code != 0:
         return None
     try:
-        # yt-dlp --print outputs one JSON object per line; take the last non-empty
         lines = [l.strip() for l in out.strip().splitlines() if l.strip()]
         return json.loads(lines[-1]) if lines else None
     except Exception:
@@ -167,7 +168,7 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
 
     log.append(f"[INFO] Boost tier: {guild.premium_tier if guild else 0} — limit: {target_mb}MB")
 
-    # ── Pre-flight duration check (fast metadata fetch, no download) ────
+    # ── Pre-flight duration check ────────────────────────────────────
     print(f"[cove] Fetching metadata for: {url}")
     info = await get_video_info(url)
     if info:
@@ -275,14 +276,13 @@ async def process_url(url: str, guild: discord.Guild | None,
         await on_error(f"Unexpected error: {e}")
         return
 
-    # Check for too-big rejection
     toobig_lines = [l for l in log.splitlines() if l.startswith("[TOOBIG]")]
     if toobig_lines:
         duration_str = toobig_lines[0].replace("[TOOBIG] ", "")
         if on_too_big:
             await on_too_big(duration_str)
         else:
-            await on_error(f"Video too big NYO ({duration_str}, max {MAX_DURATION_SECONDS//60}min)")
+            await on_error(f"Video too big {NYO_EMOJI} ({duration_str}, max {MAX_DURATION_SECONDS//60}min)")
         return
 
     if not filepath or not os.path.exists(filepath):
@@ -351,13 +351,11 @@ class CoveBot(discord.Client):
                 message.remove_reaction("⏳", self.user),
                 return_exceptions=True
             )
+            msg = f"Video too big {NYO_EMOJI} ({duration_str}, max {MAX_DURATION_SECONDS//60}min)"
             try:
-                await message.reply(
-                    f"🚫 Video too big NYO ({duration_str}, max {MAX_DURATION_SECONDS//60}min)",
-                    mention_author=False
-                )
+                await message.reply(msg, mention_author=False)
             except discord.HTTPException:
-                await message.channel.send(f"🚫 Video too big NYO ({duration_str}, max {MAX_DURATION_SECONDS//60}min)")
+                await message.channel.send(msg)
 
         async def on_error(msg: str):
             await asyncio.gather(

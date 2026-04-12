@@ -98,8 +98,9 @@ async def get_duration(filepath: str, env: dict) -> float:
 
 async def compress_to_target(src: str, dest: str, env: dict, target_mb: float) -> tuple:
     """
-    2-pass CBR encode targeting just under the guild upload limit.
-    Uses ultrafast preset + all CPU threads for maximum speed on local hardware.
+    Single-pass CBR encode targeting just under the guild upload limit.
+    1-pass is ~2x faster than 2-pass; size accuracy is close enough for Discord uploads.
+    Uses ultrafast preset + all CPU threads for maximum speed.
     """
     duration = await get_duration(src, env)
     if not duration or duration <= 0:
@@ -111,9 +112,11 @@ async def compress_to_target(src: str, dest: str, env: dict, target_mb: float) -
     video_kbits = total_kbits - audio_kbits
     video_kbps  = max(100, int(video_kbits / duration))  # floor at 100kbps
 
+    # Apply a 0.92 safety factor so 1-pass overshoot doesn't exceed the limit
+    video_kbps = int(video_kbps * 0.92)
+
     print(f"[ffmpeg] Target: {target_mb}MB | Duration: {duration:.1f}s | Video bitrate: {video_kbps}kbps | Audio: {AUDIO_KBPS}kbps")
 
-    # Pass 1 — ultrafast + all threads
     cmd = [
         "ffmpeg", "-y",
         "-i", src,
@@ -121,37 +124,15 @@ async def compress_to_target(src: str, dest: str, env: dict, target_mb: float) -
         "-preset", "ultrafast",
         "-threads", "0",
         "-b:v", f"{video_kbps}k",
-        "-pass", "1",
-        "-an",
-        "-f", "null", "/dev/null",
-    ]
-    await run_subprocess(cmd, env)
-
-    # Pass 2 — ultrafast + all threads
-    cmd2 = [
-        "ffmpeg", "-y",
-        "-i", src,
-        "-c:v", "libx264",
-        "-preset", "ultrafast",
-        "-threads", "0",
-        "-b:v", f"{video_kbps}k",
-        "-pass", "2",
         "-c:a", "aac",
         "-b:a", f"{AUDIO_KBPS}k",
         "-movflags", "+faststart",
         dest,
     ]
-    code2, out2 = await run_subprocess(cmd2, env)
+    code, out = await run_subprocess(cmd, env)
 
-    # Clean up 2-pass log files
-    for f in Path(".").glob("ffmpeg2pass*"):
-        try:
-            f.unlink()
-        except Exception:
-            pass
-
-    if code2 != 0:
-        return False, out2
+    if code != 0:
+        return False, out
 
     final_mb = os.path.getsize(dest) / (1024 * 1024)
     print(f"[ffmpeg] Output: {final_mb:.2f} MB")
@@ -169,13 +150,14 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
     with tempfile.TemporaryDirectory(prefix="cove_") as tmp:
         output_template = str(Path(tmp) / "%(title)s.%(ext)s")
 
-        # ── Download with concurrent fragments for maximum speed ─────────
+        # ── Download ──────────────────────────────────────────────────
         cmd = [
             "yt-dlp",
-            "-f", "bv*+ba/b",
+            # Best format up to 1080p — avoids huge 4K downloads for no Discord benefit
+            "-f", "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
             "--merge-output-format", "mp4",
             "-N", "4",            # 4 concurrent fragment downloads
-            "--no-part",          # write directly, skip .part files
+            "--no-part",          # write directly, skip .part rename
             "-o", output_template,
         ]
 
@@ -212,7 +194,7 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
             shutil.copy2(src, dest)
             return dest, "\n".join(log)
 
-        # ── Compress to target size ───────────────────────────────────
+        # ── Compress to target size (1-pass) ──────────────────────────
         compressed = str(Path(tmp) / "compressed.mp4")
         log.append(f"[INFO] Compressing to ≤{target_mb}MB...")
         ok, result = await compress_to_target(src, compressed, env, target_mb)
@@ -276,7 +258,6 @@ class CoveBot(discord.Client):
         filepath, log = await download_and_compress(url, message.guild)
 
         if not filepath or not os.path.exists(filepath):
-            # Restore embed since we're leaving the original message
             try:
                 await message.edit(suppress=False)
             except discord.HTTPException:
@@ -294,7 +275,7 @@ class CoveBot(discord.Client):
             return
 
         try:
-            # Upload first, then delete original — safer and feels snappier
+            # Upload first, then delete original
             await message.channel.send(
                 content=f"📥 {message.author.mention}",
                 file=discord.File(filepath)

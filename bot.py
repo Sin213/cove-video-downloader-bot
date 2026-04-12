@@ -47,6 +47,8 @@ async def run_subprocess(cmd: list[str], env: dict) -> tuple[int, str]:
 async def upload_to_catbox(filepath: str) -> str | None:
     """Upload a file to Catbox.moe anonymously. Returns the URL or None."""
     try:
+        file_sz = os.path.getsize(filepath)
+        print(f"[Catbox] Uploading {Path(filepath).name} ({file_sz / 1024 / 1024:.1f} MB)...")
         async with aiohttp.ClientSession() as session:
             with open(filepath, "rb") as f:
                 form = aiohttp.FormData()
@@ -57,13 +59,14 @@ async def upload_to_catbox(filepath: str) -> str | None:
                     filename=Path(filepath).name,
                     content_type="video/mp4",
                 )
-                async with session.post(CATBOX_API, data=form) as resp:
-                    if resp.status == 200:
-                        url = (await resp.text()).strip()
-                        if url.startswith("https://"):
-                            return url
-    except Exception:
-        pass
+                async with session.post(CATBOX_API, data=form, timeout=aiohttp.ClientTimeout(total=300)) as resp:
+                    status = resp.status
+                    body   = (await resp.text()).strip()
+                    print(f"[Catbox] Response {status}: {body!r}")
+                    if status == 200 and body.startswith("https://"):
+                        return body
+    except Exception as e:
+        print(f"[Catbox] Exception: {e}")
     return None
 
 
@@ -171,12 +174,9 @@ client = CoveBot()
 )
 @app_commands.describe(url="The video URL to download")
 async def download_cmd(interaction: discord.Interaction, url: str):
-    # Defer immediately — Discord requires acknowledgement within 3 seconds.
-    # If the clock is skewed or the interaction already expired, bail cleanly.
     try:
         await interaction.response.defer(thinking=True)
     except (discord.errors.NotFound, discord.errors.HTTPException):
-        # Interaction expired before we could acknowledge it — nothing to do.
         return
 
     filepath, log = await download_and_compress(url)
@@ -191,12 +191,10 @@ async def download_cmd(interaction: discord.Interaction, url: str):
         file_sz = os.path.getsize(filepath)
 
         if file_sz <= FILE_LIMIT:
-            # ── Small enough — upload directly to Discord ─────────────────
             await interaction.followup.send(
                 file=discord.File(filepath)
             )
         elif file_sz <= CATBOX_LIMIT:
-            # ── Too big for Discord — send to Catbox instead ────────────
             await interaction.followup.send(
                 "⏳ File is over 10MB — uploading to Catbox..."
             )

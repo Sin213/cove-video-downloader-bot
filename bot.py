@@ -378,15 +378,10 @@ class CoveBot(discord.Client):
         )
 
         async def on_success(filepath: str):
-            embed = discord.Embed(
-                color=message.author.color if message.author.color.value else discord.Color.blurple()
+            await message.channel.send(
+                content=f"**{message.author.display_name}** posted:",
+                file=discord.File(filepath)
             )
-            embed.set_author(
-                name=f"{message.author.display_name} posted:",
-                icon_url=message.author.display_avatar.url
-            )
-            await message.channel.send(embed=embed)
-            await message.channel.send(file=discord.File(filepath))
             await message.delete()
 
         async def on_too_big(duration_str: str):

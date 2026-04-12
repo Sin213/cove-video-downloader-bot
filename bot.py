@@ -98,9 +98,8 @@ async def get_duration(filepath: str, env: dict) -> float:
 
 async def compress_to_target(src: str, dest: str, env: dict, target_mb: float) -> tuple:
     """
-    Encode src to dest targeting just under the guild's upload limit using ffmpeg.
-    Calculates exact video bitrate from duration so the result is
-    always uploadable to Discord regardless of original quality.
+    2-pass CBR encode targeting just under the guild upload limit.
+    Uses ultrafast preset + all CPU threads for maximum speed on local hardware.
     """
     duration = await get_duration(src, env)
     if not duration or duration <= 0:
@@ -114,10 +113,13 @@ async def compress_to_target(src: str, dest: str, env: dict, target_mb: float) -
 
     print(f"[ffmpeg] Target: {target_mb}MB | Duration: {duration:.1f}s | Video bitrate: {video_kbps}kbps | Audio: {AUDIO_KBPS}kbps")
 
+    # Pass 1 — ultrafast + all threads
     cmd = [
         "ffmpeg", "-y",
         "-i", src,
         "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-threads", "0",
         "-b:v", f"{video_kbps}k",
         "-pass", "1",
         "-an",
@@ -125,10 +127,13 @@ async def compress_to_target(src: str, dest: str, env: dict, target_mb: float) -
     ]
     await run_subprocess(cmd, env)
 
+    # Pass 2 — ultrafast + all threads
     cmd2 = [
         "ffmpeg", "-y",
         "-i", src,
         "-c:v", "libx264",
+        "-preset", "ultrafast",
+        "-threads", "0",
         "-b:v", f"{video_kbps}k",
         "-pass", "2",
         "-c:a", "aac",
@@ -164,11 +169,13 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
     with tempfile.TemporaryDirectory(prefix="cove_") as tmp:
         output_template = str(Path(tmp) / "%(title)s.%(ext)s")
 
-        # ── Download ──────────────────────────────────────────────────
+        # ── Download with concurrent fragments for maximum speed ─────────
         cmd = [
             "yt-dlp",
             "-f", "bv*+ba/b",
             "--merge-output-format", "mp4",
+            "-N", "4",            # 4 concurrent fragment downloads
+            "--no-part",          # write directly, skip .part files
             "-o", output_template,
         ]
 
@@ -198,7 +205,7 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
         orig_mb = os.path.getsize(src) / (1024 * 1024)
         log.append(f"[INFO] Downloaded: {orig_mb:.1f} MB")
 
-        # ── Skip compression if already within limit ──────────────────
+        # ── Skip compression entirely if already within limit ──────────
         if os.path.getsize(src) <= target_size:
             log.append(f"[INFO] File is under {target_mb}MB — skipping compression.")
             dest = tempfile.mktemp(suffix=".mp4", prefix="cove_upload_")
@@ -226,7 +233,7 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
 class CoveBot(discord.Client):
     def __init__(self):
         intents = discord.Intents.default()
-        intents.message_content = True  # required to read message content
+        intents.message_content = True
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
 
@@ -246,7 +253,6 @@ class CoveBot(discord.Client):
         )
 
     async def on_message(self, message: discord.Message):
-        # Ignore messages from bots (including ourselves)
         if message.author.bot:
             return
 
@@ -256,14 +262,12 @@ class CoveBot(discord.Client):
 
         print(f"[Cove] Auto-triggered by {message.author} in #{message.channel}: {url}")
 
-        # Suppress Discord's native embed immediately so it doesn't appear
-        # while the bot is downloading — prevents the duplicate embed flash
+        # Suppress Discord's native embed immediately
         try:
             await message.edit(suppress=True)
         except discord.HTTPException:
             pass
 
-        # Add a loading reaction so the user knows it's working
         try:
             await message.add_reaction("⏳")
         except discord.HTTPException:
@@ -272,7 +276,7 @@ class CoveBot(discord.Client):
         filepath, log = await download_and_compress(url, message.guild)
 
         if not filepath or not os.path.exists(filepath):
-            # Re-enable embed on the original message since we're keeping it
+            # Restore embed since we're leaving the original message
             try:
                 await message.edit(suppress=False)
             except discord.HTTPException:
@@ -290,11 +294,12 @@ class CoveBot(discord.Client):
             return
 
         try:
-            await message.delete()
+            # Upload first, then delete original — safer and feels snappier
             await message.channel.send(
                 content=f"📥 {message.author.mention}",
                 file=discord.File(filepath)
             )
+            await message.delete()
         except discord.HTTPException as e:
             try:
                 await message.remove_reaction("⏳", self.user)

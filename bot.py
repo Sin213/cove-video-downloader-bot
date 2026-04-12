@@ -371,26 +371,18 @@ class CoveBot(discord.Client):
 
         print(f"[Cove] Auto-triggered by {message.author} in #{message.channel}: {url}")
 
-        await asyncio.gather(
-            message.edit(suppress=True),
-            message.add_reaction("⏳"),
-            return_exceptions=True
-        )
+        await message.add_reaction("⏳")
 
         async def on_success(filepath: str):
-            await message.channel.send(
-                content=f"{message.author.mention} posted:",
+            await message.remove_reaction("⏳", self.user)
+            await message.reply(
                 file=discord.File(filepath),
+                mention_author=False,
                 allowed_mentions=discord.AllowedMentions.none()
             )
-            await message.delete()
 
         async def on_too_big(duration_str: str):
-            await asyncio.gather(
-                message.edit(suppress=False),
-                message.remove_reaction("⏳", self.user),
-                return_exceptions=True
-            )
+            await message.remove_reaction("⏳", self.user)
             msg = f"Video too big {NYO_EMOJI} ({duration_str}, max {MAX_DURATION_SECONDS//60}min)"
             try:
                 await message.reply(msg, mention_author=False)
@@ -398,11 +390,7 @@ class CoveBot(discord.Client):
                 await message.channel.send(msg)
 
         async def on_error(msg: str):
-            await asyncio.gather(
-                message.edit(suppress=False),
-                message.remove_reaction("⏳", self.user),
-                return_exceptions=True
-            )
+            await message.remove_reaction("⏳", self.user)
             try:
                 await message.reply(f"❌ {msg}", mention_author=False)
             except discord.HTTPException:

@@ -371,10 +371,17 @@ class CoveBot(discord.Client):
 
         print(f"[Cove] Auto-triggered by {message.author} in #{message.channel}: {url}")
 
-        await message.add_reaction("⏳")
+        # Best-effort reaction — silently ignored if bot lacks Add Reactions permission
+        try:
+            await message.add_reaction("⏳")
+        except discord.HTTPException:
+            pass
 
         async def on_success(filepath: str):
-            await message.remove_reaction("⏳", self.user)
+            try:
+                await message.remove_reaction("⏳", self.user)
+            except discord.HTTPException:
+                pass
             await message.reply(
                 file=discord.File(filepath),
                 mention_author=False,
@@ -382,7 +389,10 @@ class CoveBot(discord.Client):
             )
 
         async def on_too_big(duration_str: str):
-            await message.remove_reaction("⏳", self.user)
+            try:
+                await message.remove_reaction("⏳", self.user)
+            except discord.HTTPException:
+                pass
             msg = f"Video too big {NYO_EMOJI} ({duration_str}, max {MAX_DURATION_SECONDS//60}min)"
             try:
                 await message.reply(msg, mention_author=False)
@@ -390,7 +400,10 @@ class CoveBot(discord.Client):
                 await message.channel.send(msg)
 
         async def on_error(msg: str):
-            await message.remove_reaction("⏳", self.user)
+            try:
+                await message.remove_reaction("⏳", self.user)
+            except discord.HTTPException:
+                pass
             try:
                 await message.reply(f"❌ {msg}", mention_author=False)
             except discord.HTTPException:

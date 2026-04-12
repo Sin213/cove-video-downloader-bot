@@ -16,20 +16,18 @@ load_dotenv()
 TOKEN    = os.getenv("DISCORD_TOKEN")
 GUILD_ID = int(os.getenv("GUILD_ID", "0"))
 
-# Cookies file for yt-dlp (export from browser via "Get cookies.txt LOCALLY")
 COOKIES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
+COOKIES_EXIST = os.path.exists(COOKIES_FILE)  # check once at startup, not per-download
 
-AUDIO_KBPS = 128  # reserved for audio track
+AUDIO_KBPS = 128
 
-# Discord upload limits by guild boost tier (leave headroom below hard cap)
 BOOST_TIER_LIMITS_MB = {
-    0: 9.5,   # No boosts    — 10 MB hard cap
-    1: 9.5,   # Tier 1       — 10 MB hard cap
-    2: 49.0,  # Tier 2       — 50 MB hard cap
-    3: 99.0,  # Tier 3       — 100 MB hard cap
+    0: 9.5,
+    1: 9.5,
+    2: 49.0,
+    3: 99.0,
 }
 
-# Domains that trigger auto-download from messages
 AUTO_DOWNLOAD_DOMAINS = (
     "twitter.com",
     "x.com",
@@ -41,12 +39,10 @@ AUTO_DOWNLOAD_DOMAINS = (
     "youtu.be",
 )
 
-# Regex to extract URLs from message content
 URL_RE = re.compile(r"https?://[^\s]+")
 
 
 def extract_supported_url(content: str) -> str | None:
-    """Return the first URL in content that matches a supported domain, or None."""
     for match in URL_RE.finditer(content):
         url = match.group(0).rstrip(").,>")
         if any(domain in url for domain in AUTO_DOWNLOAD_DOMAINS):
@@ -55,7 +51,6 @@ def extract_supported_url(content: str) -> str | None:
 
 
 def get_target_mb(guild: discord.Guild | None) -> float:
-    """Return the safe upload target in MB for the given guild's boost tier."""
     if guild is None:
         return BOOST_TIER_LIMITS_MB[0]
     return BOOST_TIER_LIMITS_MB.get(guild.premium_tier, 9.5)
@@ -68,26 +63,28 @@ def clean_env():
     return env
 
 
-async def run_subprocess(cmd: list, env: dict) -> tuple:
+ENV = clean_env()  # build once at startup
+
+
+async def run_subprocess(cmd: list) -> tuple:
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
-        env=env,
+        env=ENV,
     )
     stdout, _ = await proc.communicate()
     return proc.returncode, stdout.decode(errors="replace")
 
 
-async def get_duration(filepath: str, env: dict) -> float:
-    """Return video duration in seconds using ffprobe."""
+async def get_duration(filepath: str) -> float | None:
     cmd = [
         "ffprobe", "-v", "quiet",
         "-print_format", "json",
         "-show_format",
         filepath,
     ]
-    code, out = await run_subprocess(cmd, env)
+    code, out = await run_subprocess(cmd)
     if code != 0:
         return None
     try:
@@ -96,26 +93,20 @@ async def get_duration(filepath: str, env: dict) -> float:
         return None
 
 
-async def compress_to_target(src: str, dest: str, env: dict, target_mb: float) -> tuple:
+async def compress_to_target(src: str, dest: str, target_mb: float) -> tuple:
     """
-    Single-pass CBR encode targeting just under the guild upload limit.
-    1-pass is ~2x faster than 2-pass; size accuracy is close enough for Discord uploads.
-    Uses ultrafast preset + all CPU threads for maximum speed.
+    Single-pass CBR encode with ultrafast preset + all threads.
+    0.92 safety factor compensates for 1-pass size variance.
     """
-    duration = await get_duration(src, env)
+    duration = await get_duration(src)
     if not duration or duration <= 0:
         return False, "Could not read video duration."
 
-    # Total budget in kilobits, minus audio
     total_kbits = target_mb * 8 * 1024
     audio_kbits = AUDIO_KBPS * duration
-    video_kbits = total_kbits - audio_kbits
-    video_kbps  = max(100, int(video_kbits / duration))  # floor at 100kbps
+    video_kbps  = max(100, int(((total_kbits - audio_kbits) / duration) * 0.92))
 
-    # Apply a 0.92 safety factor so 1-pass overshoot doesn't exceed the limit
-    video_kbps = int(video_kbps * 0.92)
-
-    print(f"[ffmpeg] Target: {target_mb}MB | Duration: {duration:.1f}s | Video bitrate: {video_kbps}kbps | Audio: {AUDIO_KBPS}kbps")
+    print(f"[ffmpeg] Target: {target_mb}MB | Duration: {duration:.1f}s | Video: {video_kbps}kbps | Audio: {AUDIO_KBPS}kbps")
 
     cmd = [
         "ffmpeg", "-y",
@@ -129,8 +120,7 @@ async def compress_to_target(src: str, dest: str, env: dict, target_mb: float) -
         "-movflags", "+faststart",
         dest,
     ]
-    code, out = await run_subprocess(cmd, env)
-
+    code, out = await run_subprocess(cmd)
     if code != 0:
         return False, out
 
@@ -140,42 +130,51 @@ async def compress_to_target(src: str, dest: str, env: dict, target_mb: float) -
 
 
 async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
-    env = clean_env()
+    """
+    Returns (filepath, log). filepath is None on failure.
+    The returned file is inside a temp dir managed by this function —
+    caller must delete it after use.
+    """
     log = []
     target_mb   = get_target_mb(guild)
     target_size = int(target_mb * 1024 * 1024)
 
-    log.append(f"[INFO] Guild boost tier: {guild.premium_tier if guild else 0} — upload limit: {target_mb}MB")
+    log.append(f"[INFO] Boost tier: {guild.premium_tier if guild else 0} — limit: {target_mb}MB")
 
-    with tempfile.TemporaryDirectory(prefix="cove_") as tmp:
+    # Use a persistent temp dir so we can return a path without copy2
+    tmp = tempfile.mkdtemp(prefix="cove_")
+    try:
         output_template = str(Path(tmp) / "%(title)s.%(ext)s")
 
-        # ── Download ──────────────────────────────────────────────────
+        # ── Download ─────────────────────────────────────────────
         cmd = [
             "yt-dlp",
-            # Best format up to 1080p — avoids huge 4K downloads for no Discord benefit
             "-f", "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
             "--merge-output-format", "mp4",
-            "-N", "4",            # 4 concurrent fragment downloads
-            "--no-part",          # write directly, skip .part rename
+            "-N", "16",                   # 16 concurrent fragment downloads
+            "--http-chunk-size", "10M",   # force-split single-file URLs into 10MB chunks (IDM-style)
+            "--no-part",                  # write directly, no .part rename
+            "--no-check-certificates",    # skip TLS verify overhead
             "-o", output_template,
         ]
 
-        if os.path.exists(COOKIES_FILE):
+        if COOKIES_EXIST:
             cmd.extend(["--cookies", COOKIES_FILE])
-            log.append("[INFO] Using cookies file.")
+            log.append("[INFO] Using cookies.")
         else:
-            log.append("[WARN] No cookies.txt found — some sites may fail.")
+            log.append("[WARN] No cookies.txt — some sites may fail.")
 
         cmd.append(url)
 
         log.append("[INFO] Downloading...")
-        code, out = await run_subprocess(cmd, env)
+        code, out = await run_subprocess(cmd)
         log.append(out.strip())
 
         if code != 0:
             if "Sign in to confirm" in out or "bot" in out.lower():
-                log.append("[ERROR] YouTube bot detection triggered. YouTube downloads from this server are currently blocked.")
+                log.append("[ERROR] YouTube bot detection triggered.")
+            else:
+                log.append("[ERROR] Download failed.")
             return None, "\n".join(log)
 
         mp4_files = list(Path(tmp).glob("*.mp4"))
@@ -183,35 +182,67 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
             log.append("[ERROR] No MP4 file found after download.")
             return None, "\n".join(log)
 
-        src     = str(mp4_files[0])
-        orig_mb = os.path.getsize(src) / (1024 * 1024)
+        src_path = str(mp4_files[0])
+        orig_mb  = os.path.getsize(src_path) / (1024 * 1024)
         log.append(f"[INFO] Downloaded: {orig_mb:.1f} MB")
 
-        # ── Skip compression entirely if already within limit ──────────
-        if os.path.getsize(src) <= target_size:
-            log.append(f"[INFO] File is under {target_mb}MB — skipping compression.")
-            dest = tempfile.mktemp(suffix=".mp4", prefix="cove_upload_")
-            shutil.copy2(src, dest)
-            return dest, "\n".join(log)
+        # ── Skip compression if already within limit ────────────────
+        if os.path.getsize(src_path) <= target_size:
+            log.append(f"[INFO] Under {target_mb}MB — skipping compression.")
+            return src_path, "\n".join(log)  # return in-place, no copy
 
-        # ── Compress to target size (1-pass) ──────────────────────────
+        # ── Compress (1-pass) ──────────────────────────────────
         compressed = str(Path(tmp) / "compressed.mp4")
         log.append(f"[INFO] Compressing to ≤{target_mb}MB...")
-        ok, result = await compress_to_target(src, compressed, env, target_mb)
+        ok, result = await compress_to_target(src_path, compressed, target_mb)
 
         if ok:
             log.append(f"[OK] Final size: {result}")
-            final = compressed
+            return compressed, "\n".join(log)
         else:
             log.append(f"[WARN] Compression failed: {result}. Using original.")
-            final = src
+            return src_path, "\n".join(log)
 
-        dest = tempfile.mktemp(suffix=".mp4", prefix="cove_upload_")
-        shutil.copy2(final, dest)
-        return dest, "\n".join(log)
+    except Exception as e:
+        log.append(f"[ERROR] Unexpected error: {e}")
+        shutil.rmtree(tmp, ignore_errors=True)
+        return None, "\n".join(log)
 
 
-# ── Bot setup ─────────────────────────────────────────────────────────────
+def cleanup_tmp(filepath: str):
+    """Remove the entire temp dir that filepath lives in."""
+    try:
+        parent = str(Path(filepath).parent)
+        if "cove_" in parent:
+            shutil.rmtree(parent, ignore_errors=True)
+        else:
+            os.remove(filepath)
+    except Exception:
+        pass
+
+
+# ── Core send logic (shared by auto and slash) ───────────────────────
+async def process_url(url: str, guild: discord.Guild | None,
+                      on_success, on_error):
+    """
+    Download + compress url, then call on_success(filepath) or on_error(msg).
+    Cleans up temp files after either callback.
+    """
+    filepath, log = await download_and_compress(url, guild)
+
+    if not filepath or not os.path.exists(filepath):
+        error_lines = [l for l in log.splitlines() if l.startswith("[ERROR]")]
+        msg = error_lines[-1].replace("[ERROR] ", "") if error_lines else "Download failed."
+        await on_error(msg)
+        return
+
+    try:
+        await on_success(filepath)
+    finally:
+        cleanup_tmp(filepath)
+
+
+# ── Bot ───────────────────────────────────────────────────────────────
 class CoveBot(discord.Client):
     def __init__(self):
         intents = discord.Intents.default()
@@ -244,57 +275,33 @@ class CoveBot(discord.Client):
 
         print(f"[Cove] Auto-triggered by {message.author} in #{message.channel}: {url}")
 
-        # Suppress Discord's native embed immediately
-        try:
-            await message.edit(suppress=True)
-        except discord.HTTPException:
-            pass
+        # Suppress embed immediately and add reaction — do both concurrently
+        await asyncio.gather(
+            message.edit(suppress=True),
+            message.add_reaction("⏳"),
+            return_exceptions=True
+        )
 
-        try:
-            await message.add_reaction("⏳")
-        except discord.HTTPException:
-            pass
-
-        filepath, log = await download_and_compress(url, message.guild)
-
-        if not filepath or not os.path.exists(filepath):
-            try:
-                await message.edit(suppress=False)
-            except discord.HTTPException:
-                pass
-            try:
-                await message.remove_reaction("⏳", self.user)
-            except discord.HTTPException:
-                pass
-            error_lines = [l for l in log.splitlines() if l.startswith("[ERROR]")]
-            error_msg   = error_lines[-1].replace("[ERROR] ", "") if error_lines else "Download failed."
-            try:
-                await message.reply(f"❌ {error_msg}", mention_author=False)
-            except discord.HTTPException:
-                await message.channel.send(f"❌ {error_msg}")
-            return
-
-        try:
-            # Upload first, then delete original
+        async def on_success(filepath: str):
             await message.channel.send(
                 content=f"📥 {message.author.mention}",
                 file=discord.File(filepath)
             )
             await message.delete()
-        except discord.HTTPException as e:
+
+        async def on_error(msg: str):
+            await asyncio.gather(
+                message.edit(suppress=False),
+                message.remove_reaction("⏳", self.user),
+                return_exceptions=True
+            )
             try:
-                await message.remove_reaction("⏳", self.user)
+                await message.reply(f"❌ {msg}", mention_author=False)
             except discord.HTTPException:
-                pass
-            try:
-                await message.reply(f"❌ Upload failed: {e}", mention_author=False)
-            except discord.HTTPException:
-                await message.channel.send(f"❌ Upload failed: {e}")
-        finally:
-            try:
-                os.remove(filepath)
-            except Exception:
-                pass
+                await message.channel.send(f"❌ {msg}")
+
+        # Fire and forget — each message is processed concurrently
+        asyncio.create_task(process_url(url, message.guild, on_success, on_error))
 
 
 client = CoveBot()
@@ -311,23 +318,13 @@ async def download_cmd(interaction: discord.Interaction, url: str):
     except (discord.errors.NotFound, discord.errors.HTTPException):
         return
 
-    filepath, log = await download_and_compress(url, interaction.guild)
-
-    if not filepath or not os.path.exists(filepath):
-        error_lines = [l for l in log.splitlines() if l.startswith("[ERROR]")]
-        error_msg   = error_lines[-1].replace("[ERROR] ", "") if error_lines else "Download failed."
-        await interaction.followup.send(f"❌ {error_msg}")
-        return
-
-    try:
+    async def on_success(filepath: str):
         await interaction.followup.send(file=discord.File(filepath))
-    except discord.HTTPException as e:
-        await interaction.followup.send(f"❌ Upload failed: {e}")
-    finally:
-        try:
-            os.remove(filepath)
-        except Exception:
-            pass
+
+    async def on_error(msg: str):
+        await interaction.followup.send(f"❌ {msg}")
+
+    await process_url(url, interaction.guild, on_success, on_error)
 
 
 client.run(TOKEN)

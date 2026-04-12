@@ -8,6 +8,7 @@ import re
 import shutil
 import tempfile
 import json
+import traceback
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -16,8 +17,8 @@ load_dotenv()
 TOKEN    = os.getenv("DISCORD_TOKEN")
 GUILD_ID = int(os.getenv("GUILD_ID", "0"))
 
-COOKIES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
-COOKIES_EXIST = os.path.exists(COOKIES_FILE)  # check once at startup, not per-download
+COOKIES_FILE  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
+COOKIES_EXIST = os.path.exists(COOKIES_FILE)
 
 AUDIO_KBPS = 128
 
@@ -63,7 +64,7 @@ def clean_env():
     return env
 
 
-ENV = clean_env()  # build once at startup
+ENV = clean_env()
 
 
 async def run_subprocess(cmd: list) -> tuple:
@@ -94,10 +95,6 @@ async def get_duration(filepath: str) -> float | None:
 
 
 async def compress_to_target(src: str, dest: str, target_mb: float) -> tuple:
-    """
-    Single-pass CBR encode with ultrafast preset + all threads.
-    0.92 safety factor compensates for 1-pass size variance.
-    """
     duration = await get_duration(src)
     if not duration or duration <= 0:
         return False, "Could not read video duration."
@@ -122,6 +119,7 @@ async def compress_to_target(src: str, dest: str, target_mb: float) -> tuple:
     ]
     code, out = await run_subprocess(cmd)
     if code != 0:
+        print(f"[ffmpeg ERROR]\n{out}")
         return False, out
 
     final_mb = os.path.getsize(dest) / (1024 * 1024)
@@ -130,87 +128,94 @@ async def compress_to_target(src: str, dest: str, target_mb: float) -> tuple:
 
 
 async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
-    """
-    Returns (filepath, log). filepath is None on failure.
-    The returned file is inside a temp dir managed by this function —
-    caller must delete it after use.
-    """
     log = []
     target_mb   = get_target_mb(guild)
     target_size = int(target_mb * 1024 * 1024)
 
     log.append(f"[INFO] Boost tier: {guild.premium_tier if guild else 0} — limit: {target_mb}MB")
 
-    # Use a persistent temp dir so we can return a path without copy2
     tmp = tempfile.mkdtemp(prefix="cove_")
-    try:
-        output_template = str(Path(tmp) / "%(title)s.%(ext)s")
+    output_template = str(Path(tmp) / "%(title)s.%(ext)s")
 
-        # ── Download ─────────────────────────────────────────────
-        cmd = [
-            "yt-dlp",
-            "-f", "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
-            "--merge-output-format", "mp4",
-            "-N", "16",                   # 16 concurrent fragment downloads
-            "--http-chunk-size", "10M",   # force-split single-file URLs into 10MB chunks (IDM-style)
-            "--no-part",                  # write directly, no .part rename
-            "--no-check-certificates",    # skip TLS verify overhead
-            "-o", output_template,
-        ]
+    # ── Download ─────────────────────────────────────────────
+    cmd = [
+        "yt-dlp",
+        "-f", "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
+        "--merge-output-format", "mp4",
+        "-N", "16",
+        "--http-chunk-size", "10M",
+        "--no-part",
+        "--no-check-certificates",
+        "-o", output_template,
+    ]
 
-        if COOKIES_EXIST:
-            cmd.extend(["--cookies", COOKIES_FILE])
-            log.append("[INFO] Using cookies.")
+    if COOKIES_EXIST:
+        cmd.extend(["--cookies", COOKIES_FILE])
+        log.append("[INFO] Using cookies.")
+    else:
+        log.append("[WARN] No cookies.txt — some sites may fail.")
+
+    cmd.append(url)
+
+    print(f"[yt-dlp] Running: {' '.join(cmd)}")
+    log.append("[INFO] Downloading...")
+
+    code, out = await run_subprocess(cmd)
+
+    # Always print full yt-dlp output to terminal for debugging
+    print(f"[yt-dlp] Exit code: {code}")
+    print(f"[yt-dlp] Output:\n{out}")
+    log.append(out.strip())
+
+    if code != 0:
+        if "Sign in to confirm" in out or "bot" in out.lower():
+            log.append("[ERROR] YouTube bot detection triggered.")
+        elif "Unsupported URL" in out:
+            log.append("[ERROR] Unsupported or private URL.")
+        elif "HTTP Error 403" in out:
+            log.append("[ERROR] Access denied (403). Cookies may be needed or expired.")
+        elif "HTTP Error 404" in out:
+            log.append("[ERROR] Video not found (404).")
         else:
-            log.append("[WARN] No cookies.txt — some sites may fail.")
-
-        cmd.append(url)
-
-        log.append("[INFO] Downloading...")
-        code, out = await run_subprocess(cmd)
-        log.append(out.strip())
-
-        if code != 0:
-            if "Sign in to confirm" in out or "bot" in out.lower():
-                log.append("[ERROR] YouTube bot detection triggered.")
-            else:
-                log.append("[ERROR] Download failed.")
-            return None, "\n".join(log)
-
-        mp4_files = list(Path(tmp).glob("*.mp4"))
-        if not mp4_files:
-            log.append("[ERROR] No MP4 file found after download.")
-            return None, "\n".join(log)
-
-        src_path = str(mp4_files[0])
-        orig_mb  = os.path.getsize(src_path) / (1024 * 1024)
-        log.append(f"[INFO] Downloaded: {orig_mb:.1f} MB")
-
-        # ── Skip compression if already within limit ────────────────
-        if os.path.getsize(src_path) <= target_size:
-            log.append(f"[INFO] Under {target_mb}MB — skipping compression.")
-            return src_path, "\n".join(log)  # return in-place, no copy
-
-        # ── Compress (1-pass) ──────────────────────────────────
-        compressed = str(Path(tmp) / "compressed.mp4")
-        log.append(f"[INFO] Compressing to ≤{target_mb}MB...")
-        ok, result = await compress_to_target(src_path, compressed, target_mb)
-
-        if ok:
-            log.append(f"[OK] Final size: {result}")
-            return compressed, "\n".join(log)
-        else:
-            log.append(f"[WARN] Compression failed: {result}. Using original.")
-            return src_path, "\n".join(log)
-
-    except Exception as e:
-        log.append(f"[ERROR] Unexpected error: {e}")
+            # Surface the actual last line of yt-dlp output as the error
+            last_error = out.strip().splitlines()[-1] if out.strip() else "Unknown error."
+            log.append(f"[ERROR] {last_error}")
         shutil.rmtree(tmp, ignore_errors=True)
         return None, "\n".join(log)
 
+    mp4_files = list(Path(tmp).glob("*.mp4"))
+    if not mp4_files:
+        # Check for any video file if mp4 merge failed
+        any_video = list(Path(tmp).glob("*"))
+        print(f"[cove] Temp dir contents: {[f.name for f in any_video]}")
+        log.append("[ERROR] No MP4 file found after download.")
+        shutil.rmtree(tmp, ignore_errors=True)
+        return None, "\n".join(log)
+
+    src_path = str(mp4_files[0])
+    orig_mb  = os.path.getsize(src_path) / (1024 * 1024)
+    log.append(f"[INFO] Downloaded: {orig_mb:.1f} MB")
+    print(f"[cove] Downloaded file: {mp4_files[0].name} ({orig_mb:.1f} MB)")
+
+    # ── Skip compression if within limit ────────────────────────
+    if os.path.getsize(src_path) <= target_size:
+        log.append(f"[INFO] Under {target_mb}MB — skipping compression.")
+        return src_path, "\n".join(log)
+
+    # ── Compress (1-pass) ────────────────────────────────
+    compressed = str(Path(tmp) / "compressed.mp4")
+    log.append(f"[INFO] Compressing to ≤{target_mb}MB...")
+    ok, result = await compress_to_target(src_path, compressed, target_mb)
+
+    if ok:
+        log.append(f"[OK] Final size: {result}")
+        return compressed, "\n".join(log)
+    else:
+        log.append(f"[WARN] Compression failed. Using original.")
+        return src_path, "\n".join(log)
+
 
 def cleanup_tmp(filepath: str):
-    """Remove the entire temp dir that filepath lives in."""
     try:
         parent = str(Path(filepath).parent)
         if "cove_" in parent:
@@ -221,28 +226,34 @@ def cleanup_tmp(filepath: str):
         pass
 
 
-# ── Core send logic (shared by auto and slash) ───────────────────────
 async def process_url(url: str, guild: discord.Guild | None,
                       on_success, on_error):
-    """
-    Download + compress url, then call on_success(filepath) or on_error(msg).
-    Cleans up temp files after either callback.
-    """
-    filepath, log = await download_and_compress(url, guild)
+    try:
+        filepath, log = await download_and_compress(url, guild)
+    except Exception as e:
+        tb = traceback.format_exc()
+        print(f"[cove] UNHANDLED EXCEPTION in download_and_compress:\n{tb}")
+        await on_error(f"Unexpected error: {e}")
+        return
 
     if not filepath or not os.path.exists(filepath):
         error_lines = [l for l in log.splitlines() if l.startswith("[ERROR]")]
         msg = error_lines[-1].replace("[ERROR] ", "") if error_lines else "Download failed."
+        print(f"[cove] Download failed. Full log:\n{log}")
         await on_error(msg)
         return
 
     try:
         await on_success(filepath)
+    except Exception as e:
+        tb = traceback.format_exc()
+        print(f"[cove] UNHANDLED EXCEPTION in on_success:\n{tb}")
+        await on_error(f"Upload failed: {e}")
     finally:
         cleanup_tmp(filepath)
 
 
-# ── Bot ───────────────────────────────────────────────────────────────
+# ── Bot ────────────────────────────────────────────────────────────
 class CoveBot(discord.Client):
     def __init__(self):
         intents = discord.Intents.default()
@@ -275,7 +286,6 @@ class CoveBot(discord.Client):
 
         print(f"[Cove] Auto-triggered by {message.author} in #{message.channel}: {url}")
 
-        # Suppress embed immediately and add reaction — do both concurrently
         await asyncio.gather(
             message.edit(suppress=True),
             message.add_reaction("⏳"),
@@ -300,7 +310,6 @@ class CoveBot(discord.Client):
             except discord.HTTPException:
                 await message.channel.send(f"❌ {msg}")
 
-        # Fire and forget — each message is processed concurrently
         asyncio.create_task(process_url(url, message.guild, on_success, on_error))
 
 

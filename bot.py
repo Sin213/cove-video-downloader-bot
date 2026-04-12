@@ -14,9 +14,9 @@ load_dotenv()
 TOKEN    = os.getenv("DISCORD_TOKEN")
 GUILD_ID = int(os.getenv("GUILD_ID", "0"))
 
-FILE_LIMIT   = 10 * 1024 * 1024   # 10 MB — Discord free tier
-CATBOX_API   = "https://catbox.moe/user/api.php"
-CATBOX_LIMIT = 200 * 1024 * 1024  # 200 MB — Catbox max
+FILE_LIMIT  = 10 * 1024 * 1024    # 10 MB — Discord free tier
+NULL_API    = "https://0x0.st"
+NULL_LIMIT  = 512 * 1024 * 1024   # 512 MB — 0x0.st max
 
 
 def clean_env():
@@ -44,29 +44,32 @@ async def run_subprocess(cmd: list[str], env: dict) -> tuple[int, str]:
     return proc.returncode, stdout.decode(errors="replace")
 
 
-async def upload_to_catbox(filepath: str) -> str | None:
-    """Upload a file to Catbox.moe anonymously. Returns the URL or None."""
+async def upload_to_0x0(filepath: str) -> str | None:
+    """Upload a file to 0x0.st. Returns the direct URL or None."""
     try:
         file_sz = os.path.getsize(filepath)
-        print(f"[Catbox] Uploading {Path(filepath).name} ({file_sz / 1024 / 1024:.1f} MB)...")
+        print(f"[0x0] Uploading {Path(filepath).name} ({file_sz / 1024 / 1024:.1f} MB)...")
         async with aiohttp.ClientSession() as session:
             with open(filepath, "rb") as f:
                 form = aiohttp.FormData()
-                form.add_field("reqtype", "fileupload")
                 form.add_field(
-                    "fileToUpload",
+                    "file",
                     f,
                     filename=Path(filepath).name,
                     content_type="video/mp4",
                 )
-                async with session.post(CATBOX_API, data=form, timeout=aiohttp.ClientTimeout(total=300)) as resp:
+                async with session.post(
+                    NULL_API,
+                    data=form,
+                    timeout=aiohttp.ClientTimeout(total=300)
+                ) as resp:
                     status = resp.status
                     body   = (await resp.text()).strip()
-                    print(f"[Catbox] Response {status}: {body!r}")
+                    print(f"[0x0] Response {status}: {body!r}")
                     if status == 200 and body.startswith("https://"):
                         return body
     except Exception as e:
-        print(f"[Catbox] Exception: {e}")
+        print(f"[0x0] Exception: {e}")
     return None
 
 
@@ -191,24 +194,26 @@ async def download_cmd(interaction: discord.Interaction, url: str):
         file_sz = os.path.getsize(filepath)
 
         if file_sz <= FILE_LIMIT:
+            # ── Small enough — upload directly to Discord ─────────────────
             await interaction.followup.send(
                 file=discord.File(filepath)
             )
-        elif file_sz <= CATBOX_LIMIT:
+        elif file_sz <= NULL_LIMIT:
+            # ── Too big for Discord — upload to 0x0.st ─────────────────
             await interaction.followup.send(
-                "⏳ File is over 10MB — uploading to Catbox..."
+                "⏳ File is over 10MB — uploading to 0x0.st..."
             )
-            catbox_url = await upload_to_catbox(filepath)
-            if catbox_url:
-                await interaction.followup.send(catbox_url)
+            url_0x0 = await upload_to_0x0(filepath)
+            if url_0x0:
+                await interaction.followup.send(url_0x0)
             else:
                 await interaction.followup.send(
-                    "❌ Catbox upload failed. Try again or use a shorter video."
+                    "❌ Upload failed. Try again or use a shorter video."
                 )
         else:
             file_mb = file_sz / (1024 * 1024)
             await interaction.followup.send(
-                f"❌ File is {file_mb:.1f}MB — over Catbox's 200MB limit."
+                f"❌ File is {file_mb:.1f}MB — over the 512MB limit."
             )
     except discord.HTTPException as e:
         await interaction.followup.send(f"❌ Upload failed: {e}")

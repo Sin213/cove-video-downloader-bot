@@ -356,6 +356,11 @@ class CoveBot(discord.Client):
                 mention_author=False,
                 allowed_mentions=discord.AllowedMentions.none()
             )
+            # Suppress the original message's link embed now that we have the video
+            try:
+                await message.edit(suppress=True)
+            except discord.HTTPException:
+                pass
 
         async def on_too_big(duration_str: str):
             try:

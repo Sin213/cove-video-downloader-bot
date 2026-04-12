@@ -2,10 +2,10 @@
 import discord
 from discord import app_commands
 import asyncio
-import aiohttp
 import os
 import shutil
 import tempfile
+import json
 from pathlib import Path
 from dotenv import load_dotenv
 
@@ -14,9 +14,10 @@ load_dotenv()
 TOKEN    = os.getenv("DISCORD_TOKEN")
 GUILD_ID = int(os.getenv("GUILD_ID", "0"))
 
-FILE_LIMIT  = 10 * 1024 * 1024    # 10 MB — Discord free tier
-NULL_API    = "https://0x0.st"
-NULL_LIMIT  = 512 * 1024 * 1024   # 512 MB — 0x0.st max
+# Target just under Discord's 10MB free tier limit
+TARGET_MB   = 9.5
+TARGET_SIZE = int(TARGET_MB * 1024 * 1024)
+AUDIO_KBPS  = 128  # reserved for audio track
 
 
 def clean_env():
@@ -44,33 +45,78 @@ async def run_subprocess(cmd: list[str], env: dict) -> tuple[int, str]:
     return proc.returncode, stdout.decode(errors="replace")
 
 
-async def upload_to_0x0(filepath: str) -> str | None:
-    """Upload a file to 0x0.st. Returns the direct URL or None."""
+async def get_duration(filepath: str, env: dict) -> float | None:
+    """Return video duration in seconds using ffprobe."""
+    cmd = [
+        "ffprobe", "-v", "quiet",
+        "-print_format", "json",
+        "-show_format",
+        filepath,
+    ]
+    code, out = await run_subprocess(cmd, env)
+    if code != 0:
+        return None
     try:
-        file_sz = os.path.getsize(filepath)
-        print(f"[0x0] Uploading {Path(filepath).name} ({file_sz / 1024 / 1024:.1f} MB)...")
-        async with aiohttp.ClientSession() as session:
-            with open(filepath, "rb") as f:
-                form = aiohttp.FormData()
-                form.add_field(
-                    "file",
-                    f,
-                    filename=Path(filepath).name,
-                    content_type="video/mp4",
-                )
-                async with session.post(
-                    NULL_API,
-                    data=form,
-                    timeout=aiohttp.ClientTimeout(total=300)
-                ) as resp:
-                    status = resp.status
-                    body   = (await resp.text()).strip()
-                    print(f"[0x0] Response {status}: {body!r}")
-                    if status == 200 and body.startswith("https://"):
-                        return body
-    except Exception as e:
-        print(f"[0x0] Exception: {e}")
-    return None
+        return float(json.loads(out)["format"]["duration"])
+    except Exception:
+        return None
+
+
+async def compress_to_target(src: str, dest: str, env: dict) -> tuple[bool, str]:
+    """
+    Encode src to dest targeting just under 10MB using ffmpeg.
+    Calculates exact video bitrate from duration so the result is
+    always uploadable to Discord regardless of original quality.
+    """
+    duration = await get_duration(src, env)
+    if not duration or duration <= 0:
+        return False, "Could not read video duration."
+
+    # Total budget in kilobits, minus audio
+    total_kbits  = TARGET_MB * 8 * 1024
+    audio_kbits  = AUDIO_KBPS * duration
+    video_kbits  = total_kbits - audio_kbits
+    video_kbps   = max(100, int(video_kbits / duration))  # floor at 100kbps
+
+    print(f"[ffmpeg] Duration: {duration:.1f}s | Video bitrate: {video_kbps}kbps | Audio: {AUDIO_KBPS}kbps")
+
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", src,
+        "-c:v", "libx264",
+        "-b:v", f"{video_kbps}k",
+        "-pass", "1",
+        "-an",
+        "-f", "null", "/dev/null",
+    ]
+    code, out = await run_subprocess(cmd, env)
+
+    cmd2 = [
+        "ffmpeg", "-y",
+        "-i", src,
+        "-c:v", "libx264",
+        "-b:v", f"{video_kbps}k",
+        "-pass", "2",
+        "-c:a", "aac",
+        "-b:a", f"{AUDIO_KBPS}k",
+        "-movflags", "+faststart",
+        dest,
+    ]
+    code2, out2 = await run_subprocess(cmd2, env)
+
+    # Clean up 2-pass log files
+    for f in Path(".").glob("ffmpeg2pass*"):
+        try:
+            f.unlink()
+        except Exception:
+            pass
+
+    if code2 != 0:
+        return False, out2
+
+    final_mb = os.path.getsize(dest) / (1024 * 1024)
+    print(f"[ffmpeg] Output: {final_mb:.2f} MB")
+    return True, f"{final_mb:.2f} MB"
 
 
 async def download_and_compress(url: str) -> tuple[str | None, str]:
@@ -106,39 +152,20 @@ async def download_and_compress(url: str) -> tuple[str | None, str]:
             return None, "\n".join(log)
 
         src     = str(mp4_files[0])
-        orig_sz = os.path.getsize(src)
-        orig_mb = orig_sz / (1024 * 1024)
+        orig_mb = os.path.getsize(src) / (1024 * 1024)
         log.append(f"[INFO] Downloaded: {orig_mb:.1f} MB")
 
-        # ── Compress (H.264) ────────────────────────────────────────────
-        compressed = src + ".compressed.mp4"
-        hb_cmd = [
-            "HandBrakeCLI",
-            "-i", src,
-            "-o", compressed,
-            "-e", "x264",
-            "-q", "28",
-            "--encoder-preset", "fast",
-            "-E", "aac",
-            "-B", "192",
-        ]
+        # ── Compress to target size ──────────────────────────────────
+        compressed = str(Path(tmp) / "compressed.mp4")
+        log.append(f"[INFO] Compressing to ≤{TARGET_MB}MB...")
+        ok, result = await compress_to_target(src, compressed, env)
 
-        log.append("[INFO] Compressing (H.264)...")
-        hb_code, hb_out = await run_subprocess(hb_cmd, env)
-        log.append(hb_out.strip())
-
-        if hb_code == 0 and os.path.exists(compressed):
-            new_sz = os.path.getsize(compressed)
-            new_mb = new_sz / (1024 * 1024)
-            if new_sz < orig_sz:
-                final = compressed
-                log.append(f"[OK] Compressed: {orig_mb:.1f}MB → {new_mb:.1f}MB")
-            else:
-                final = src
-                log.append(f"[SKIP] Compression larger than original. Keeping original ({orig_mb:.1f}MB).")
+        if ok:
+            log.append(f"[OK] Final size: {result}")
+            final = compressed
         else:
+            log.append(f"[WARN] Compression failed: {result}. Using original.")
             final = src
-            log.append("[WARN] Compression failed. Using original.")
 
         dest = tempfile.mktemp(suffix=".mp4", prefix="cove_upload_")
         shutil.copy2(final, dest)
@@ -191,30 +218,7 @@ async def download_cmd(interaction: discord.Interaction, url: str):
         return
 
     try:
-        file_sz = os.path.getsize(filepath)
-
-        if file_sz <= FILE_LIMIT:
-            # ── Small enough — upload directly to Discord ─────────────────
-            await interaction.followup.send(
-                file=discord.File(filepath)
-            )
-        elif file_sz <= NULL_LIMIT:
-            # ── Too big for Discord — upload to 0x0.st ─────────────────
-            await interaction.followup.send(
-                "⏳ File is over 10MB — uploading to 0x0.st..."
-            )
-            url_0x0 = await upload_to_0x0(filepath)
-            if url_0x0:
-                await interaction.followup.send(url_0x0)
-            else:
-                await interaction.followup.send(
-                    "❌ Upload failed. Try again or use a shorter video."
-                )
-        else:
-            file_mb = file_sz / (1024 * 1024)
-            await interaction.followup.send(
-                f"❌ File is {file_mb:.1f}MB — over the 512MB limit."
-            )
+        await interaction.followup.send(file=discord.File(filepath))
     except discord.HTTPException as e:
         await interaction.followup.send(f"❌ Upload failed: {e}")
     finally:

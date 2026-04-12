@@ -29,6 +29,7 @@ BOOST_TIER_LIMITS_MB = {
     3: 99.0,
 }
 
+# Domains that trigger auto-download from messages
 AUTO_DOWNLOAD_DOMAINS = (
     "twitter.com",
     "x.com",
@@ -40,12 +41,20 @@ AUTO_DOWNLOAD_DOMAINS = (
     "youtu.be",
 )
 
+# Domains that are silently ignored — no download attempt, no error message
+BLACKLISTED_DOMAINS = (
+    "kkinstagram.com",
+)
+
 URL_RE = re.compile(r"https?://[^\s]+")
 
 
 def extract_supported_url(content: str) -> str | None:
     for match in URL_RE.finditer(content):
         url = match.group(0).rstrip(").,>")
+        # Silently skip blacklisted domains
+        if any(domain in url for domain in BLACKLISTED_DOMAINS):
+            return None
         if any(domain in url for domain in AUTO_DOWNLOAD_DOMAINS):
             return url
     return None
@@ -137,13 +146,12 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
     tmp = tempfile.mkdtemp(prefix="cove_")
     output_template = str(Path(tmp) / "%(title)s.%(ext)s")
 
-    # ── Download ─────────────────────────────────────────────
     cmd = [
         "yt-dlp",
         "-f", "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
         "--merge-output-format", "mp4",
-        "-N", "16",          # 16 concurrent fragment downloads
-        "--no-part",         # write directly, no .part rename
+        "-N", "16",
+        "--no-part",
         "--no-check-certificates",
         "-o", output_template,
     ]
@@ -191,14 +199,12 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
     src_path = str(mp4_files[0])
     orig_mb  = os.path.getsize(src_path) / (1024 * 1024)
     log.append(f"[INFO] Downloaded: {orig_mb:.1f} MB")
-    print(f"[cove] Downloaded file: {mp4_files[0].name} ({orig_mb:.1f} MB)")
+    print(f"[cove] Downloaded: {mp4_files[0].name} ({orig_mb:.1f} MB)")
 
-    # ── Skip compression if within limit ────────────────────────
     if os.path.getsize(src_path) <= target_size:
         log.append(f"[INFO] Under {target_mb}MB — skipping compression.")
         return src_path, "\n".join(log)
 
-    # ── Compress (1-pass) ────────────────────────────────
     compressed = str(Path(tmp) / "compressed.mp4")
     log.append(f"[INFO] Compressing to ≤{target_mb}MB...")
     ok, result = await compress_to_target(src_path, compressed, target_mb)
@@ -289,10 +295,8 @@ class CoveBot(discord.Client):
         )
 
         async def on_success(filepath: str):
-            await message.channel.send(
-                content=f"📥 {message.author.mention}",
-                file=discord.File(filepath)
-            )
+            # No mention — just upload the file cleanly
+            await message.channel.send(file=discord.File(filepath))
             await message.delete()
 
         async def on_error(msg: str):

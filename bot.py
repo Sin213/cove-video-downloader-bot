@@ -142,9 +142,8 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
         "yt-dlp",
         "-f", "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
         "--merge-output-format", "mp4",
-        "-N", "16",
-        "--http-chunk-size", "10M",
-        "--no-part",
+        "-N", "16",          # 16 concurrent fragment downloads
+        "--no-part",         # write directly, no .part rename
         "--no-check-certificates",
         "-o", output_template,
     ]
@@ -162,7 +161,6 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
 
     code, out = await run_subprocess(cmd)
 
-    # Always print full yt-dlp output to terminal for debugging
     print(f"[yt-dlp] Exit code: {code}")
     print(f"[yt-dlp] Output:\n{out}")
     log.append(out.strip())
@@ -177,7 +175,6 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
         elif "HTTP Error 404" in out:
             log.append("[ERROR] Video not found (404).")
         else:
-            # Surface the actual last line of yt-dlp output as the error
             last_error = out.strip().splitlines()[-1] if out.strip() else "Unknown error."
             log.append(f"[ERROR] {last_error}")
         shutil.rmtree(tmp, ignore_errors=True)
@@ -185,7 +182,6 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
 
     mp4_files = list(Path(tmp).glob("*.mp4"))
     if not mp4_files:
-        # Check for any video file if mp4 merge failed
         any_video = list(Path(tmp).glob("*"))
         print(f"[cove] Temp dir contents: {[f.name for f in any_video]}")
         log.append("[ERROR] No MP4 file found after download.")
@@ -232,7 +228,7 @@ async def process_url(url: str, guild: discord.Guild | None,
         filepath, log = await download_and_compress(url, guild)
     except Exception as e:
         tb = traceback.format_exc()
-        print(f"[cove] UNHANDLED EXCEPTION in download_and_compress:\n{tb}")
+        print(f"[cove] UNHANDLED EXCEPTION:\n{tb}")
         await on_error(f"Unexpected error: {e}")
         return
 

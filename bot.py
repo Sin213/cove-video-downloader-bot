@@ -256,6 +256,13 @@ class CoveBot(discord.Client):
 
         print(f"[Cove] Auto-triggered by {message.author} in #{message.channel}: {url}")
 
+        # Suppress Discord's native embed immediately so it doesn't appear
+        # while the bot is downloading — prevents the duplicate embed flash
+        try:
+            await message.edit(suppress=True)
+        except discord.HTTPException:
+            pass
+
         # Add a loading reaction so the user knows it's working
         try:
             await message.add_reaction("⏳")
@@ -265,19 +272,24 @@ class CoveBot(discord.Client):
         filepath, log = await download_and_compress(url, message.guild)
 
         if not filepath or not os.path.exists(filepath):
-            # Remove loading reaction
+            # Re-enable embed on the original message since we're keeping it
+            try:
+                await message.edit(suppress=False)
+            except discord.HTTPException:
+                pass
             try:
                 await message.remove_reaction("⏳", self.user)
             except discord.HTTPException:
                 pass
             error_lines = [l for l in log.splitlines() if l.startswith("[ERROR]")]
             error_msg   = error_lines[-1].replace("[ERROR] ", "") if error_lines else "Download failed."
-            # Leave the original message, reply with error
-            await message.reply(f"❌ {error_msg}", mention_author=False)
+            try:
+                await message.reply(f"❌ {error_msg}", mention_author=False)
+            except discord.HTTPException:
+                await message.channel.send(f"❌ {error_msg}")
             return
 
         try:
-            # Delete the original message and upload the video
             await message.delete()
             await message.channel.send(
                 content=f"📥 {message.author.mention}",
@@ -288,7 +300,10 @@ class CoveBot(discord.Client):
                 await message.remove_reaction("⏳", self.user)
             except discord.HTTPException:
                 pass
-            await message.reply(f"❌ Upload failed: {e}", mention_author=False)
+            try:
+                await message.reply(f"❌ Upload failed: {e}", mention_author=False)
+            except discord.HTTPException:
+                await message.channel.send(f"❌ Upload failed: {e}")
         finally:
             try:
                 os.remove(filepath)

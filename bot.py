@@ -49,16 +49,14 @@ BLACKLISTED_DOMAINS = (
     "kkinstagram.com",
 )
 
+# Use RAM-backed tmpfs if available, otherwise fall back to /tmp
+TMP_BASE = "/dev/shm" if os.path.isdir("/dev/shm") else None
+
 URL_RE    = re.compile(r"https?://[^\s]+")
-# Matches a reddit link anywhere in HTML: href="https://[old.]reddit.com/r/.../comments/..."
 REDDIT_RE = re.compile(r'href="(https?://(?:old\.)?reddit\.com/r/[^/]+/comments/[^"]+)"')
 
 
 async def resolve_arazu(url: str) -> str:
-    """
-    Fetch an arazu.io page and extract the embedded Reddit URL from it.
-    Returns the Reddit URL if found, otherwise returns the original url.
-    """
     if "arazu.io" not in url:
         return url
     try:
@@ -68,16 +66,13 @@ async def resolve_arazu(url: str) -> str:
             headers={"User-Agent": "Mozilla/5.0 (compatible; CoveBot/1.0)"},
         )
         loop = asyncio.get_event_loop()
-        # Run the blocking HTTP request in a thread so we don't block the event loop
         html = await loop.run_in_executor(
             None,
             lambda: urllib.request.urlopen(req, timeout=10).read().decode(errors="replace"),
         )
         match = REDDIT_RE.search(html)
         if match:
-            reddit_url = match.group(1)
-            # Normalise old.reddit.com → reddit.com so yt-dlp is happy
-            reddit_url = reddit_url.replace("old.reddit.com", "www.reddit.com")
+            reddit_url = match.group(1).replace("old.reddit.com", "www.reddit.com")
             print(f"[arazu] Resolved to: {reddit_url}")
             return reddit_url
         print("[arazu] Could not find Reddit link in page.")
@@ -121,27 +116,6 @@ async def run_subprocess(cmd: list) -> tuple:
     )
     stdout, _ = await proc.communicate()
     return proc.returncode, stdout.decode(errors="replace")
-
-
-async def get_video_info(url: str) -> dict | None:
-    cmd = [
-        "yt-dlp",
-        "--no-download",
-        "--print", "%(.{duration,title})j",
-        "--no-check-certificates",
-        url,
-    ]
-    if COOKIES_EXIST:
-        cmd = cmd[:-1] + ["--cookies", COOKIES_FILE, url]
-
-    code, out = await run_subprocess(cmd)
-    if code != 0:
-        return None
-    try:
-        lines = [l.strip() for l in out.strip().splitlines() if l.strip()]
-        return json.loads(lines[-1]) if lines else None
-    except Exception:
-        return None
 
 
 async def get_duration(filepath: str) -> float | None:
@@ -200,24 +174,10 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
 
     log.append(f"[INFO] Boost tier: {guild.premium_tier if guild else 0} — limit: {target_mb}MB")
 
-    # ── Resolve arazu.io links to their real Reddit URL ───────────────
     url = await resolve_arazu(url)
     log.append(f"[INFO] URL: {url}")
 
-    # ── Pre-flight duration check ─────────────────────────────────
-    print(f"[cove] Fetching metadata for: {url}")
-    info = await get_video_info(url)
-    if info:
-        duration = info.get("duration")
-        title    = info.get("title", "Unknown")
-        if duration and duration > MAX_DURATION_SECONDS:
-            mins = int(duration // 60)
-            secs = int(duration % 60)
-            print(f"[cove] Rejected: '{title}' is {mins}m{secs}s — over {MAX_DURATION_SECONDS//60}min limit")
-            log.append(f"[TOOBIG] {mins}m{secs}s")
-            return None, "\n".join(log)
-
-    tmp = tempfile.mkdtemp(prefix="cove_")
+    tmp = tempfile.mkdtemp(prefix="cove_", dir=TMP_BASE)
     output_template = str(Path(tmp) / "%(title)s.%(ext)s")
 
     cmd = [
@@ -274,6 +234,16 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
     orig_mb  = os.path.getsize(src_path) / (1024 * 1024)
     log.append(f"[INFO] Downloaded: {orig_mb:.1f} MB")
     print(f"[cove] Downloaded: {mp4_files[0].name} ({orig_mb:.1f} MB)")
+
+    # Post-download duration check — no separate pre-flight needed
+    duration = await get_duration(src_path)
+    if duration and duration > MAX_DURATION_SECONDS:
+        mins = int(duration // 60)
+        secs = int(duration % 60)
+        print(f"[cove] Rejected after download: {mins}m{secs}s")
+        shutil.rmtree(tmp, ignore_errors=True)
+        log.append(f"[TOOBIG] {mins}m{secs}s")
+        return None, "\n".join(log)
 
     if os.path.getsize(src_path) <= target_size:
         log.append(f"[INFO] Under {target_mb}MB — skipping compression.")
@@ -371,7 +341,6 @@ class CoveBot(discord.Client):
 
         print(f"[Cove] Auto-triggered by {message.author} in #{message.channel}: {url}")
 
-        # Best-effort reaction — silently ignored if bot lacks Add Reactions permission
         try:
             await message.add_reaction("⏳")
         except discord.HTTPException:

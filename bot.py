@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+from __future__ import annotations
 import discord
 from discord import app_commands
 import asyncio
@@ -14,6 +15,9 @@ load_dotenv()
 TOKEN    = os.getenv("DISCORD_TOKEN")
 GUILD_ID = int(os.getenv("GUILD_ID", "0"))
 
+# Cookies file for yt-dlp (export from browser via "Get cookies.txt LOCALLY")
+COOKIES_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
+
 # Target just under Discord's 10MB free tier limit
 TARGET_MB   = 9.5
 TARGET_SIZE = int(TARGET_MB * 1024 * 1024)
@@ -27,14 +31,7 @@ def clean_env():
     return env
 
 
-def detect_browser():
-    for b in ["firefox", "chrome", "brave"]:
-        if shutil.which(b):
-            return b
-    return None
-
-
-async def run_subprocess(cmd: list[str], env: dict) -> tuple[int, str]:
+async def run_subprocess(cmd: list, env: dict) -> tuple:
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
@@ -45,7 +42,7 @@ async def run_subprocess(cmd: list[str], env: dict) -> tuple[int, str]:
     return proc.returncode, stdout.decode(errors="replace")
 
 
-async def get_duration(filepath: str, env: dict) -> float | None:
+async def get_duration(filepath: str, env: dict) -> float:
     """Return video duration in seconds using ffprobe."""
     cmd = [
         "ffprobe", "-v", "quiet",
@@ -62,7 +59,7 @@ async def get_duration(filepath: str, env: dict) -> float | None:
         return None
 
 
-async def compress_to_target(src: str, dest: str, env: dict) -> tuple[bool, str]:
+async def compress_to_target(src: str, dest: str, env: dict) -> tuple:
     """
     Encode src to dest targeting just under 10MB using ffmpeg.
     Calculates exact video bitrate from duration so the result is
@@ -119,10 +116,9 @@ async def compress_to_target(src: str, dest: str, env: dict) -> tuple[bool, str]
     return True, f"{final_mb:.2f} MB"
 
 
-async def download_and_compress(url: str) -> tuple[str | None, str]:
-    env     = clean_env()
-    browser = detect_browser()
-    log     = []
+async def download_and_compress(url: str) -> tuple:
+    env = clean_env()
+    log = []
 
     with tempfile.TemporaryDirectory(prefix="cove_") as tmp:
         output_template = str(Path(tmp) / "%(title)s.%(ext)s")
@@ -134,9 +130,13 @@ async def download_and_compress(url: str) -> tuple[str | None, str]:
             "--merge-output-format", "mp4",
             "-o", output_template,
         ]
-        if browser:
-            cmd.extend(["--cookies-from-browser", browser])
-            log.append(f"[INFO] Using {browser} cookies.")
+
+        if os.path.exists(COOKIES_FILE):
+            cmd.extend(["--cookies", COOKIES_FILE])
+            log.append("[INFO] Using cookies file.")
+        else:
+            log.append("[WARN] No cookies.txt found — some sites may fail.")
+
         cmd.append(url)
 
         log.append("[INFO] Downloading...")
@@ -144,6 +144,9 @@ async def download_and_compress(url: str) -> tuple[str | None, str]:
         log.append(out.strip())
 
         if code != 0:
+            # Friendly message for YouTube bot detection
+            if "Sign in to confirm" in out or "bot" in out.lower():
+                log.append("[ERROR] YouTube bot detection triggered. YouTube downloads from this server are currently blocked.")
             return None, "\n".join(log)
 
         mp4_files = list(Path(tmp).glob("*.mp4"))
@@ -213,7 +216,7 @@ async def download_cmd(interaction: discord.Interaction, url: str):
 
     if not filepath or not os.path.exists(filepath):
         error_lines = [l for l in log.splitlines() if l.startswith("[ERROR]")]
-        error_msg   = error_lines[-1] if error_lines else "Download failed."
+        error_msg   = error_lines[-1].replace("[ERROR] ", "") if error_lines else "Download failed."
         await interaction.followup.send(f"❌ {error_msg}")
         return
 

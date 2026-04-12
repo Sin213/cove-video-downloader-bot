@@ -20,10 +20,6 @@ FILE_LIMIT = 10 * 1024 * 1024  # 10 MB
 
 
 def clean_env():
-    """
-    Strip PyInstaller env vars so yt-dlp and HandBrakeCLI
-    use the real system Python and libs.
-    """
     env = os.environ.copy()
     env.pop("PYTHONHOME", None)
     env.pop("PYTHONPATH", None)
@@ -31,7 +27,6 @@ def clean_env():
 
 
 def detect_browser():
-    """Return first installed browser for cookie extraction, or None."""
     for b in ["firefox", "chrome", "brave"]:
         if shutil.which(b):
             return b
@@ -39,7 +34,6 @@ def detect_browser():
 
 
 async def run_subprocess(cmd: list[str], env: dict) -> tuple[int, str]:
-    """Run a subprocess asynchronously and return (returncode, output)."""
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
@@ -51,10 +45,6 @@ async def run_subprocess(cmd: list[str], env: dict) -> tuple[int, str]:
 
 
 async def download_and_compress(url: str) -> tuple[str | None, str]:
-    """
-    Download and compress a video.
-    Returns (filepath, log) on success, (None, log) on failure.
-    """
     env     = clean_env()
     browser = detect_browser()
     log     = []
@@ -81,7 +71,6 @@ async def download_and_compress(url: str) -> tuple[str | None, str]:
         if code != 0:
             return None, "\n".join(log)
 
-        # Find the downloaded file
         mp4_files = list(Path(tmp).glob("*.mp4"))
         if not mp4_files:
             log.append("[ERROR] No MP4 file found after download.")
@@ -91,20 +80,20 @@ async def download_and_compress(url: str) -> tuple[str | None, str]:
         orig_mb = os.path.getsize(src) / (1024 * 1024)
         log.append(f"[INFO] Downloaded: {orig_mb:.1f} MB")
 
-        # ── Compress ──────────────────────────────────────────────────
+        # ── Compress (H.264 — universally supported by Discord desktop) ─────
         compressed = src + ".compressed.mp4"
         hb_cmd = [
             "HandBrakeCLI",
             "-i", src,
             "-o", compressed,
-            "-e", "x265",
-            "-q", "31.5",
+            "-e", "x264",
+            "-q", "28",
             "--encoder-preset", "fast",
             "-E", "aac",
             "-B", "192",
         ]
 
-        log.append("[INFO] Compressing (H.265)...")
+        log.append("[INFO] Compressing (H.264)...")
         hb_code, hb_out = await run_subprocess(hb_cmd, env)
         log.append(hb_out.strip())
 
@@ -117,19 +106,17 @@ async def download_and_compress(url: str) -> tuple[str | None, str]:
                 log.append(f"[OK] Compressed: {orig_mb:.1f}MB → {new_mb:.1f}MB")
             else:
                 final = src
-                log.append(f"[SKIP] Compression made it larger. Using original ({orig_mb:.1f}MB).")
+                log.append(f"[SKIP] Compression made it larger. Keeping original ({orig_mb:.1f}MB).")
         else:
             final = src
             log.append("[WARN] Compression failed. Using original.")
 
-        # Check file size against Discord limit
         final_sz = os.path.getsize(final)
         if final_sz > FILE_LIMIT:
             final_mb = final_sz / (1024 * 1024)
             log.append(f"[ERROR] Final file is {final_mb:.1f}MB — over Discord's 10MB limit.")
             return None, "\n".join(log)
 
-        # Move to a persistent temp path before the TemporaryDirectory is deleted
         dest = tempfile.mktemp(suffix=".mp4", prefix="cove_upload_")
         shutil.copy2(final, dest)
         return dest, "\n".join(log)
@@ -174,7 +161,6 @@ async def download_cmd(interaction: discord.Interaction, url: str):
     if filepath and os.path.exists(filepath):
         try:
             await interaction.followup.send(
-                content="✅ Here's your video:",
                 file=discord.File(filepath),
             )
         except discord.HTTPException as e:
@@ -183,13 +169,11 @@ async def download_cmd(interaction: discord.Interaction, url: str):
                 f"The file may still be too large for this server."
             )
         finally:
-            # Clean up the temp upload file
             try:
                 os.remove(filepath)
             except Exception:
                 pass
     else:
-        # Pull just the last meaningful error line for the reply
         error_lines = [l for l in log.splitlines() if l.startswith("[ERROR]")]
         error_msg   = error_lines[-1] if error_lines else "Download failed."
         await interaction.followup.send(f"❌ {error_msg}")

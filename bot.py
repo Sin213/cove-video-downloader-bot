@@ -4,6 +4,7 @@ import discord
 from discord import app_commands
 import asyncio
 import os
+import re
 import shutil
 import tempfile
 import json
@@ -27,6 +28,30 @@ BOOST_TIER_LIMITS_MB = {
     2: 49.0,  # Tier 2       — 50 MB hard cap
     3: 99.0,  # Tier 3       — 100 MB hard cap
 }
+
+# Domains that trigger auto-download from messages
+AUTO_DOWNLOAD_DOMAINS = (
+    "twitter.com",
+    "x.com",
+    "reddit.com",
+    "redd.it",
+    "tiktok.com",
+    "instagram.com",
+    "youtube.com",
+    "youtu.be",
+)
+
+# Regex to extract URLs from message content
+URL_RE = re.compile(r"https?://[^\s]+")
+
+
+def extract_supported_url(content: str) -> str | None:
+    """Return the first URL in content that matches a supported domain, or None."""
+    for match in URL_RE.finditer(content):
+        url = match.group(0).rstrip(").,>")
+        if any(domain in url for domain in AUTO_DOWNLOAD_DOMAINS):
+            return url
+    return None
 
 
 def get_target_mb(guild: discord.Guild | None) -> float:
@@ -81,8 +106,6 @@ async def compress_to_target(src: str, dest: str, env: dict, target_mb: float) -
     if not duration or duration <= 0:
         return False, "Could not read video duration."
 
-    target_size = int(target_mb * 1024 * 1024)
-
     # Total budget in kilobits, minus audio
     total_kbits = target_mb * 8 * 1024
     audio_kbits = AUDIO_KBPS * duration
@@ -133,7 +156,7 @@ async def compress_to_target(src: str, dest: str, env: dict, target_mb: float) -
 async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
     env = clean_env()
     log = []
-    target_mb = get_target_mb(guild)
+    target_mb   = get_target_mb(guild)
     target_size = int(target_mb * 1024 * 1024)
 
     log.append(f"[INFO] Guild boost tier: {guild.premium_tier if guild else 0} — upload limit: {target_mb}MB")
@@ -203,6 +226,7 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
 class CoveBot(discord.Client):
     def __init__(self):
         intents = discord.Intents.default()
+        intents.message_content = True  # required to read message content
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
 
@@ -217,9 +241,59 @@ class CoveBot(discord.Client):
         await self.change_presence(
             activity=discord.Activity(
                 type=discord.ActivityType.watching,
-                name="for /download"
+                name="for links & /download"
             )
         )
+
+    async def on_message(self, message: discord.Message):
+        # Ignore messages from bots (including ourselves)
+        if message.author.bot:
+            return
+
+        url = extract_supported_url(message.content)
+        if not url:
+            return
+
+        print(f"[Cove] Auto-triggered by {message.author} in #{message.channel}: {url}")
+
+        # Add a loading reaction so the user knows it's working
+        try:
+            await message.add_reaction("⏳")
+        except discord.HTTPException:
+            pass
+
+        filepath, log = await download_and_compress(url, message.guild)
+
+        if not filepath or not os.path.exists(filepath):
+            # Remove loading reaction
+            try:
+                await message.remove_reaction("⏳", self.user)
+            except discord.HTTPException:
+                pass
+            error_lines = [l for l in log.splitlines() if l.startswith("[ERROR]")]
+            error_msg   = error_lines[-1].replace("[ERROR] ", "") if error_lines else "Download failed."
+            # Leave the original message, reply with error
+            await message.reply(f"❌ {error_msg}", mention_author=False)
+            return
+
+        try:
+            # Delete the original message and upload the video
+            await message.delete()
+            await message.channel.send(
+                content=f"📥 {message.author.mention}",
+                file=discord.File(filepath)
+            )
+        except discord.HTTPException as e:
+            try:
+                await message.remove_reaction("⏳", self.user)
+            except discord.HTTPException:
+                pass
+            await message.reply(f"❌ Upload failed: {e}", mention_author=False)
+        finally:
+            try:
+                os.remove(filepath)
+            except Exception:
+                pass
 
 
 client = CoveBot()

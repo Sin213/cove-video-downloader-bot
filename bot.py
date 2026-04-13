@@ -49,6 +49,14 @@ BLACKLISTED_DOMAINS = (
     "kkinstagram.com",
 )
 
+# Phrases that mean the URL simply has no video — silently ignore these
+NO_VIDEO_PHRASES = (
+    "No video could be found",
+    "no video",
+    "does not have a video",
+    "no media",
+)
+
 # Use RAM-backed tmpfs if available, otherwise fall back to /tmp
 TMP_BASE = "/dev/shm" if os.path.isdir("/dev/shm") else None
 
@@ -208,7 +216,11 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
     log.append(out.strip())
 
     if code != 0:
-        if "Sign in to confirm" in out or "bot" in out.lower():
+        # Check if yt-dlp is telling us there simply is no video — silently ignore
+        if any(phrase.lower() in out.lower() for phrase in NO_VIDEO_PHRASES):
+            print(f"[cove] No video in post — ignoring silently.")
+            log.append("[NOVIDEO]")
+        elif "Sign in to confirm" in out or "bot" in out.lower():
             log.append("[ERROR] YouTube bot detection triggered.")
         elif "Unsupported URL" in out:
             log.append("[ERROR] Unsupported or private URL.")
@@ -280,6 +292,10 @@ async def process_url(url: str, guild: discord.Guild | None,
         tb = traceback.format_exc()
         print(f"[cove] UNHANDLED EXCEPTION:\n{tb}")
         await on_error(f"Unexpected error: {e}")
+        return
+
+    # Silently drop if there was simply no video in the post
+    if any(l.strip() == "[NOVIDEO]" for l in log.splitlines()):
         return
 
     toobig_lines = [l for l in log.splitlines() if l.startswith("[TOOBIG]")]

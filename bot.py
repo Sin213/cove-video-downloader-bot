@@ -79,6 +79,12 @@ NO_VIDEO_PHRASES = (
     "no media",
     "HTTP Error 429",
     "Too Many Requests",
+    # Network/timeout errors hitting embedded/linked domains (not the video itself)
+    "Connection timed out",
+    "connect timeout",
+    "timed out",
+    "TransportError",
+    "Unable to download webpage",
 )
 
 # yt-dlp "Unsupported URL" errors that are silently ignorable for Reddit
@@ -356,13 +362,12 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
 
     if code != 0:
         if any(phrase.lower() in out.lower() for phrase in NO_VIDEO_PHRASES):
-            print(f"[cove] No video in post (or rate limited) — ignoring silently.")
+            print(f"[cove] No video / network issue on embedded domain — ignoring silently.")
             log.append("[NOVIDEO]")
         elif "Unsupported URL" in out and is_reddit and any(p in out for p in REDDIT_SILENT_URL_PATTERNS):
             print(f"[cove] Reddit GIF/image URL — ignoring silently.")
             log.append("[NOVIDEO]")
         elif "Unsupported URL" in out and is_twitter:
-            # X/Twitter text/image posts have no downloadable video — ignore silently
             print(f"[cove] X/Twitter post has no downloadable video — ignoring silently.")
             log.append("[NOVIDEO]")
         elif "Sign in to confirm" in out or "bot" in out.lower():

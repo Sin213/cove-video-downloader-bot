@@ -520,20 +520,17 @@ class CoveBot(discord.Client):
                 pass
 
             if friend_mode:
-                # ── Friend server: embed ("Sin posted:") + real pings + delete original ──
+                # ── Friend server: embed ("Sin posted:") + ping tagged users only ──
                 embed = discord.Embed()
                 embed.set_author(
                     name=f"{display_name} posted:",
                     icon_url=message.author.display_avatar.url,
                 )
 
-                # Build mention string: poster + any extra @mentions from original message
-                mentions = f"<@{author_id}>"
-                if extra_mentions:
-                    mentions += f" {extra_mentions}"
-
+                # Only include extra @mentions in content (not the original poster)
+                # If nobody was tagged, send with no content so there's no ping at all
                 await message.channel.send(
-                    content=mentions,
+                    content=extra_mentions if extra_mentions else None,
                     embed=embed,
                     file=discord.File(filepath),
                     allowed_mentions=discord.AllowedMentions(
@@ -548,7 +545,7 @@ class CoveBot(discord.Client):
                     pass
 
             else:
-                # ── Main server: silent tag, no embed ───────────────────────────
+                # ── Main server: silent tag, no embed ──────────────────────────────
                 content = f"<@{author_id}> posted:"
                 if extra_mentions:
                     content += f" {extra_mentions}"

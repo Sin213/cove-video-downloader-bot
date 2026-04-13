@@ -508,6 +508,7 @@ class CoveBot(discord.Client):
         except discord.HTTPException:
             pass
 
+        display_name   = message.author.display_name
         author_id      = message.author.id
         friend_mode    = is_friend_server(message.guild)
         extra_mentions = extract_extra_mentions(message.content)
@@ -518,14 +519,22 @@ class CoveBot(discord.Client):
             except discord.HTTPException:
                 pass
 
-            content = f"<@{author_id}> posted:"
-            if extra_mentions:
-                content += f" {extra_mentions}"
-
             if friend_mode:
-                # ── Friend server ──────────────────────────────────────────────
+                # ── Friend server: embed ("Sin posted:") + real pings + delete original ──
+                embed = discord.Embed()
+                embed.set_author(
+                    name=f"{display_name} posted:",
+                    icon_url=message.author.display_avatar.url,
+                )
+
+                # Build mention string: poster + any extra @mentions from original message
+                mentions = f"<@{author_id}>"
+                if extra_mentions:
+                    mentions += f" {extra_mentions}"
+
                 await message.channel.send(
-                    content=content,
+                    content=mentions,
+                    embed=embed,
                     file=discord.File(filepath),
                     allowed_mentions=discord.AllowedMentions(
                         users=True,
@@ -539,7 +548,11 @@ class CoveBot(discord.Client):
                     pass
 
             else:
-                # ── Main server ────────────────────────────────────────────────
+                # ── Main server: silent tag, no embed ───────────────────────────
+                content = f"<@{author_id}> posted:"
+                if extra_mentions:
+                    content += f" {extra_mentions}"
+
                 sent = await message.channel.send(
                     content=content,
                     file=discord.File(filepath),

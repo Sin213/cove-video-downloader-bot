@@ -55,6 +55,8 @@ NO_VIDEO_PHRASES = (
     "no video",
     "does not have a video",
     "no media",
+    "HTTP Error 429",
+    "Too Many Requests",
 )
 
 # Use RAM-backed tmpfs if available, otherwise fall back to /tmp
@@ -195,6 +197,9 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
         "-N", "16",
         "--no-part",
         "--no-check-certificates",
+        "--no-playlist",
+        "--extractor-retries", "0",
+        "--sleep-requests", "2",
         "-o", output_template,
     ]
 
@@ -218,7 +223,7 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
     if code != 0:
         # Check if yt-dlp is telling us there simply is no video — silently ignore
         if any(phrase.lower() in out.lower() for phrase in NO_VIDEO_PHRASES):
-            print(f"[cove] No video in post — ignoring silently.")
+            print(f"[cove] No video in post (or rate limited) — ignoring silently.")
             log.append("[NOVIDEO]")
         elif "Sign in to confirm" in out or "bot" in out.lower():
             log.append("[ERROR] YouTube bot detection triggered.")
@@ -364,15 +369,21 @@ class CoveBot(discord.Client):
         except discord.HTTPException:
             pass
 
+        display_name = message.author.display_name
+
         async def on_success(filepath: str):
             try:
                 await message.remove_reaction("⏳", self.user)
             except discord.HTTPException:
                 pass
-            await message.reply(
+            embed = discord.Embed()
+            embed.set_author(
+                name=f"{display_name} posted:",
+                icon_url=message.author.display_avatar.url,
+            )
+            await message.channel.send(
+                embed=embed,
                 file=discord.File(filepath),
-                mention_author=False,
-                allowed_mentions=discord.AllowedMentions.none()
             )
 
         async def on_no_video():

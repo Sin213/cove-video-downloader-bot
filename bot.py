@@ -15,9 +15,17 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-TOKEN    = os.getenv("DISCORD_TOKEN")
-GUILD_ID = int(os.getenv("GUILD_ID", "0"))
+TOKEN           = os.getenv("DISCORD_TOKEN")
+GUILD_ID        = int(os.getenv("GUILD_ID", "0"))
 FRIEND_GUILD_ID = int(os.getenv("FRIEND_GUILD_ID", "0"))
+
+# Whitelist: comma-separated user IDs whose original message is deleted on the main server
+_WHITELIST_RAW  = os.getenv("WHITELIST_USER_IDS", "")
+WHITELIST_IDS  = {
+    int(uid.strip())
+    for uid in _WHITELIST_RAW.split(",")
+    if uid.strip().isdigit()
+}
 
 COOKIES_FILE  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
 COOKIES_EXIST = os.path.exists(COOKIES_FILE)
@@ -61,7 +69,6 @@ NO_VIDEO_PHRASES = (
 )
 
 # yt-dlp "Unsupported URL" errors that are silently ignorable for Reddit
-# (GIFs, images, /media redirects — not real video content)
 REDDIT_SILENT_URL_PATTERNS = (
     "i.redd.it",
     "reddit.com/media",
@@ -93,20 +100,26 @@ REDDIT_UA = (
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 
+# In-memory map: bot_message_id -> original_poster_id
+# Used for ❌ reaction-delete on the main server only
+_deletable: dict[int, int] = {}
+
 
 def is_friend_server(guild: discord.Guild | None) -> bool:
     """Returns True if the message is in the optional friend server."""
     return FRIEND_GUILD_ID != 0 and guild is not None and guild.id == FRIEND_GUILD_ID
 
 
+def extract_extra_mentions(content: str) -> str:
+    """Strip the URL(s) from content and return whatever remains (e.g. extra @mentions)."""
+    stripped = URL_RE.sub("", content).strip()
+    return stripped
+
+
 async def reddit_has_video(url: str) -> bool:
-    """Check Reddit's JSON API to see if a post contains video before attempting yt-dlp.
-    Returns True if the post has native video or links to a known video host.
-    Returns False for image, gallery, and text posts.
-    On any error (network, parse, rate limit), returns True to let yt-dlp try anyway.
-    """
+    """Check Reddit's JSON API to see if a post contains video before attempting yt-dlp."""
     if not REDDIT_POST_RE.search(url):
-        return True  # not a reddit post URL, let it through
+        return True
 
     api_url = url.rstrip("/").split("?")[0] + ".json?limit=1"
     try:
@@ -125,18 +138,15 @@ async def reddit_has_video(url: str) -> bool:
         data = json.loads(raw)
         post = data[0]["data"]["children"][0]["data"]
 
-        # Native Reddit video
         if post.get("is_video"):
             print("[reddit-check] Native Reddit video detected.")
             return True
 
-        # Post links out to a known video host
         post_url = post.get("url", "")
         if any(domain in post_url for domain in VIDEO_DOMAINS):
             print(f"[reddit-check] External video link detected: {post_url}")
             return True
 
-        # Check media embed (e.g. YouTube embeds)
         media = post.get("media") or post.get("secure_media")
         if media:
             print("[reddit-check] Media embed detected.")
@@ -147,7 +157,7 @@ async def reddit_has_video(url: str) -> bool:
 
     except Exception as e:
         print(f"[reddit-check] Pre-check failed ({e}) — letting yt-dlp try anyway.")
-        return True  # fail open: don't silently drop if we can't check
+        return True
 
 
 async def resolve_arazu(url: str) -> str:
@@ -271,7 +281,6 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
     url = await resolve_arazu(url)
     log.append(f"[INFO] URL: {url}")
 
-    # Reddit pre-check: skip image/gallery/text posts before calling yt-dlp
     is_reddit = any(d in url for d in ("reddit.com", "redd.it"))
     if is_reddit:
         has_video = await reddit_has_video(url)
@@ -428,6 +437,7 @@ class CoveBot(discord.Client):
     def __init__(self):
         intents = discord.Intents.default()
         intents.message_content = True
+        intents.reactions = True
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
 
@@ -461,9 +471,11 @@ class CoveBot(discord.Client):
         except discord.HTTPException:
             pass
 
-        display_name = message.author.display_name
-        author_id    = message.author.id
-        friend_mode  = is_friend_server(message.guild)
+        display_name  = message.author.display_name
+        author_id     = message.author.id
+        friend_mode   = is_friend_server(message.guild)
+        # Extra mentions: everything in the message except the URL itself
+        extra_mentions = extract_extra_mentions(message.content)
 
         async def on_success(filepath: str):
             try:
@@ -472,28 +484,61 @@ class CoveBot(discord.Client):
                 pass
 
             if friend_mode:
-                # @silent prefix — Discord suppresses the notification natively.
-                # No embed, just the silent mention + video file.
+                # ── Friend server ──────────────────────────────────────────────
+                # Build content: silent author attribution + live tags from original message
+                # e.g. "@Timo posted: @EatHat @眠そうなダンディ"
+                content = f"<@{author_id}> posted:"
+                if extra_mentions:
+                    content += f" {extra_mentions}"
+
                 await message.channel.send(
-                    content=f"\U0001f515 <@{author_id}> posted:",
+                    content=content,
                     file=discord.File(filepath),
-                    allowed_mentions=discord.AllowedMentions(users=False),
+                    # Author ping is silent; extra user mentions fire normally
+                    allowed_mentions=discord.AllowedMentions(
+                        users=True,           # allow the extra tags to ping
+                        everyone=False,
+                        roles=False,
+                    ),
                 )
+                # Delete original
                 try:
                     await message.delete()
                 except discord.HTTPException:
-                    pass  # Missing Manage Messages perm — fail gracefully
+                    pass
+                # No ❌ reaction on friend server (original already deleted)
+
             else:
-                # Original behavior: attribution embed + file, no mention
+                # ── Main server ────────────────────────────────────────────────
+                # Silent author ping + attribution embed
+                content = f"<@{author_id}> posted:"
+
                 embed = discord.Embed()
                 embed.set_author(
                     name=f"{display_name} posted:",
                     icon_url=message.author.display_avatar.url,
                 )
-                await message.channel.send(
+
+                sent = await message.channel.send(
+                    content=content,
                     embed=embed,
                     file=discord.File(filepath),
+                    allowed_mentions=discord.AllowedMentions(users=False),  # silent
                 )
+
+                # Track for ❌ reaction-delete
+                _deletable[sent.id] = author_id
+                try:
+                    await sent.add_reaction("\u274c")
+                except discord.HTTPException:
+                    pass
+
+                # Whitelist: delete original message on main server
+                if author_id in WHITELIST_IDS:
+                    try:
+                        await message.delete()
+                    except discord.HTTPException:
+                        pass
 
         async def on_no_video():
             try:
@@ -525,6 +570,42 @@ class CoveBot(discord.Client):
         asyncio.create_task(
             process_url(url, message.guild, on_success, on_error, on_too_big, on_no_video)
         )
+
+    async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):
+        """Main server only: let the original poster delete the bot's video message via ❌."""
+        # Ignore reactions from the bot itself
+        if payload.user_id == self.user.id:
+            return
+
+        # Only care about ❌ on tracked messages
+        if str(payload.emoji) != "\u274c":
+            return
+
+        original_poster_id = _deletable.get(payload.message_id)
+        if original_poster_id is None:
+            return  # not a tracked message
+
+        if payload.user_id != original_poster_id:
+            # Not the original poster — silently remove their reaction
+            channel = self.get_channel(payload.channel_id)
+            if channel:
+                try:
+                    msg = await channel.fetch_message(payload.message_id)
+                    user = await self.fetch_user(payload.user_id)
+                    await msg.remove_reaction("\u274c", user)
+                except discord.HTTPException:
+                    pass
+            return
+
+        # Original poster reacted — delete the bot's message
+        channel = self.get_channel(payload.channel_id)
+        if channel:
+            try:
+                msg = await channel.fetch_message(payload.message_id)
+                await msg.delete()
+                _deletable.pop(payload.message_id, None)
+            except discord.HTTPException:
+                pass
 
 
 client = CoveBot()

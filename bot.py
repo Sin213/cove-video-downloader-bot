@@ -17,6 +17,7 @@ load_dotenv()
 
 TOKEN    = os.getenv("DISCORD_TOKEN")
 GUILD_ID = int(os.getenv("GUILD_ID", "0"))
+FRIEND_GUILD_ID = int(os.getenv("FRIEND_GUILD_ID", "0"))
 
 COOKIES_FILE  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
 COOKIES_EXIST = os.path.exists(COOKIES_FILE)
@@ -91,6 +92,11 @@ REDDIT_UA = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
+
+
+def is_friend_server(guild: discord.Guild | None) -> bool:
+    """Returns True if the message is in the optional friend server."""
+    return FRIEND_GUILD_ID != 0 and guild is not None and guild.id == FRIEND_GUILD_ID
 
 
 async def reddit_has_video(url: str) -> bool:
@@ -311,7 +317,6 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
             print(f"[cove] No video in post (or rate limited) — ignoring silently.")
             log.append("[NOVIDEO]")
         elif "Unsupported URL" in out and is_reddit and any(p in out for p in REDDIT_SILENT_URL_PATTERNS):
-            # GIF or image post that slipped past the pre-check — treat as no video
             print(f"[cove] Reddit GIF/image URL — ignoring silently.")
             log.append("[NOVIDEO]")
         elif "Sign in to confirm" in out or "bot" in out.lower():
@@ -355,7 +360,7 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
         return src_path, "\n".join(log)
 
     compressed = str(Path(tmp) / "compressed.mp4")
-    log.append(f"[INFO] Compressing to ≤{target_mb}MB...")
+    log.append(f"[INFO] Compressing to \u2264{target_mb}MB...")
     ok, result = await compress_to_target(src_path, compressed, target_mb)
 
     if ok:
@@ -452,36 +457,54 @@ class CoveBot(discord.Client):
         print(f"[Cove] Auto-triggered by {message.author} in #{message.channel}: {url}")
 
         try:
-            await message.add_reaction("⏳")
+            await message.add_reaction("\u23f3")
         except discord.HTTPException:
             pass
 
         display_name = message.author.display_name
+        author_id    = message.author.id
+        friend_mode  = is_friend_server(message.guild)
 
         async def on_success(filepath: str):
             try:
-                await message.remove_reaction("⏳", self.user)
+                await message.remove_reaction("\u23f3", self.user)
             except discord.HTTPException:
                 pass
+
             embed = discord.Embed()
             embed.set_author(
                 name=f"{display_name} posted:",
                 icon_url=message.author.display_avatar.url,
             )
-            await message.channel.send(
-                embed=embed,
-                file=discord.File(filepath),
-            )
+
+            if friend_mode:
+                # Silent @mention (renders as tag, sends no notification) + delete original
+                await message.channel.send(
+                    content=f"<@{author_id}>",
+                    embed=embed,
+                    file=discord.File(filepath),
+                    allowed_mentions=discord.AllowedMentions(users=False),
+                )
+                try:
+                    await message.delete()
+                except discord.HTTPException:
+                    pass  # Missing Manage Messages perm — fail gracefully
+            else:
+                # Original behavior: no mention, no delete
+                await message.channel.send(
+                    embed=embed,
+                    file=discord.File(filepath),
+                )
 
         async def on_no_video():
             try:
-                await message.remove_reaction("⏳", self.user)
+                await message.remove_reaction("\u23f3", self.user)
             except discord.HTTPException:
                 pass
 
         async def on_too_big(duration_str: str):
             try:
-                await message.remove_reaction("⏳", self.user)
+                await message.remove_reaction("\u23f3", self.user)
             except discord.HTTPException:
                 pass
             msg = f"Video too big {NYO_EMOJI} ({duration_str}, max {MAX_DURATION_SECONDS//60}min)"
@@ -492,13 +515,13 @@ class CoveBot(discord.Client):
 
         async def on_error(msg: str):
             try:
-                await message.remove_reaction("⏳", self.user)
+                await message.remove_reaction("\u23f3", self.user)
             except discord.HTTPException:
                 pass
             try:
-                await message.reply(f"❌ {msg}", mention_author=False)
+                await message.reply(f"\u274c {msg}", mention_author=False)
             except discord.HTTPException:
-                await message.channel.send(f"❌ {msg}")
+                await message.channel.send(f"\u274c {msg}")
 
         asyncio.create_task(
             process_url(url, message.guild, on_success, on_error, on_too_big, on_no_video)
@@ -523,7 +546,7 @@ async def download_cmd(interaction: discord.Interaction, url: str):
         await interaction.followup.send(file=discord.File(filepath))
 
     async def on_error(msg: str):
-        await interaction.followup.send(f"❌ {msg}")
+        await interaction.followup.send(f"\u274c {msg}")
 
     await process_url(url, interaction.guild, on_success, on_error)
 

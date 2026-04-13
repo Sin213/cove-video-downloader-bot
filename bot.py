@@ -64,6 +64,71 @@ TMP_BASE = "/dev/shm" if os.path.isdir("/dev/shm") else None
 
 URL_RE    = re.compile(r"https?://[^\s]+")
 REDDIT_RE = re.compile(r'href="(https?://(?:old\.)?reddit\.com/r/[^/]+/comments/[^"]+)"')
+REDDIT_POST_RE = re.compile(r'reddit\.com/r/[^/]+/comments/')
+
+# VIDEO_DOMAINS: if a Reddit post links to one of these, treat it as downloadable
+VIDEO_DOMAINS = (
+    "v.redd.it",
+    "youtube.com",
+    "youtu.be",
+    "streamable.com",
+    "gfycat.com",
+    "redgifs.com",
+    "clips.twitch.tv",
+    "twitch.tv",
+    "vimeo.com",
+)
+
+
+async def reddit_has_video(url: str) -> bool:
+    """Check Reddit's JSON API to see if a post contains video before attempting yt-dlp.
+    Returns True if the post has native video or links to a known video host.
+    Returns False for image, gallery, and text posts.
+    On any error (network, parse, rate limit), returns True to let yt-dlp try anyway.
+    """
+    if not REDDIT_POST_RE.search(url):
+        return True  # not a reddit post URL, let it through
+
+    api_url = url.rstrip("/").split("?")[0] + ".json?limit=1"
+    try:
+        req = urllib.request.Request(
+            api_url,
+            headers={
+                "User-Agent": "CoveBot/1.0 (video pre-check)",
+                "Accept": "application/json",
+            },
+        )
+        loop = asyncio.get_event_loop()
+        raw = await loop.run_in_executor(
+            None,
+            lambda: urllib.request.urlopen(req, timeout=8).read().decode(errors="replace"),
+        )
+        data = json.loads(raw)
+        post = data[0]["data"]["children"][0]["data"]
+
+        # Native Reddit video
+        if post.get("is_video"):
+            print("[reddit-check] Native Reddit video detected.")
+            return True
+
+        # Post links out to a known video host
+        post_url = post.get("url", "")
+        if any(domain in post_url for domain in VIDEO_DOMAINS):
+            print(f"[reddit-check] External video link detected: {post_url}")
+            return True
+
+        # Check media embed (e.g. YouTube embeds)
+        media = post.get("media") or post.get("secure_media")
+        if media:
+            print("[reddit-check] Media embed detected.")
+            return True
+
+        print(f"[reddit-check] No video found in post (is_video=False, url={post_url})")
+        return False
+
+    except Exception as e:
+        print(f"[reddit-check] Pre-check failed ({e}) — letting yt-dlp try anyway.")
+        return True  # fail open: don't silently drop if we can't check
 
 
 async def resolve_arazu(url: str) -> str:
@@ -187,6 +252,13 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
     url = await resolve_arazu(url)
     log.append(f"[INFO] URL: {url}")
 
+    # Reddit pre-check: skip image/gallery/text posts before calling yt-dlp
+    if any(d in url for d in ("reddit.com", "redd.it")):
+        has_video = await reddit_has_video(url)
+        if not has_video:
+            log.append("[NOVIDEO]")
+            return None, "\n".join(log)
+
     tmp = tempfile.mkdtemp(prefix="cove_", dir=TMP_BASE)
     output_template = str(Path(tmp) / "%(title)s.%(ext)s")
 
@@ -221,7 +293,6 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
     log.append(out.strip())
 
     if code != 0:
-        # Check if yt-dlp is telling us there simply is no video — silently ignore
         if any(phrase.lower() in out.lower() for phrase in NO_VIDEO_PHRASES):
             print(f"[cove] No video in post (or rate limited) — ignoring silently.")
             log.append("[NOVIDEO]")
@@ -252,7 +323,6 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
     log.append(f"[INFO] Downloaded: {orig_mb:.1f} MB")
     print(f"[cove] Downloaded: {mp4_files[0].name} ({orig_mb:.1f} MB)")
 
-    # Post-download duration check — no separate pre-flight needed
     duration = await get_duration(src_path)
     if duration and duration > MAX_DURATION_SECONDS:
         mins = int(duration // 60)
@@ -299,7 +369,6 @@ async def process_url(url: str, guild: discord.Guild | None,
         await on_error(f"Unexpected error: {e}")
         return
 
-    # Silently drop if there was simply no video in the post
     if any(l.strip() == "[NOVIDEO]" for l in log.splitlines()):
         if on_no_video:
             await on_no_video()
@@ -387,7 +456,6 @@ class CoveBot(discord.Client):
             )
 
         async def on_no_video():
-            # Remove the hourglass silently — no reply
             try:
                 await message.remove_reaction("⏳", self.user)
             except discord.HTTPException:

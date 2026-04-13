@@ -508,7 +508,6 @@ class CoveBot(discord.Client):
         except discord.HTTPException:
             pass
 
-        display_name   = message.author.display_name
         author_id      = message.author.id
         friend_mode    = is_friend_server(message.guild)
         extra_mentions = extract_extra_mentions(message.content)
@@ -519,12 +518,12 @@ class CoveBot(discord.Client):
             except discord.HTTPException:
                 pass
 
+            content = f"<@{author_id}> posted:"
+            if extra_mentions:
+                content += f" {extra_mentions}"
+
             if friend_mode:
                 # ── Friend server ──────────────────────────────────────────────
-                content = f"<@{author_id}> posted:"
-                if extra_mentions:
-                    content += f" {extra_mentions}"
-
                 await message.channel.send(
                     content=content,
                     file=discord.File(filepath),
@@ -541,17 +540,8 @@ class CoveBot(discord.Client):
 
             else:
                 # ── Main server ────────────────────────────────────────────────
-                content = f"<@{author_id}> posted:"
-
-                embed = discord.Embed()
-                embed.set_author(
-                    name=f"{display_name} posted:",
-                    icon_url=message.author.display_avatar.url,
-                )
-
                 sent = await message.channel.send(
                     content=content,
-                    embed=embed,
                     file=discord.File(filepath),
                     allowed_mentions=discord.AllowedMentions(users=False),
                 )

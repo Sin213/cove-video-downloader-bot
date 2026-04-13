@@ -471,17 +471,11 @@ class CoveBot(discord.Client):
             except discord.HTTPException:
                 pass
 
-            embed = discord.Embed()
-            embed.set_author(
-                name=f"{display_name} posted:",
-                icon_url=message.author.display_avatar.url,
-            )
-
             if friend_mode:
-                # Silent @mention (renders as tag, sends no notification) + delete original
+                # @silent prefix — Discord suppresses the notification natively.
+                # No embed, just the silent mention + video file.
                 await message.channel.send(
-                    content=f"<@{author_id}>",
-                    embed=embed,
+                    content=f"\U0001f515 <@{author_id}> posted:",
                     file=discord.File(filepath),
                     allowed_mentions=discord.AllowedMentions(users=False),
                 )
@@ -490,7 +484,12 @@ class CoveBot(discord.Client):
                 except discord.HTTPException:
                     pass  # Missing Manage Messages perm — fail gracefully
             else:
-                # Original behavior: no mention, no delete
+                # Original behavior: attribution embed + file, no mention
+                embed = discord.Embed()
+                embed.set_author(
+                    name=f"{display_name} posted:",
+                    icon_url=message.author.display_avatar.url,
+                )
                 await message.channel.send(
                     embed=embed,
                     file=discord.File(filepath),

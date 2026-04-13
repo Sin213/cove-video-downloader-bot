@@ -285,7 +285,7 @@ def cleanup_tmp(filepath: str):
 
 
 async def process_url(url: str, guild: discord.Guild | None,
-                      on_success, on_error, on_too_big=None):
+                      on_success, on_error, on_too_big=None, on_no_video=None):
     try:
         filepath, log = await download_and_compress(url, guild)
     except Exception as e:
@@ -296,6 +296,8 @@ async def process_url(url: str, guild: discord.Guild | None,
 
     # Silently drop if there was simply no video in the post
     if any(l.strip() == "[NOVIDEO]" for l in log.splitlines()):
+        if on_no_video:
+            await on_no_video()
         return
 
     toobig_lines = [l for l in log.splitlines() if l.startswith("[TOOBIG]")]
@@ -373,6 +375,13 @@ class CoveBot(discord.Client):
                 allowed_mentions=discord.AllowedMentions.none()
             )
 
+        async def on_no_video():
+            # Remove the hourglass silently — no reply
+            try:
+                await message.remove_reaction("⏳", self.user)
+            except discord.HTTPException:
+                pass
+
         async def on_too_big(duration_str: str):
             try:
                 await message.remove_reaction("⏳", self.user)
@@ -395,7 +404,7 @@ class CoveBot(discord.Client):
                 await message.channel.send(f"❌ {msg}")
 
         asyncio.create_task(
-            process_url(url, message.guild, on_success, on_error, on_too_big)
+            process_url(url, message.guild, on_success, on_error, on_too_big, on_no_video)
         )
 
 

@@ -1,4 +1,5 @@
 .env
+cookies.txt
 __pycache__/
 *.pyc
 tmp/

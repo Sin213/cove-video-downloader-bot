@@ -87,6 +87,12 @@ REDDIT_SILENT_URL_PATTERNS = (
     "reddit.com/media",
 )
 
+# X/Twitter domains — "Unsupported URL" from yt-dlp means no downloadable video
+TWITTER_DOMAINS = (
+    "x.com",
+    "twitter.com",
+)
+
 # Use RAM-backed tmpfs if available, otherwise fall back to /tmp
 TMP_BASE = "/dev/shm" if os.path.isdir("/dev/shm") else None
 
@@ -306,7 +312,9 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
     url = await resolve_arazu(url)
     log.append(f"[INFO] URL: {url}")
 
-    is_reddit = any(d in url for d in ("reddit.com", "redd.it"))
+    is_reddit  = any(d in url for d in ("reddit.com", "redd.it"))
+    is_twitter = any(d in url for d in TWITTER_DOMAINS)
+
     if is_reddit:
         has_video = await reddit_has_video(url)
         if not has_video:
@@ -352,6 +360,10 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
             log.append("[NOVIDEO]")
         elif "Unsupported URL" in out and is_reddit and any(p in out for p in REDDIT_SILENT_URL_PATTERNS):
             print(f"[cove] Reddit GIF/image URL — ignoring silently.")
+            log.append("[NOVIDEO]")
+        elif "Unsupported URL" in out and is_twitter:
+            # X/Twitter text/image posts have no downloadable video — ignore silently
+            print(f"[cove] X/Twitter post has no downloadable video — ignoring silently.")
             log.append("[NOVIDEO]")
         elif "Sign in to confirm" in out or "bot" in out.lower():
             log.append("[ERROR] YouTube bot detection triggered.")

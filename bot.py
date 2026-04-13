@@ -49,7 +49,7 @@ BLACKLISTED_DOMAINS = (
     "kkinstagram.com",
 )
 
-# Phrases that mean the URL simply has no video — silently ignore these
+# Phrases in yt-dlp output that mean there is simply no video — silently ignore
 NO_VIDEO_PHRASES = (
     "No video could be found",
     "no video",
@@ -57,6 +57,13 @@ NO_VIDEO_PHRASES = (
     "no media",
     "HTTP Error 429",
     "Too Many Requests",
+)
+
+# yt-dlp "Unsupported URL" errors that are silently ignorable for Reddit
+# (GIFs, images, /media redirects — not real video content)
+REDDIT_SILENT_URL_PATTERNS = (
+    "i.redd.it",
+    "reddit.com/media",
 )
 
 # Use RAM-backed tmpfs if available, otherwise fall back to /tmp
@@ -79,6 +86,12 @@ VIDEO_DOMAINS = (
     "vimeo.com",
 )
 
+# Realistic browser User-Agent for Reddit API requests
+REDDIT_UA = (
+    "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+    "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+)
+
 
 async def reddit_has_video(url: str) -> bool:
     """Check Reddit's JSON API to see if a post contains video before attempting yt-dlp.
@@ -94,7 +107,7 @@ async def reddit_has_video(url: str) -> bool:
         req = urllib.request.Request(
             api_url,
             headers={
-                "User-Agent": "CoveBot/1.0 (video pre-check)",
+                "User-Agent": REDDIT_UA,
                 "Accept": "application/json",
             },
         )
@@ -253,7 +266,8 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
     log.append(f"[INFO] URL: {url}")
 
     # Reddit pre-check: skip image/gallery/text posts before calling yt-dlp
-    if any(d in url for d in ("reddit.com", "redd.it")):
+    is_reddit = any(d in url for d in ("reddit.com", "redd.it"))
+    if is_reddit:
         has_video = await reddit_has_video(url)
         if not has_video:
             log.append("[NOVIDEO]")
@@ -295,6 +309,10 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
     if code != 0:
         if any(phrase.lower() in out.lower() for phrase in NO_VIDEO_PHRASES):
             print(f"[cove] No video in post (or rate limited) — ignoring silently.")
+            log.append("[NOVIDEO]")
+        elif "Unsupported URL" in out and is_reddit and any(p in out for p in REDDIT_SILENT_URL_PATTERNS):
+            # GIF or image post that slipped past the pre-check — treat as no video
+            print(f"[cove] Reddit GIF/image URL — ignoring silently.")
             log.append("[NOVIDEO]")
         elif "Sign in to confirm" in out or "bot" in out.lower():
             log.append("[ERROR] YouTube bot detection triggered.")

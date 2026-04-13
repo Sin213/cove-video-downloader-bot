@@ -16,6 +16,7 @@ A self-hosted Discord bot that automatically detects video links in chat and dow
 - **Silent ignore** — if a link has no video (image posts, text posts, rate limits), the bot removes the ⏳ and does nothing
 - **Slash command** — `/download <url>` for manual downloads
 - **Cookie support** — place a `cookies.txt` next to `bot.py` for sites that require authentication
+- **Friend server mode** — optional second server where the bot deletes the original message and silently tags the poster
 
 ---
 
@@ -65,10 +66,13 @@ Edit `.env` and fill in your values:
 
 ```
 DISCORD_TOKEN=your_token_here
-GUILD_ID=your_guild_id_here
+GUILD_ID=your_main_guild_id_here
+FRIEND_GUILD_ID=your_friend_guild_id_here  # optional
 ```
 
-To get your Guild ID: enable Developer Mode in Discord → right-click your server → **Copy Server ID**.
+To get a Guild ID: enable Developer Mode in Discord → right-click your server → **Copy Server ID**.
+
+`FRIEND_GUILD_ID` is optional. If omitted or set to `0`, the bot behaves identically on all servers.
 
 ### 3. (Optional) Add cookies
 
@@ -117,6 +121,20 @@ systemctl --user enable --now cove-bot.service
 
 ---
 
+## Friend Server Mode
+
+When `FRIEND_GUILD_ID` is set, the bot activates a special mode in that server only:
+
+| Behavior | Main Server | Friend Server |
+|---|---|---|
+| Post video | ✅ embed + file | ✅ embed + file |
+| Delete original message | ❌ | ✅ |
+| @mention poster | ❌ | ✅ silent (no ping) |
+
+The silent mention renders the poster's name as a clickable tag in the bot's message but sends **zero notification**. This requires the bot to have the **Manage Messages** permission in the friend server. If it's missing, the delete step is silently skipped.
+
+---
+
 ## Bot Permissions Required
 
 - Send Messages
@@ -124,6 +142,7 @@ systemctl --user enable --now cove-bot.service
 - Add Reactions
 - Read Message History
 - Use Slash Commands
+- **Manage Messages** *(friend server only — for deleting the original message)*
 
 ---
 

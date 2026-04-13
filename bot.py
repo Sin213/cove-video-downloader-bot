@@ -52,10 +52,23 @@ AUTO_DOWNLOAD_DOMAINS = (
     "youtube.com",
     "youtu.be",
     "arazu.io",
+    # Twitter/X embed-fixer proxies — rewritten to x.com before download
+    "fixupx.com",
+    "fxtwitter.com",
+    "vxtwitter.com",
+    "twittpr.com",
 )
 
 BLACKLISTED_DOMAINS = (
     "kkinstagram.com",
+)
+
+# Embed-fixer domains that should be silently rewritten to x.com
+FIXUP_DOMAINS = (
+    "fixupx.com",
+    "fxtwitter.com",
+    "vxtwitter.com",
+    "twittpr.com",
 )
 
 # Phrases in yt-dlp output that mean there is simply no video — silently ignore
@@ -108,6 +121,16 @@ _deletable: dict[int, int] = {}
 def is_friend_server(guild: discord.Guild | None) -> bool:
     """Returns True if the message is in the optional friend server."""
     return FRIEND_GUILD_ID != 0 and guild is not None and guild.id == FRIEND_GUILD_ID
+
+
+def resolve_fixup_url(url: str) -> str:
+    """Rewrite Twitter embed-fixer proxy domains to x.com so yt-dlp can handle them."""
+    for domain in FIXUP_DOMAINS:
+        if domain in url:
+            rewritten = url.replace(domain, "x.com")
+            print(f"[fixup] Rewrote {domain} -> x.com: {rewritten}")
+            return rewritten
+    return url
 
 
 def extract_extra_mentions(content: str) -> str:
@@ -278,6 +301,8 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
 
     log.append(f"[INFO] Boost tier: {guild.premium_tier if guild else 0} — limit: {target_mb}MB")
 
+    # Rewrite embed-fixer proxy URLs before anything else
+    url = resolve_fixup_url(url)
     url = await resolve_arazu(url)
     log.append(f"[INFO] URL: {url}")
 
@@ -471,10 +496,9 @@ class CoveBot(discord.Client):
         except discord.HTTPException:
             pass
 
-        display_name  = message.author.display_name
-        author_id     = message.author.id
-        friend_mode   = is_friend_server(message.guild)
-        # Extra mentions: everything in the message except the URL itself
+        display_name   = message.author.display_name
+        author_id      = message.author.id
+        friend_mode    = is_friend_server(message.guild)
         extra_mentions = extract_extra_mentions(message.content)
 
         async def on_success(filepath: str):
@@ -485,8 +509,6 @@ class CoveBot(discord.Client):
 
             if friend_mode:
                 # ── Friend server ──────────────────────────────────────────────
-                # Build content: silent author attribution + live tags from original message
-                # e.g. "@Timo posted: @EatHat @眠そうなダンディ"
                 content = f"<@{author_id}> posted:"
                 if extra_mentions:
                     content += f" {extra_mentions}"
@@ -494,23 +516,19 @@ class CoveBot(discord.Client):
                 await message.channel.send(
                     content=content,
                     file=discord.File(filepath),
-                    # Author ping is silent; extra user mentions fire normally
                     allowed_mentions=discord.AllowedMentions(
-                        users=True,           # allow the extra tags to ping
+                        users=True,
                         everyone=False,
                         roles=False,
                     ),
                 )
-                # Delete original
                 try:
                     await message.delete()
                 except discord.HTTPException:
                     pass
-                # No ❌ reaction on friend server (original already deleted)
 
             else:
                 # ── Main server ────────────────────────────────────────────────
-                # Silent author ping + attribution embed
                 content = f"<@{author_id}> posted:"
 
                 embed = discord.Embed()
@@ -523,17 +541,15 @@ class CoveBot(discord.Client):
                     content=content,
                     embed=embed,
                     file=discord.File(filepath),
-                    allowed_mentions=discord.AllowedMentions(users=False),  # silent
+                    allowed_mentions=discord.AllowedMentions(users=False),
                 )
 
-                # Track for ❌ reaction-delete
                 _deletable[sent.id] = author_id
                 try:
                     await sent.add_reaction("\u274c")
                 except discord.HTTPException:
                     pass
 
-                # Whitelist: delete original message on main server
                 if author_id in WHITELIST_IDS:
                     try:
                         await message.delete()
@@ -573,20 +589,17 @@ class CoveBot(discord.Client):
 
     async def on_raw_reaction_add(self, payload: discord.RawReactionActionEvent):
         """Main server only: let the original poster delete the bot's video message via ❌."""
-        # Ignore reactions from the bot itself
         if payload.user_id == self.user.id:
             return
 
-        # Only care about ❌ on tracked messages
         if str(payload.emoji) != "\u274c":
             return
 
         original_poster_id = _deletable.get(payload.message_id)
         if original_poster_id is None:
-            return  # not a tracked message
+            return
 
         if payload.user_id != original_poster_id:
-            # Not the original poster — silently remove their reaction
             channel = self.get_channel(payload.channel_id)
             if channel:
                 try:
@@ -597,7 +610,6 @@ class CoveBot(discord.Client):
                     pass
             return
 
-        # Original poster reacted — delete the bot's message
         channel = self.get_channel(payload.channel_id)
         if channel:
             try:

@@ -440,7 +440,13 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
         _log.append(f"[OK] Final size: {result}")
         return compressed, "\n".join(_log)
     else:
-        _log.append("[WARN] Compression failed. Using original.")
+        # Smart fallback: only use the original if it fits the server's upload limit
+        if orig_mb > target_mb:
+            _log.append(f"[ERROR] Compression failed, and original ({orig_mb:.1f}MB) is too big for Discord.")
+            shutil.rmtree(tmp, ignore_errors=True)
+            return None, "\n".join(_log)
+
+        _log.append("[WARN] Compression failed, but original fits. Using original.")
         return src_path, "\n".join(_log)
 
 
@@ -680,7 +686,22 @@ async def download_cmd(interaction: discord.Interaction, url: str):
     async def on_error(msg: str):
         await interaction.followup.send(f"\u274c {msg}")
 
-    await process_url(url, interaction.guild, on_success, on_error)
+    async def on_no_video():
+        await interaction.followup.send("\u274c No video found at that link.")
+
+    async def on_too_big(duration_str: str):
+        await interaction.followup.send(
+            f"Video too big {NYO_EMOJI} ({duration_str}, max {MAX_DURATION_SECONDS // 60}min)"
+        )
+
+    await process_url(
+        url,
+        interaction.guild,
+        on_success,
+        on_error,
+        on_too_big=on_too_big,
+        on_no_video=on_no_video,
+    )
 
 
 client.run(TOKEN)

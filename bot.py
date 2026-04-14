@@ -363,7 +363,6 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
         "--no-check-certificates",
         "--no-playlist",
         "--extractor-retries", "0",
-        "--sleep-requests", "2",
         "-o", output_template,
     ]
 
@@ -488,7 +487,7 @@ async def process_url(
 
         if not filepath or not os.path.exists(filepath):
             error_lines = [line for line in log_text.splitlines() if line.startswith("[ERROR]")]
-            msg = error_lines[-1].replace("[ERROR] ", "") if error_lines else "Download failed."
+            msg = error_lines[0].replace("[ERROR] ", "") if error_lines else "Download failed."
             log.error("Download failed. Full log:\n%s", log_text)
             await on_error(msg)
             return
@@ -554,7 +553,6 @@ class CoveBot(discord.Client):
                 pass
 
             if friend_mode:
-                # Friend server: embed ("Sin posted:") + ping tagged users only
                 embed = discord.Embed()
                 embed.set_author(
                     name=f"{display_name} posted:",
@@ -572,7 +570,6 @@ class CoveBot(discord.Client):
                     pass
 
             else:
-                # Main server: silent tag, no embed
                 content = f"<@{author_id}> posted:"
                 if extra_mentions:
                     content += f" {extra_mentions}"

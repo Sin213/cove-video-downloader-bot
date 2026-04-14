@@ -3,6 +3,7 @@ from __future__ import annotations
 import discord
 from discord import app_commands
 import asyncio
+import logging
 import os
 import re
 import shutil
@@ -11,17 +12,24 @@ import json
 import traceback
 import urllib.request
 from pathlib import Path
+from time import monotonic
+from urllib.parse import urlparse, urlunparse
 from dotenv import load_dotenv
 
 load_dotenv()
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO"),
+    format="%(asctime)s %(levelname)s %(message)s",
+)
+log = logging.getLogger("cove")
 
 TOKEN           = os.getenv("DISCORD_TOKEN")
 GUILD_ID        = int(os.getenv("GUILD_ID", "0"))
 FRIEND_GUILD_ID = int(os.getenv("FRIEND_GUILD_ID", "0"))
 
-# Whitelist: comma-separated user IDs whose original message is deleted on the main server
-_WHITELIST_RAW  = os.getenv("WHITELIST_USER_IDS", "")
-WHITELIST_IDS  = {
+_WHITELIST_RAW = os.getenv("WHITELIST_USER_IDS", "")
+WHITELIST_IDS = {
     int(uid.strip())
     for uid in _WHITELIST_RAW.split(",")
     if uid.strip().isdigit()
@@ -30,10 +38,15 @@ WHITELIST_IDS  = {
 COOKIES_FILE  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
 COOKIES_EXIST = os.path.exists(COOKIES_FILE)
 
-AUDIO_KBPS = 128
-MAX_DURATION_SECONDS = 600  # 10 minutes — reject anything longer
+AUDIO_KBPS           = 128
+MAX_DURATION_SECONDS = 600
+NYO_EMOJI            = "<:NYO:1312902725750624316>"
 
-NYO_EMOJI = "<:NYO:1312902725750624316>"
+MAX_CONCURRENT_JOBS = int(os.getenv("MAX_CONCURRENT_JOBS", "3"))
+SUBPROCESS_TIMEOUT  = int(os.getenv("SUBPROCESS_TIMEOUT", "900"))
+DELETE_TTL_SECONDS  = int(os.getenv("DELETE_TTL_SECONDS", "21600"))
+
+JOB_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
 
 BOOST_TIER_LIMITS_MB = {
     0: 9.5,
@@ -42,7 +55,7 @@ BOOST_TIER_LIMITS_MB = {
     3: 99.0,
 }
 
-AUTO_DOWNLOAD_DOMAINS = (
+AUTO_DOWNLOAD_DOMAINS = {
     "twitter.com",
     "x.com",
     "reddit.com",
@@ -52,26 +65,28 @@ AUTO_DOWNLOAD_DOMAINS = (
     "youtube.com",
     "youtu.be",
     "arazu.io",
-    # Twitter/X embed-fixer proxies — rewritten to x.com before download
     "fixupx.com",
     "fxtwitter.com",
     "vxtwitter.com",
     "twittpr.com",
-)
+}
 
-BLACKLISTED_DOMAINS = (
+BLACKLISTED_DOMAINS = {
     "kkinstagram.com",
-)
+}
 
-# Embed-fixer domains that should be silently rewritten to x.com
-FIXUP_DOMAINS = (
+FIXUP_DOMAINS = {
     "fixupx.com",
     "fxtwitter.com",
     "vxtwitter.com",
     "twittpr.com",
-)
+}
 
-# Phrases in yt-dlp output that mean there is simply no video — silently ignore
+TWITTER_DOMAINS = {
+    "x.com",
+    "twitter.com",
+}
+
 NO_VIDEO_PHRASES = (
     "No video could be found",
     "no video",
@@ -79,7 +94,6 @@ NO_VIDEO_PHRASES = (
     "no media",
     "HTTP Error 429",
     "Too Many Requests",
-    # Network/timeout errors hitting embedded/linked domains (not the video itself)
     "Connection timed out",
     "connect timeout",
     "timed out",
@@ -87,26 +101,17 @@ NO_VIDEO_PHRASES = (
     "Unable to download webpage",
 )
 
-# yt-dlp "Unsupported URL" errors that are silently ignorable for Reddit
 REDDIT_SILENT_URL_PATTERNS = (
     "i.redd.it",
     "reddit.com/media",
 )
 
-# X/Twitter domains — "Unsupported URL" from yt-dlp means no downloadable video
-TWITTER_DOMAINS = (
-    "x.com",
-    "twitter.com",
-)
-
-# Use RAM-backed tmpfs if available, otherwise fall back to /tmp
 TMP_BASE = "/dev/shm" if os.path.isdir("/dev/shm") else None
 
-URL_RE    = re.compile(r"https?://[^\s]+")
-REDDIT_RE = re.compile(r'href="(https?://(?:old\.)?reddit\.com/r/[^/]+/comments/[^"]+)"')
+URL_RE         = re.compile(r"https?://[^\s]+")
+REDDIT_RE      = re.compile(r'href="(https?://(?:old\.)?reddit\.com/r/[^/]+/comments/[^"]+)"')
 REDDIT_POST_RE = re.compile(r'reddit\.com/r/[^/]+/comments/')
 
-# VIDEO_DOMAINS: if a Reddit post links to one of these, treat it as downloadable
 VIDEO_DOMAINS = (
     "v.redd.it",
     "youtube.com",
@@ -119,115 +124,66 @@ VIDEO_DOMAINS = (
     "vimeo.com",
 )
 
-# Realistic browser User-Agent for Reddit API requests
 REDDIT_UA = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 
-# In-memory map: bot_message_id -> original_poster_id
-# Used for ❌ reaction-delete on the main server only
-_deletable: dict[int, int] = {}
+# bot_message_id -> (original_poster_id, expires_at)
+_deletable: dict[int, tuple[int, float]] = {}
 
 
-def is_friend_server(guild: discord.Guild | None) -> bool:
-    """Returns True if the message is in the optional friend server."""
-    return FRIEND_GUILD_ID != 0 and guild is not None and guild.id == FRIEND_GUILD_ID
+def prune_deletable() -> None:
+    now = monotonic()
+    expired = [mid for mid, (_, expires_at) in _deletable.items() if expires_at <= now]
+    for mid in expired:
+        _deletable.pop(mid, None)
+
+
+# ── Hostname helpers (safe URL matching) ──────────────────────────────────────
+
+def hostname_for(url: str) -> str:
+    host = (urlparse(url).hostname or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    return host
+
+
+def host_matches(host: str, domains: set[str]) -> bool:
+    return host in domains or any(host.endswith(f".{d}") for d in domains)
+
+
+def replace_hostname(url: str, new_host: str) -> str:
+    parsed = urlparse(url)
+    return urlunparse(parsed._replace(netloc=new_host))
 
 
 def resolve_fixup_url(url: str) -> str:
-    """Rewrite Twitter embed-fixer proxy domains to x.com so yt-dlp can handle them."""
-    for domain in FIXUP_DOMAINS:
-        if domain in url:
-            rewritten = url.replace(domain, "x.com")
-            print(f"[fixup] Rewrote {domain} -> x.com: {rewritten}")
-            return rewritten
+    host = hostname_for(url)
+    if host_matches(host, FIXUP_DOMAINS):
+        rewritten = replace_hostname(url, "x.com")
+        log.info("[fixup] Rewrote %s -> %s", url, rewritten)
+        return rewritten
     return url
 
 
 def extract_extra_mentions(content: str) -> str:
-    """Strip the URL(s) from content and return whatever remains (e.g. extra @mentions)."""
-    stripped = URL_RE.sub("", content).strip()
-    return stripped
-
-
-async def reddit_has_video(url: str) -> bool:
-    """Check Reddit's JSON API to see if a post contains video before attempting yt-dlp."""
-    if not REDDIT_POST_RE.search(url):
-        return True
-
-    api_url = url.rstrip("/").split("?")[0] + ".json?limit=1"
-    try:
-        req = urllib.request.Request(
-            api_url,
-            headers={
-                "User-Agent": REDDIT_UA,
-                "Accept": "application/json",
-            },
-        )
-        loop = asyncio.get_event_loop()
-        raw = await loop.run_in_executor(
-            None,
-            lambda: urllib.request.urlopen(req, timeout=8).read().decode(errors="replace"),
-        )
-        data = json.loads(raw)
-        post = data[0]["data"]["children"][0]["data"]
-
-        if post.get("is_video"):
-            print("[reddit-check] Native Reddit video detected.")
-            return True
-
-        post_url = post.get("url", "")
-        if any(domain in post_url for domain in VIDEO_DOMAINS):
-            print(f"[reddit-check] External video link detected: {post_url}")
-            return True
-
-        media = post.get("media") or post.get("secure_media")
-        if media:
-            print("[reddit-check] Media embed detected.")
-            return True
-
-        print(f"[reddit-check] No video found in post (is_video=False, url={post_url})")
-        return False
-
-    except Exception as e:
-        print(f"[reddit-check] Pre-check failed ({e}) — letting yt-dlp try anyway.")
-        return True
-
-
-async def resolve_arazu(url: str) -> str:
-    if "arazu.io" not in url:
-        return url
-    try:
-        print(f"[arazu] Resolving: {url}")
-        req = urllib.request.Request(
-            url,
-            headers={"User-Agent": "Mozilla/5.0 (compatible; CoveBot/1.0)"},
-        )
-        loop = asyncio.get_event_loop()
-        html = await loop.run_in_executor(
-            None,
-            lambda: urllib.request.urlopen(req, timeout=10).read().decode(errors="replace"),
-        )
-        match = REDDIT_RE.search(html)
-        if match:
-            reddit_url = match.group(1).replace("old.reddit.com", "www.reddit.com")
-            print(f"[arazu] Resolved to: {reddit_url}")
-            return reddit_url
-        print("[arazu] Could not find Reddit link in page.")
-    except Exception as e:
-        print(f"[arazu] Fetch error: {e}")
-    return url
+    return URL_RE.sub("", content).strip()
 
 
 def extract_supported_url(content: str) -> str | None:
     for match in URL_RE.finditer(content):
         url = match.group(0).rstrip(").,>")
-        if any(domain in url for domain in BLACKLISTED_DOMAINS):
+        host = hostname_for(url)
+        if host_matches(host, BLACKLISTED_DOMAINS):
             return None
-        if any(domain in url for domain in AUTO_DOWNLOAD_DOMAINS):
+        if host_matches(host, AUTO_DOWNLOAD_DOMAINS):
             return url
     return None
+
+
+def is_friend_server(guild: discord.Guild | None) -> bool:
+    return FRIEND_GUILD_ID != 0 and guild is not None and guild.id == FRIEND_GUILD_ID
 
 
 def get_target_mb(guild: discord.Guild | None) -> float:
@@ -246,24 +202,86 @@ def clean_env():
 ENV = clean_env()
 
 
-async def run_subprocess(cmd: list) -> tuple:
+# ── Subprocess ────────────────────────────────────────────────────────────────
+
+async def run_subprocess(cmd: list[str], timeout: int = SUBPROCESS_TIMEOUT) -> tuple[int, str]:
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
         env=ENV,
     )
-    stdout, _ = await proc.communicate()
+    try:
+        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except asyncio.TimeoutError:
+        proc.kill()
+        stdout, _ = await proc.communicate()
+        output = stdout.decode(errors="replace")
+        return 124, output + "\n[ERROR] Subprocess timed out."
     return proc.returncode, stdout.decode(errors="replace")
 
 
+# ── Reddit helpers ────────────────────────────────────────────────────────────
+
+async def reddit_has_video(url: str) -> bool:
+    if not REDDIT_POST_RE.search(url):
+        return True
+    api_url = url.rstrip("/").split("?")[0] + ".json?limit=1"
+    try:
+        req = urllib.request.Request(
+            api_url,
+            headers={"User-Agent": REDDIT_UA, "Accept": "application/json"},
+        )
+        loop = asyncio.get_running_loop()
+        raw = await loop.run_in_executor(
+            None,
+            lambda: urllib.request.urlopen(req, timeout=8).read().decode(errors="replace"),
+        )
+        data = json.loads(raw)
+        post = data[0]["data"]["children"][0]["data"]
+        if post.get("is_video"):
+            return True
+        post_url = post.get("url", "")
+        if any(domain in post_url for domain in VIDEO_DOMAINS):
+            return True
+        if post.get("media") or post.get("secure_media"):
+            return True
+        log.info("[reddit-check] No video in post (url=%s)", post_url)
+        return False
+    except Exception as e:
+        log.warning("[reddit-check] Pre-check failed (%s) — letting yt-dlp try anyway.", e)
+        return True
+
+
+async def resolve_arazu(url: str) -> str:
+    if "arazu.io" not in url:
+        return url
+    try:
+        log.info("[arazu] Resolving: %s", url)
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "Mozilla/5.0 (compatible; CoveBot/1.0)"},
+        )
+        loop = asyncio.get_running_loop()
+        html = await loop.run_in_executor(
+            None,
+            lambda: urllib.request.urlopen(req, timeout=10).read().decode(errors="replace"),
+        )
+        match = REDDIT_RE.search(html)
+        if match:
+            reddit_url = match.group(1).replace("old.reddit.com", "www.reddit.com")
+            log.info("[arazu] Resolved to: %s", reddit_url)
+            return reddit_url
+        log.warning("[arazu] Could not find Reddit link in page.")
+    except Exception as e:
+        log.warning("[arazu] Fetch error: %s", e)
+    return url
+
+
+# ── ffmpeg helpers ────────────────────────────────────────────────────────────
+
 async def get_duration(filepath: str) -> float | None:
-    cmd = [
-        "ffprobe", "-v", "quiet",
-        "-print_format", "json",
-        "-show_format",
-        filepath,
-    ]
+    cmd = ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", filepath]
     code, out = await run_subprocess(cmd)
     if code != 0:
         return None
@@ -273,24 +291,29 @@ async def get_duration(filepath: str) -> float | None:
         return None
 
 
-async def compress_to_target(src: str, dest: str, target_mb: float) -> tuple:
+async def compress_to_target(src: str, dest: str, target_mb: float) -> tuple[bool, str]:
     duration = await get_duration(src)
     if not duration or duration <= 0:
         return False, "Could not read video duration."
 
-    total_kbits = target_mb * 8 * 1024
-    audio_kbits = AUDIO_KBPS * duration
-    video_kbps  = max(100, int(((total_kbits - audio_kbits) / duration) * 0.92))
+    target_kbits = target_mb * 8 * 1024 * 0.97  # reserve for muxing overhead
+    audio_kbits  = AUDIO_KBPS * duration
+    video_kbps   = max(250, int((target_kbits - audio_kbits) / duration))
 
-    print(f"[ffmpeg] Target: {target_mb}MB | Duration: {duration:.1f}s | Video: {video_kbps}kbps | Audio: {AUDIO_KBPS}kbps")
+    log.info(
+        "[ffmpeg] Target=%sMB Duration=%.1fs Video=%sk Audio=%sk",
+        target_mb, duration, video_kbps, AUDIO_KBPS,
+    )
 
     cmd = [
         "ffmpeg", "-y",
         "-i", src,
         "-c:v", "libx264",
-        "-preset", "ultrafast",
-        "-threads", "0",
+        "-preset", "veryfast",
+        "-pix_fmt", "yuv420p",
         "-b:v", f"{video_kbps}k",
+        "-maxrate", f"{int(video_kbps * 1.15)}k",
+        "-bufsize", f"{int(video_kbps * 2)}k",
         "-c:a", "aac",
         "-b:a", f"{AUDIO_KBPS}k",
         "-movflags", "+faststart",
@@ -298,34 +321,35 @@ async def compress_to_target(src: str, dest: str, target_mb: float) -> tuple:
     ]
     code, out = await run_subprocess(cmd)
     if code != 0:
-        print(f"[ffmpeg ERROR]\n{out}")
+        log.error("[ffmpeg ERROR]\n%s", out)
         return False, out
 
     final_mb = os.path.getsize(dest) / (1024 * 1024)
-    print(f"[ffmpeg] Output: {final_mb:.2f} MB")
+    log.info("[ffmpeg] Output=%.2f MB", final_mb)
     return True, f"{final_mb:.2f} MB"
 
 
+# ── Download pipeline ─────────────────────────────────────────────────────────
+
 async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
-    log = []
+    _log = []
     target_mb   = get_target_mb(guild)
     target_size = int(target_mb * 1024 * 1024)
 
-    log.append(f"[INFO] Boost tier: {guild.premium_tier if guild else 0} — limit: {target_mb}MB")
+    _log.append(f"[INFO] Boost tier: {guild.premium_tier if guild else 0} — limit: {target_mb}MB")
 
-    # Rewrite embed-fixer proxy URLs before anything else
     url = resolve_fixup_url(url)
     url = await resolve_arazu(url)
-    log.append(f"[INFO] URL: {url}")
+    _log.append(f"[INFO] URL: {url}")
 
     is_reddit  = any(d in url for d in ("reddit.com", "redd.it"))
-    is_twitter = any(d in url for d in TWITTER_DOMAINS)
+    is_twitter = host_matches(hostname_for(url), TWITTER_DOMAINS)
 
     if is_reddit:
         has_video = await reddit_has_video(url)
         if not has_video:
-            log.append("[NOVIDEO]")
-            return None, "\n".join(log)
+            _log.append("[NOVIDEO]")
+            return None, "\n".join(_log)
 
     tmp = tempfile.mkdtemp(prefix="cove_", dir=TMP_BASE)
     output_template = str(Path(tmp) / "%(title)s.%(ext)s")
@@ -345,81 +369,80 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
 
     if COOKIES_EXIST:
         cmd.extend(["--cookies", COOKIES_FILE])
-        log.append("[INFO] Using cookies.")
+        _log.append("[INFO] Using cookies.")
     else:
-        log.append("[WARN] No cookies.txt — some sites may fail.")
+        _log.append("[WARN] No cookies.txt — some sites may fail.")
 
     cmd.append(url)
 
-    print(f"[yt-dlp] Running: {' '.join(cmd)}")
-    log.append("[INFO] Downloading...")
+    log.info("[yt-dlp] Running: %s", ' '.join(cmd))
+    _log.append("[INFO] Downloading...")
 
     code, out = await run_subprocess(cmd)
 
-    print(f"[yt-dlp] Exit code: {code}")
-    print(f"[yt-dlp] Output:\n{out}")
-    log.append(out.strip())
+    log.info("[yt-dlp] Exit code: %d", code)
+    log.debug("[yt-dlp] Output:\n%s", out)
+    _log.append(out.strip())
 
     if code != 0:
         if any(phrase.lower() in out.lower() for phrase in NO_VIDEO_PHRASES):
-            print(f"[cove] No video / network issue on embedded domain — ignoring silently.")
-            log.append("[NOVIDEO]")
+            log.info("[cove] No video / network issue — ignoring silently.")
+            _log.append("[NOVIDEO]")
         elif "Unsupported URL" in out and is_reddit and any(p in out for p in REDDIT_SILENT_URL_PATTERNS):
-            print(f"[cove] Reddit GIF/image URL — ignoring silently.")
-            log.append("[NOVIDEO]")
+            log.info("[cove] Reddit GIF/image URL — ignoring silently.")
+            _log.append("[NOVIDEO]")
         elif "Unsupported URL" in out and is_twitter:
-            print(f"[cove] X/Twitter post has no downloadable video — ignoring silently.")
-            log.append("[NOVIDEO]")
+            log.info("[cove] X/Twitter post has no downloadable video — ignoring silently.")
+            _log.append("[NOVIDEO]")
         elif "Sign in to confirm" in out or "bot" in out.lower():
-            log.append("[ERROR] YouTube bot detection triggered.")
+            _log.append("[ERROR] YouTube bot detection triggered.")
         elif "Unsupported URL" in out:
-            log.append("[ERROR] Unsupported or private URL.")
+            _log.append("[ERROR] Unsupported or private URL.")
         elif "HTTP Error 403" in out:
-            log.append("[ERROR] Access denied (403). Cookies may be needed or expired.")
+            _log.append("[ERROR] Access denied (403). Cookies may be needed or expired.")
         elif "HTTP Error 404" in out:
-            log.append("[ERROR] Video not found (404).")
+            _log.append("[ERROR] Video not found (404).")
         else:
             last_error = out.strip().splitlines()[-1] if out.strip() else "Unknown error."
-            log.append(f"[ERROR] {last_error}")
+            _log.append(f"[ERROR] {last_error}")
         shutil.rmtree(tmp, ignore_errors=True)
-        return None, "\n".join(log)
+        return None, "\n".join(_log)
 
     mp4_files = list(Path(tmp).glob("*.mp4"))
     if not mp4_files:
-        any_video = list(Path(tmp).glob("*"))
-        print(f"[cove] Temp dir contents: {[f.name for f in any_video]}")
-        log.append("[ERROR] No MP4 file found after download.")
+        log.warning("[cove] Temp dir contents: %s", [f.name for f in Path(tmp).glob("*")])
+        _log.append("[ERROR] No MP4 file found after download.")
         shutil.rmtree(tmp, ignore_errors=True)
-        return None, "\n".join(log)
+        return None, "\n".join(_log)
 
     src_path = str(mp4_files[0])
     orig_mb  = os.path.getsize(src_path) / (1024 * 1024)
-    log.append(f"[INFO] Downloaded: {orig_mb:.1f} MB")
-    print(f"[cove] Downloaded: {mp4_files[0].name} ({orig_mb:.1f} MB)")
+    _log.append(f"[INFO] Downloaded: {orig_mb:.1f} MB")
+    log.info("[cove] Downloaded: %s (%.1f MB)", mp4_files[0].name, orig_mb)
 
     duration = await get_duration(src_path)
     if duration and duration > MAX_DURATION_SECONDS:
         mins = int(duration // 60)
         secs = int(duration % 60)
-        print(f"[cove] Rejected after download: {mins}m{secs}s")
+        log.info("[cove] Rejected after download: %dm%ds", mins, secs)
         shutil.rmtree(tmp, ignore_errors=True)
-        log.append(f"[TOOBIG] {mins}m{secs}s")
-        return None, "\n".join(log)
+        _log.append(f"[TOOBIG] {mins}m{secs}s")
+        return None, "\n".join(_log)
 
     if os.path.getsize(src_path) <= target_size:
-        log.append(f"[INFO] Under {target_mb}MB — skipping compression.")
-        return src_path, "\n".join(log)
+        _log.append(f"[INFO] Under {target_mb}MB — skipping compression.")
+        return src_path, "\n".join(_log)
 
     compressed = str(Path(tmp) / "compressed.mp4")
-    log.append(f"[INFO] Compressing to \u2264{target_mb}MB...")
+    _log.append(f"[INFO] Compressing to \u2264{target_mb}MB...")
     ok, result = await compress_to_target(src_path, compressed, target_mb)
 
     if ok:
-        log.append(f"[OK] Final size: {result}")
-        return compressed, "\n".join(log)
+        _log.append(f"[OK] Final size: {result}")
+        return compressed, "\n".join(_log)
     else:
-        log.append(f"[WARN] Compression failed. Using original.")
-        return src_path, "\n".join(log)
+        _log.append("[WARN] Compression failed. Using original.")
+        return src_path, "\n".join(_log)
 
 
 def cleanup_tmp(filepath: str):
@@ -433,48 +456,54 @@ def cleanup_tmp(filepath: str):
         pass
 
 
-async def process_url(url: str, guild: discord.Guild | None,
-                      on_success, on_error, on_too_big=None, on_no_video=None):
-    try:
-        filepath, log = await download_and_compress(url, guild)
-    except Exception as e:
-        tb = traceback.format_exc()
-        print(f"[cove] UNHANDLED EXCEPTION:\n{tb}")
-        await on_error(f"Unexpected error: {e}")
-        return
+async def process_url(
+    url: str,
+    guild: discord.Guild | None,
+    on_success,
+    on_error,
+    on_too_big=None,
+    on_no_video=None,
+):
+    async with JOB_SEMAPHORE:
+        try:
+            filepath, log_text = await download_and_compress(url, guild)
+        except Exception as e:
+            log.exception("Unhandled exception during process_url")
+            await on_error(f"Unexpected error: {e}")
+            return
 
-    if any(l.strip() == "[NOVIDEO]" for l in log.splitlines()):
-        if on_no_video:
-            await on_no_video()
-        return
+        if any(line.strip() == "[NOVIDEO]" for line in log_text.splitlines()):
+            if on_no_video:
+                await on_no_video()
+            return
 
-    toobig_lines = [l for l in log.splitlines() if l.startswith("[TOOBIG]")]
-    if toobig_lines:
-        duration_str = toobig_lines[0].replace("[TOOBIG] ", "")
-        if on_too_big:
-            await on_too_big(duration_str)
-        else:
-            await on_error(f"Video too big {NYO_EMOJI} ({duration_str}, max {MAX_DURATION_SECONDS//60}min)")
-        return
+        toobig_lines = [line for line in log_text.splitlines() if line.startswith("[TOOBIG]")]
+        if toobig_lines:
+            duration_str = toobig_lines[0].replace("[TOOBIG] ", "")
+            if on_too_big:
+                await on_too_big(duration_str)
+            else:
+                await on_error(f"Video too big {NYO_EMOJI} ({duration_str}, max {MAX_DURATION_SECONDS // 60}min)")
+            return
 
-    if not filepath or not os.path.exists(filepath):
-        error_lines = [l for l in log.splitlines() if l.startswith("[ERROR]")]
-        msg = error_lines[-1].replace("[ERROR] ", "") if error_lines else "Download failed."
-        print(f"[cove] Download failed. Full log:\n{log}")
-        await on_error(msg)
-        return
+        if not filepath or not os.path.exists(filepath):
+            error_lines = [line for line in log_text.splitlines() if line.startswith("[ERROR]")]
+            msg = error_lines[-1].replace("[ERROR] ", "") if error_lines else "Download failed."
+            log.error("Download failed. Full log:\n%s", log_text)
+            await on_error(msg)
+            return
 
-    try:
-        await on_success(filepath)
-    except Exception as e:
-        tb = traceback.format_exc()
-        print(f"[cove] UNHANDLED EXCEPTION in on_success:\n{tb}")
-        await on_error(f"Upload failed: {e}")
-    finally:
-        cleanup_tmp(filepath)
+        try:
+            await on_success(filepath)
+        except Exception as e:
+            log.exception("Unhandled exception in on_success")
+            await on_error(f"Upload failed: {e}")
+        finally:
+            cleanup_tmp(filepath)
 
 
-# ── Bot ────────────────────────────────────────────────────────────
+# ── Bot ───────────────────────────────────────────────────────────────────────
+
 class CoveBot(discord.Client):
     def __init__(self):
         intents = discord.Intents.default()
@@ -487,14 +516,14 @@ class CoveBot(discord.Client):
         guild = discord.Object(id=GUILD_ID)
         self.tree.copy_global_to(guild=guild)
         await self.tree.sync(guild=guild)
-        print(f"[Cove] Slash commands synced to guild {GUILD_ID}")
+        log.info("[Cove] Slash commands synced to guild %d", GUILD_ID)
 
     async def on_ready(self):
-        print(f"[Cove] Logged in as {self.user} (ID: {self.user.id})")
+        log.info("[Cove] Logged in as %s (ID: %d)", self.user, self.user.id)
         await self.change_presence(
             activity=discord.Activity(
                 type=discord.ActivityType.watching,
-                name="for links & /download"
+                name="for links & /download",
             )
         )
 
@@ -506,7 +535,7 @@ class CoveBot(discord.Client):
         if not url:
             return
 
-        print(f"[Cove] Auto-triggered by {message.author} in #{message.channel}: {url}")
+        log.info("[Cove] Auto-triggered by %s in #%s: %s", message.author, message.channel, url)
 
         try:
             await message.add_reaction("\u23f3")
@@ -525,24 +554,17 @@ class CoveBot(discord.Client):
                 pass
 
             if friend_mode:
-                # ── Friend server: embed ("Sin posted:") + ping tagged users only ──
+                # Friend server: embed ("Sin posted:") + ping tagged users only
                 embed = discord.Embed()
                 embed.set_author(
                     name=f"{display_name} posted:",
                     icon_url=message.author.display_avatar.url,
                 )
-
-                # Only include extra @mentions in content (not the original poster)
-                # If nobody was tagged, send with no content so there's no ping at all
                 await message.channel.send(
                     content=extra_mentions if extra_mentions else None,
                     embed=embed,
                     file=discord.File(filepath),
-                    allowed_mentions=discord.AllowedMentions(
-                        users=True,
-                        everyone=False,
-                        roles=False,
-                    ),
+                    allowed_mentions=discord.AllowedMentions(users=True, everyone=False, roles=False),
                 )
                 try:
                     await message.delete()
@@ -550,7 +572,7 @@ class CoveBot(discord.Client):
                     pass
 
             else:
-                # ── Main server: silent tag, no embed ──────────────────────────────
+                # Main server: silent tag, no embed
                 content = f"<@{author_id}> posted:"
                 if extra_mentions:
                     content += f" {extra_mentions}"
@@ -561,7 +583,9 @@ class CoveBot(discord.Client):
                     allowed_mentions=discord.AllowedMentions(users=False),
                 )
 
-                _deletable[sent.id] = author_id
+                prune_deletable()
+                _deletable[sent.id] = (author_id, monotonic() + DELETE_TTL_SECONDS)
+
                 try:
                     await sent.add_reaction("\u274c")
                 except discord.HTTPException:
@@ -584,7 +608,7 @@ class CoveBot(discord.Client):
                 await message.remove_reaction("\u23f3", self.user)
             except discord.HTTPException:
                 pass
-            msg = f"Video too big {NYO_EMOJI} ({duration_str}, max {MAX_DURATION_SECONDS//60}min)"
+            msg = f"Video too big {NYO_EMOJI} ({duration_str}, max {MAX_DURATION_SECONDS // 60}min)"
             try:
                 await message.reply(msg, mention_author=False)
             except discord.HTTPException:
@@ -608,13 +632,15 @@ class CoveBot(discord.Client):
         """Main server only: let the original poster delete the bot's video message via ❌."""
         if payload.user_id == self.user.id:
             return
-
         if str(payload.emoji) != "\u274c":
             return
 
-        original_poster_id = _deletable.get(payload.message_id)
-        if original_poster_id is None:
+        prune_deletable()
+        entry = _deletable.get(payload.message_id)
+        if entry is None:
             return
+
+        original_poster_id, _ = entry
 
         if payload.user_id != original_poster_id:
             channel = self.get_channel(payload.channel_id)
@@ -642,7 +668,7 @@ client = CoveBot()
 
 @client.tree.command(
     name="download",
-    description="Download and compress a video from any supported site"
+    description="Download and compress a video from any supported site",
 )
 @app_commands.describe(url="The video URL to download")
 async def download_cmd(interaction: discord.Interaction, url: str):

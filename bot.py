@@ -87,6 +87,18 @@ TWITTER_DOMAINS = {
     "twitter.com",
 }
 
+VIDEO_DOMAINS = {
+    "v.redd.it",
+    "youtube.com",
+    "youtu.be",
+    "streamable.com",
+    "gfycat.com",
+    "redgifs.com",
+    "clips.twitch.tv",
+    "twitch.tv",
+    "vimeo.com",
+}
+
 NO_VIDEO_PHRASES = (
     "No video could be found",
     "no video",
@@ -111,18 +123,6 @@ TMP_BASE = "/dev/shm" if os.path.isdir("/dev/shm") else None
 URL_RE         = re.compile(r"https?://[^\s]+")
 REDDIT_RE      = re.compile(r'href="(https?://(?:old\.)?reddit\.com/r/[^/]+/comments/[^"]+)"')
 REDDIT_POST_RE = re.compile(r'reddit\.com/r/[^/]+/comments/')
-
-VIDEO_DOMAINS = (
-    "v.redd.it",
-    "youtube.com",
-    "youtu.be",
-    "streamable.com",
-    "gfycat.com",
-    "redgifs.com",
-    "clips.twitch.tv",
-    "twitch.tv",
-    "vimeo.com",
-)
 
 REDDIT_UA = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -176,7 +176,7 @@ def extract_supported_url(content: str) -> str | None:
         url = match.group(0).rstrip(").,>")
         host = hostname_for(url)
         if host_matches(host, BLACKLISTED_DOMAINS):
-            return None
+            continue  # skip blacklisted URLs and keep scanning
         if host_matches(host, AUTO_DOWNLOAD_DOMAINS):
             return url
     return None
@@ -242,7 +242,7 @@ async def reddit_has_video(url: str) -> bool:
         if post.get("is_video"):
             return True
         post_url = post.get("url", "")
-        if any(domain in post_url for domain in VIDEO_DOMAINS):
+        if host_matches(hostname_for(post_url), VIDEO_DOMAINS):
             return True
         if post.get("media") or post.get("secure_media"):
             return True
@@ -254,7 +254,7 @@ async def reddit_has_video(url: str) -> bool:
 
 
 async def resolve_arazu(url: str) -> str:
-    if "arazu.io" not in url:
+    if not host_matches(hostname_for(url), {"arazu.io"}):
         return url
     try:
         log.info("[arazu] Resolving: %s", url)
@@ -324,8 +324,15 @@ async def compress_to_target(src: str, dest: str, target_mb: float) -> tuple[boo
         log.error("[ffmpeg ERROR]\n%s", out)
         return False, out
 
-    final_mb = os.path.getsize(dest) / (1024 * 1024)
+    final_size = os.path.getsize(dest)
+    final_mb   = final_size / (1024 * 1024)
+    target_size = int(target_mb * 1024 * 1024)
     log.info("[ffmpeg] Output=%.2f MB", final_mb)
+
+    if final_size > target_size:
+        log.warning("[ffmpeg] Overshot target: %.2f MB > %.2f MB", final_mb, target_mb)
+        return False, f"Compressed file ({final_mb:.2f} MB) still exceeds the {target_mb} MB limit."
+
     return True, f"{final_mb:.2f} MB"
 
 
@@ -342,7 +349,7 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
     url = await resolve_arazu(url)
     _log.append(f"[INFO] URL: {url}")
 
-    is_reddit  = any(d in url for d in ("reddit.com", "redd.it"))
+    is_reddit  = host_matches(hostname_for(url), {"reddit.com", "redd.it"})
     is_twitter = host_matches(hostname_for(url), TWITTER_DOMAINS)
 
     if is_reddit:

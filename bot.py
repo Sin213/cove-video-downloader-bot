@@ -132,6 +132,9 @@ REDDIT_UA = (
 # bot_message_id -> (original_poster_id, expires_at)
 _deletable: dict[int, tuple[int, float]] = {}
 
+# friend server: bot_message_id -> original_human_user_id
+_friend_posts: dict[int, int] = {}
+
 
 def prune_deletable() -> None:
     now = monotonic()
@@ -176,7 +179,7 @@ def extract_supported_url(content: str) -> str | None:
         url = match.group(0).rstrip(").,>")
         host = hostname_for(url)
         if host_matches(host, BLACKLISTED_DOMAINS):
-            continue  # skip blacklisted URLs and keep scanning
+            continue
         if host_matches(host, AUTO_DOWNLOAD_DOMAINS):
             return url
     return None
@@ -296,7 +299,7 @@ async def compress_to_target(src: str, dest: str, target_mb: float) -> tuple[boo
     if not duration or duration <= 0:
         return False, "Could not read video duration."
 
-    target_kbits = target_mb * 8 * 1024 * 0.97  # reserve for muxing overhead
+    target_kbits = target_mb * 8 * 1024 * 0.97
     audio_kbits  = AUDIO_KBPS * duration
     video_kbps   = max(250, int((target_kbits - audio_kbits) / duration))
 
@@ -324,8 +327,8 @@ async def compress_to_target(src: str, dest: str, target_mb: float) -> tuple[boo
         log.error("[ffmpeg ERROR]\n%s", out)
         return False, out
 
-    final_size = os.path.getsize(dest)
-    final_mb   = final_size / (1024 * 1024)
+    final_size  = os.path.getsize(dest)
+    final_mb    = final_size / (1024 * 1024)
     target_size = int(target_mb * 1024 * 1024)
     log.info("[ffmpeg] Output=%.2f MB", final_mb)
 
@@ -447,7 +450,6 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
         _log.append(f"[OK] Final size: {result}")
         return compressed, "\n".join(_log)
     else:
-        # Smart fallback: only use the original if it fits the server's upload limit
         if orig_mb > target_mb:
             _log.append(f"[ERROR] Compression failed, and original ({orig_mb:.1f}MB) is too big for Discord.")
             shutil.rmtree(tmp, ignore_errors=True)
@@ -543,6 +545,8 @@ class CoveBot(discord.Client):
         if message.author.bot:
             return
 
+        # Friend server only: intercept replies to Cove bot messages and
+        # repost them pinging the original human who triggered the bot.
         if is_friend_server(message.guild) and message.reference and self.user:
             try:
                 referenced = message.reference.resolved
@@ -551,8 +555,11 @@ class CoveBot(discord.Client):
                 if isinstance(referenced, discord.Message) and referenced.author.id == self.user.id:
                     content = message.content.strip()
                     if content:
+                        # Look up the original human who posted the video.
+                        # Falls back to the bot itself only if somehow not found.
+                        target_user_id = _friend_posts.get(referenced.id, referenced.author.id)
                         await message.channel.send(
-                            content=f"<@{referenced.author.id}> {content}",
+                            content=f"<@{target_user_id}> {content}",
                             allowed_mentions=discord.AllowedMentions(users=True, everyone=False, roles=False),
                         )
                         try:
@@ -591,12 +598,14 @@ class CoveBot(discord.Client):
                     name=f"{display_name} posted:",
                     icon_url=message.author.display_avatar.url,
                 )
-                await message.channel.send(
+                sent = await message.channel.send(
                     content=extra_mentions if extra_mentions else None,
                     embed=embed,
                     file=discord.File(filepath),
                     allowed_mentions=discord.AllowedMentions(users=True, everyone=False, roles=False),
                 )
+                # Store the mapping so replies to this bot message ping the right human.
+                _friend_posts[sent.id] = author_id
                 try:
                     await message.delete()
                 except discord.HTTPException:

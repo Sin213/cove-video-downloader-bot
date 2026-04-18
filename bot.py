@@ -545,8 +545,9 @@ class CoveBot(discord.Client):
         if message.author.bot:
             return
 
-        # Friend server only: intercept replies to Cove bot messages and
-        # repost them pinging the original human who triggered the bot.
+        # Friend server only: intercept replies to Cove bot messages.
+        # Delete the user's reply and repost it as a reply to the same bot
+        # message, pinging the original human who triggered the bot.
         if is_friend_server(message.guild) and message.reference and self.user:
             try:
                 referenced = message.reference.resolved
@@ -555,18 +556,23 @@ class CoveBot(discord.Client):
                 if isinstance(referenced, discord.Message) and referenced.author.id == self.user.id:
                     content = message.content.strip()
                     if content:
-                        # Look up the original human who posted the video.
-                        # Falls back to the bot itself only if somehow not found.
-                        target_user_id = _friend_posts.get(referenced.id, referenced.author.id)
-                        await message.channel.send(
-                            content=f"<@{target_user_id}> {content}",
-                            allowed_mentions=discord.AllowedMentions(users=True, everyone=False, roles=False),
-                        )
-                        try:
-                            await message.delete()
-                        except discord.HTTPException:
+                        # Look up who originally posted the video.
+                        # Only skip if not in dict (message predates this feature or bot restart).
+                        target_user_id = _friend_posts.get(referenced.id)
+                        if target_user_id is None:
+                            # Can't determine original poster — pass through untouched.
                             pass
-                        return
+                        else:
+                            await message.channel.send(
+                                content=f"<@{target_user_id}> {content}",
+                                reference=referenced,
+                                allowed_mentions=discord.AllowedMentions(users=True, everyone=False, roles=False),
+                            )
+                            try:
+                                await message.delete()
+                            except discord.HTTPException:
+                                pass
+                            return
             except discord.HTTPException:
                 pass
 

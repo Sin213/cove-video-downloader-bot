@@ -556,8 +556,6 @@ class CoveBot(discord.Client):
                 if isinstance(referenced, discord.Message) and referenced.author.id == self.user.id:
                     content = message.content.strip()
                     if content:
-                        # Look up who originally posted the video.
-                        # Only skip if not in dict (message predates this feature or bot restart).
                         target_user_id = _friend_posts.get(referenced.id)
                         if target_user_id is None:
                             # Can't determine original poster — pass through untouched.
@@ -610,7 +608,6 @@ class CoveBot(discord.Client):
                     file=discord.File(filepath),
                     allowed_mentions=discord.AllowedMentions(users=True, everyone=False, roles=False),
                 )
-                # Store the mapping so replies to this bot message ping the right human.
                 _friend_posts[sent.id] = author_id
                 try:
                     await message.delete()
@@ -722,8 +719,24 @@ async def download_cmd(interaction: discord.Interaction, url: str):
     except (discord.errors.NotFound, discord.errors.HTTPException):
         return
 
+    friend_mode = is_friend_server(interaction.guild)
+    poster_id   = interaction.user.id
+
     async def on_success(filepath: str):
-        await interaction.followup.send(file=discord.File(filepath))
+        if friend_mode:
+            embed = discord.Embed()
+            embed.set_author(
+                name=f"{interaction.user.display_name} posted:",
+                icon_url=interaction.user.display_avatar.url,
+            )
+            sent = await interaction.followup.send(
+                embed=embed,
+                file=discord.File(filepath),
+            )
+            # Track so replies to this message ping the right person
+            _friend_posts[sent.id] = poster_id
+        else:
+            await interaction.followup.send(file=discord.File(filepath))
 
     async def on_error(msg: str):
         await interaction.followup.send(f"\u274c {msg}")

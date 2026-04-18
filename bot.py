@@ -543,6 +543,26 @@ class CoveBot(discord.Client):
         if message.author.bot:
             return
 
+        if is_friend_server(message.guild) and message.reference and self.user:
+            try:
+                referenced = message.reference.resolved
+                if referenced is None and message.reference.message_id:
+                    referenced = await message.channel.fetch_message(message.reference.message_id)
+                if isinstance(referenced, discord.Message) and referenced.author.id == self.user.id:
+                    content = message.content.strip()
+                    if content:
+                        await message.channel.send(
+                            content=f"<@{referenced.author.id}> {content}",
+                            allowed_mentions=discord.AllowedMentions(users=True, everyone=False, roles=False),
+                        )
+                        try:
+                            await message.delete()
+                        except discord.HTTPException:
+                            pass
+                        return
+            except discord.HTTPException:
+                pass
+
         url = extract_supported_url(message.content)
         if not url:
             return

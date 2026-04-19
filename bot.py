@@ -69,6 +69,8 @@ AUTO_DOWNLOAD_DOMAINS = {
     "fxtwitter.com",
     "vxtwitter.com",
     "twittpr.com",
+    "twitch.tv",
+    "clips.twitch.tv",
 }
 
 BLACKLISTED_DOMAINS = {

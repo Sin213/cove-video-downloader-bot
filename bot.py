@@ -73,6 +73,8 @@ AUTO_DOWNLOAD_DOMAINS = {
 
 BLACKLISTED_DOMAINS = {
     "kkinstagram.com",
+    "youtube.com",
+    "youtu.be",
 }
 
 FIXUP_DOMAINS = {

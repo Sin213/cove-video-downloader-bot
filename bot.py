@@ -610,7 +610,7 @@ class CoveBot(discord.Client):
                     content=extra_mentions if extra_mentions else None,
                     embed=embed,
                     file=discord.File(filepath),
-                    allowed_mentions=discord.AllowedMentions(users=True, everyone=False, roles=False),
+                    allowed_mentions=discord.AllowedMentions(users=False, everyone=False, roles=False),
                 )
                 _friend_posts[sent.id] = author_id
                 try:

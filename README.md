@@ -24,12 +24,15 @@ A self-hosted Discord bot that automatically detects video links in chat and dow
 
 Anything yt-dlp supports, with auto-download triggered for:
 
-- Twitter / X
+- Twitter / X (and fixup mirrors: fxtwitter, vxtwitter, fixupx, twittpr)
 - Reddit
 - TikTok
 - Instagram
-- YouTube
+- Twitch (incl. clips)
 - arazu.io
+
+YouTube is intentionally **not** auto-triggered (Google's bot-detection makes it
+unreliable in unattended runs). It's still available via `/download <youtube-url>`.
 
 ---
 

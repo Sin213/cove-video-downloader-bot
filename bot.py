@@ -3,13 +3,15 @@ from __future__ import annotations
 import discord
 from discord import app_commands
 import asyncio
+import ipaddress
 import logging
 import os
 import re
 import shutil
+import socket
+import sys
 import tempfile
 import json
-import traceback
 import urllib.request
 from pathlib import Path
 from time import monotonic
@@ -24,9 +26,28 @@ logging.basicConfig(
 )
 log = logging.getLogger("cove")
 
+
+def _require_int_env(name: str, *, allow_zero: bool = True, default: str | None = None) -> int:
+    raw = os.getenv(name, default)
+    if raw is None or raw == "":
+        if default is None:
+            sys.exit(f"[Cove] Required env var {name} is missing.")
+        raw = default
+    try:
+        value = int(raw)
+    except ValueError:
+        sys.exit(f"[Cove] Env var {name} must be an integer (got: {raw!r}).")
+    if not allow_zero and value == 0:
+        sys.exit(f"[Cove] Env var {name} must be non-zero.")
+    return value
+
+
 TOKEN           = os.getenv("DISCORD_TOKEN")
-GUILD_ID        = int(os.getenv("GUILD_ID", "0"))
-FRIEND_GUILD_ID = int(os.getenv("FRIEND_GUILD_ID", "0"))
+if not TOKEN:
+    sys.exit("[Cove] Required env var DISCORD_TOKEN is missing.")
+
+GUILD_ID        = _require_int_env("GUILD_ID", allow_zero=False)
+FRIEND_GUILD_ID = _require_int_env("FRIEND_GUILD_ID", allow_zero=True, default="0")
 
 _WHITELIST_RAW = os.getenv("WHITELIST_USER_IDS", "")
 WHITELIST_IDS = {
@@ -42,9 +63,12 @@ AUDIO_KBPS           = 128
 MAX_DURATION_SECONDS = 600
 NYO_EMOJI            = "<:NYO:1312902725750624316>"
 
-MAX_CONCURRENT_JOBS = int(os.getenv("MAX_CONCURRENT_JOBS", "3"))
-SUBPROCESS_TIMEOUT  = int(os.getenv("SUBPROCESS_TIMEOUT", "900"))
-DELETE_TTL_SECONDS  = int(os.getenv("DELETE_TTL_SECONDS", "21600"))
+MAX_CONCURRENT_JOBS    = _require_int_env("MAX_CONCURRENT_JOBS", default="3")
+SUBPROCESS_TIMEOUT     = _require_int_env("SUBPROCESS_TIMEOUT", default="900")
+DELETE_TTL_SECONDS     = _require_int_env("DELETE_TTL_SECONDS", default="21600")
+FRIEND_POST_TTL_SECONDS = _require_int_env("FRIEND_POST_TTL_SECONDS", default="86400")
+YT_DLP_FRAGMENTS       = _require_int_env("YT_DLP_FRAGMENTS", default="4")
+MAX_FILESIZE_MB        = _require_int_env("MAX_FILESIZE_MB", default="500")
 
 JOB_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
 
@@ -62,8 +86,6 @@ AUTO_DOWNLOAD_DOMAINS = {
     "redd.it",
     "tiktok.com",
     "instagram.com",
-    "youtube.com",
-    "youtu.be",
     "arazu.io",
     "fixupx.com",
     "fxtwitter.com",
@@ -73,10 +95,10 @@ AUTO_DOWNLOAD_DOMAINS = {
     "clips.twitch.tv",
 }
 
+# YouTube is intentionally excluded from auto-download (bot-detection makes it
+# unreliable in unattended runs); still reachable via /download.
 BLACKLISTED_DOMAINS = {
     "kkinstagram.com",
-    "youtube.com",
-    "youtu.be",
 }
 
 FIXUP_DOMAINS = {
@@ -136,8 +158,28 @@ REDDIT_UA = (
 # bot_message_id -> (original_poster_id, expires_at)
 _deletable: dict[int, tuple[int, float]] = {}
 
-# friend server: bot_message_id -> original_human_user_id
-_friend_posts: dict[int, int] = {}
+# friend server: bot_message_id -> (original_human_user_id, expires_at)
+_friend_posts: dict[int, tuple[int, float]] = {}
+
+# Background tasks we own — keep references so they aren't GC'd mid-flight and
+# so exceptions are surfaced via the done-callback instead of disappearing.
+_active_tasks: set[asyncio.Task] = set()
+
+
+def _on_task_done(task: asyncio.Task) -> None:
+    _active_tasks.discard(task)
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        log.error("Background task crashed: %s", exc, exc_info=exc)
+
+
+def spawn_tracked(coro) -> asyncio.Task:
+    task = asyncio.create_task(coro)
+    _active_tasks.add(task)
+    task.add_done_callback(_on_task_done)
+    return task
 
 
 def prune_deletable() -> None:
@@ -145,6 +187,13 @@ def prune_deletable() -> None:
     expired = [mid for mid, (_, expires_at) in _deletable.items() if expires_at <= now]
     for mid in expired:
         _deletable.pop(mid, None)
+
+
+def prune_friend_posts() -> None:
+    now = monotonic()
+    expired = [mid for mid, (_, expires_at) in _friend_posts.items() if expires_at <= now]
+    for mid in expired:
+        _friend_posts.pop(mid, None)
 
 
 # ── Hostname helpers (safe URL matching) ──────────────────────────────────────
@@ -187,6 +236,51 @@ def extract_supported_url(content: str) -> str | None:
         if host_matches(host, AUTO_DOWNLOAD_DOMAINS):
             return url
     return None
+
+
+def _is_internal_ip(ip_str: str) -> bool:
+    try:
+        addr = ipaddress.ip_address(ip_str)
+    except ValueError:
+        return False
+    return (
+        addr.is_private
+        or addr.is_loopback
+        or addr.is_link_local
+        or addr.is_reserved
+        or addr.is_multicast
+        or addr.is_unspecified
+    )
+
+
+def validate_manual_url(url: str) -> tuple[bool, str]:
+    """Sanity-check a user-supplied URL for /download.
+
+    Allows arbitrary public hosts (yt-dlp's strength) but rejects schemes
+    other than http(s) and any host that resolves to a non-public address.
+    Reduces the SSRF surface from arbitrary user input.
+    """
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return False, "Invalid URL."
+    if parsed.scheme not in ("http", "https"):
+        return False, "Only http(s) URLs are allowed."
+    host = (parsed.hostname or "").lower()
+    if not host:
+        return False, "URL has no host."
+    if host in {"localhost", "ip6-localhost", "ip6-loopback"}:
+        return False, "URL points to a non-public address."
+    if _is_internal_ip(host):
+        return False, "URL points to a non-public address."
+    try:
+        infos = socket.getaddrinfo(host, None)
+    except socket.gaierror:
+        return False, "Could not resolve URL host."
+    for info in infos:
+        if _is_internal_ip(info[4][0]):
+            return False, "URL points to a non-public address."
+    return True, ""
 
 
 def is_friend_server(guild: discord.Guild | None) -> bool:
@@ -372,11 +466,12 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
         "yt-dlp",
         "-f", "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
         "--merge-output-format", "mp4",
-        "-N", "16",
+        "-N", str(YT_DLP_FRAGMENTS),
         "--no-part",
-        "--no-check-certificates",
         "--no-playlist",
         "--extractor-retries", "0",
+        "--max-filesize", f"{MAX_FILESIZE_MB}M",
+        "--match-filter", f"!duration | duration<={MAX_DURATION_SECONDS}",
         "-o", output_template,
     ]
 
@@ -560,13 +655,16 @@ class CoveBot(discord.Client):
                 if isinstance(referenced, discord.Message) and referenced.author.id == self.user.id:
                     content = message.content.strip()
                     if content:
-                        target_user_id = _friend_posts.get(referenced.id)
-                        if target_user_id is None:
+                        prune_friend_posts()
+                        entry = _friend_posts.get(referenced.id)
+                        if entry is None:
                             # Can't determine original poster — pass through untouched.
                             pass
                         else:
+                            target_user_id, _ = entry
+                            replier_name = message.author.display_name
                             await message.channel.send(
-                                content=f"<@{target_user_id}> {content}",
+                                content=f"<@{target_user_id}> **{replier_name}**: {content}",
                                 reference=referenced,
                                 allowed_mentions=discord.AllowedMentions(users=True, everyone=False, roles=False),
                             )
@@ -612,7 +710,8 @@ class CoveBot(discord.Client):
                     file=discord.File(filepath),
                     allowed_mentions=discord.AllowedMentions(users=False, everyone=False, roles=False),
                 )
-                _friend_posts[sent.id] = author_id
+                prune_friend_posts()
+                _friend_posts[sent.id] = (author_id, monotonic() + FRIEND_POST_TTL_SECONDS)
                 try:
                     await message.delete()
                 except discord.HTTPException:
@@ -670,7 +769,7 @@ class CoveBot(discord.Client):
             except discord.HTTPException:
                 await message.channel.send(f"\u274c {msg}")
 
-        asyncio.create_task(
+        spawn_tracked(
             process_url(url, message.guild, on_success, on_error, on_too_big, on_no_video)
         )
 
@@ -718,6 +817,14 @@ client = CoveBot()
 )
 @app_commands.describe(url="The video URL to download")
 async def download_cmd(interaction: discord.Interaction, url: str):
+    ok, err = validate_manual_url(url)
+    if not ok:
+        try:
+            await interaction.response.send_message(f"❌ {err}", ephemeral=True)
+        except (discord.errors.NotFound, discord.errors.HTTPException):
+            pass
+        return
+
     try:
         await interaction.response.defer(thinking=True)
     except (discord.errors.NotFound, discord.errors.HTTPException):
@@ -737,8 +844,8 @@ async def download_cmd(interaction: discord.Interaction, url: str):
                 embed=embed,
                 file=discord.File(filepath),
             )
-            # Track so replies to this message ping the right person
-            _friend_posts[sent.id] = poster_id
+            prune_friend_posts()
+            _friend_posts[sent.id] = (poster_id, monotonic() + FRIEND_POST_TTL_SECONDS)
         else:
             await interaction.followup.send(file=discord.File(filepath))
 

@@ -471,7 +471,10 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
         "--no-playlist",
         "--extractor-retries", "0",
         "--max-filesize", f"{MAX_FILESIZE_MB}M",
-        "--match-filter", f"!duration | duration<={MAX_DURATION_SECONDS}",
+        # OR semantics across repeated --match-filter: accept if duration is
+        # missing OR within limit. Post-download check still catches stragglers.
+        "--match-filter", "!duration",
+        "--match-filter", f"duration <= {MAX_DURATION_SECONDS}",
         "-o", output_template,
     ]
 

@@ -496,6 +496,20 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
     log.debug("[yt-dlp] Output:\n%s", out)
     _log.append(out.strip())
 
+    # yt-dlp short-circuits with exit 0 when --match-filter / --max-filesize
+    # reject the entry. Map those to the user-facing "too big" path so the
+    # message doesn't degenerate to "No MP4 file found after download".
+    if "does not pass filter" in out:
+        log.info("[cove] Rejected by match-filter (>%dmin)", MAX_DURATION_SECONDS // 60)
+        shutil.rmtree(tmp, ignore_errors=True)
+        _log.append(f"[TOOBIG] >{MAX_DURATION_SECONDS // 60}min")
+        return None, "\n".join(_log)
+    if "larger than max-filesize" in out.lower() or "file is larger than max" in out.lower():
+        log.info("[cove] Rejected by max-filesize (>%dMB)", MAX_FILESIZE_MB)
+        shutil.rmtree(tmp, ignore_errors=True)
+        _log.append(f"[TOOBIG] >{MAX_FILESIZE_MB}MB")
+        return None, "\n".join(_log)
+
     if code != 0:
         if any(phrase.lower() in out.lower() for phrase in NO_VIDEO_PHRASES):
             log.info("[cove] No video / network issue — ignoring silently.")

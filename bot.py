@@ -452,6 +452,7 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
 
     is_reddit  = host_matches(hostname_for(url), {"reddit.com", "redd.it"})
     is_twitter = host_matches(hostname_for(url), TWITTER_DOMAINS)
+    is_youtube = host_matches(hostname_for(url), {"youtube.com", "youtu.be"})
 
     if is_reddit:
         has_video = await reddit_has_video(url)
@@ -499,13 +500,22 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
         if any(phrase.lower() in out.lower() for phrase in NO_VIDEO_PHRASES):
             log.info("[cove] No video / network issue — ignoring silently.")
             _log.append("[NOVIDEO]")
+        elif is_reddit and "[generic]" in out:
+            # Reddit link-post → handed off to the generic extractor. That means
+            # the post points at an external article/image, not a Reddit video.
+            log.info("[cove] Reddit link-post (external, no video) — ignoring silently.")
+            _log.append("[NOVIDEO]")
         elif "Unsupported URL" in out and is_reddit and any(p in out for p in REDDIT_SILENT_URL_PATTERNS):
             log.info("[cove] Reddit GIF/image URL — ignoring silently.")
             _log.append("[NOVIDEO]")
         elif "Unsupported URL" in out and is_twitter:
             log.info("[cove] X/Twitter post has no downloadable video — ignoring silently.")
             _log.append("[NOVIDEO]")
-        elif "Sign in to confirm" in out or "bot" in out.lower():
+        elif is_youtube and (
+            "Sign in to confirm" in out
+            or "confirm you're not a bot" in out.lower()
+            or "confirm you’re not a bot" in out.lower()
+        ):
             _log.append("[ERROR] YouTube bot detection triggered.")
         elif "Unsupported URL" in out:
             _log.append("[ERROR] Unsupported or private URL.")

@@ -72,6 +72,13 @@ MAX_FILESIZE_MB        = _require_int_env("MAX_FILESIZE_MB", default="500")
 
 JOB_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
 
+# User-Agent passed to every yt-dlp invocation.
+YT_DLP_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) "
+    "Chrome/124.0.0.0 Safari/537.36"
+)
+
 BOOST_TIER_LIMITS_MB = {
     0: 9.5,
     1: 9.5,
@@ -465,6 +472,7 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
 
     cmd = [
         "yt-dlp",
+        "--user-agent", YT_DLP_UA,
         "-f", "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
         "--merge-output-format", "mp4",
         "-N", str(YT_DLP_FRAGMENTS),
@@ -851,7 +859,7 @@ async def download_cmd(interaction: discord.Interaction, url: str):
     ok, err = validate_manual_url(url)
     if not ok:
         try:
-            await interaction.response.send_message(f"❌ {err}", ephemeral=True)
+            await interaction.response.send_message(f"\u274c {err}", ephemeral=True)
         except (discord.errors.NotFound, discord.errors.HTTPException):
             pass
         return

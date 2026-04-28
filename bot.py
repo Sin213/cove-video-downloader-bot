@@ -528,9 +528,13 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
         elif is_youtube and (
             "Sign in to confirm" in out
             or "confirm you're not a bot" in out.lower()
-            or "confirm you’re not a bot" in out.lower()
         ):
             _log.append("[ERROR] YouTube bot detection triggered.")
+        elif "empty media response" in out.lower():
+            # Instagram returns this when the account is banned/deleted or the
+            # post has been removed — the link is broken, not the bot.
+            log.info("[cove] Instagram empty media response — account banned or post deleted.")
+            _log.append("[ERROR] Link is broken (the account may have been banned or the post was deleted).")
         elif "Unsupported URL" in out:
             _log.append("[ERROR] Unsupported or private URL.")
         elif "HTTP Error 403" in out:

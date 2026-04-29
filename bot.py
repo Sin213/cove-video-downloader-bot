@@ -73,7 +73,9 @@ MAX_FILESIZE_MB        = _require_int_env("MAX_FILESIZE_MB", default="500")
 
 JOB_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
 
-# User-Agent passed to every yt-dlp invocation.
+# User-Agent passed to yt-dlp for non-Reddit invocations.
+# Reddit's extractor handles UA internally; overriding it breaks redirect
+# following for /s/ shortlinks.
 YT_DLP_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -517,6 +519,7 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
     is_reddit  = host_matches(hostname_for(url), {"reddit.com", "redd.it"})
     is_twitter = host_matches(hostname_for(url), TWITTER_DOMAINS)
     is_youtube = host_matches(hostname_for(url), {"youtube.com", "youtu.be"})
+    is_reddit_short = REDDIT_SHORT_RE.search(url) is not None
 
     if is_reddit:
         has_video = await reddit_has_video(url)
@@ -527,9 +530,16 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
     tmp = tempfile.mkdtemp(prefix="cove_", dir=TMP_BASE)
     output_template = str(Path(tmp) / "%(title)s.%(ext)s")
 
-    cmd = [
-        "yt-dlp",
-        "--user-agent", YT_DLP_UA,
+    cmd = ["yt-dlp"]
+
+    # Skip --user-agent for Reddit: yt-dlp's Reddit extractor manages its own
+    # session and UA internally. Overriding it breaks redirect-following for
+    # /s/ shortlinks (the generic extractor hits the URL before Reddit's
+    # extractor can claim it, causing a 403).
+    if not is_reddit:
+        cmd += ["--user-agent", YT_DLP_UA]
+
+    cmd += [
         "-f", "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
         "--merge-output-format", "mp4",
         "-N", str(YT_DLP_FRAGMENTS),
@@ -579,9 +589,11 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
         if any(phrase.lower() in out.lower() for phrase in NO_VIDEO_PHRASES):
             log.info("[cove] No video / network issue — ignoring silently.")
             _log.append("[NOVIDEO]")
-        elif is_reddit and "[generic]" in out:
+        elif is_reddit and "[generic]" in out and not is_reddit_short:
             # Reddit link-post → handed off to the generic extractor. That means
             # the post points at an external article/image, not a Reddit video.
+            # Don't fire this for /s/ shortlinks — they legitimately hit [generic]
+            # first before yt-dlp's Reddit extractor takes over.
             log.info("[cove] Reddit link-post (external, no video) — ignoring silently.")
             _log.append("[NOVIDEO]")
         elif "Unsupported URL" in out and is_reddit and any(p in out for p in REDDIT_SILENT_URL_PATTERNS):

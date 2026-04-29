@@ -156,7 +156,7 @@ TMP_BASE = "/dev/shm" if os.path.isdir("/dev/shm") else None
 URL_RE         = re.compile(r"https?://[^\s]+")
 REDDIT_RE      = re.compile(r'href="(https?://(?:old\.)?reddit\.com/r/[^/]+/comments/[^"]+)"')
 REDDIT_POST_RE = re.compile(r'reddit\.com/r/[^/]+/comments/')
-REDDIT_SHORT_RE = re.compile(r'reddit\.com/r/[^/]+/s/')
+REDDIT_SHORT_RE = re.compile(r'reddit\.com/r/([^/]+)/s/([^/?#]+)')
 
 REDDIT_UA = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -333,33 +333,36 @@ async def run_subprocess(cmd: list[str], timeout: int = SUBPROCESS_TIMEOUT) -> t
 # ── Reddit helpers ────────────────────────────────────────────────────────────
 
 async def resolve_reddit_shortlink(url: str) -> str:
-    """Follow a Reddit /s/ share shortlink to the real /comments/ URL."""
-    if not REDDIT_SHORT_RE.search(url):
+    """Resolve a Reddit /s/ share shortlink to the real /comments/ URL.
+
+    Reddit 403s plain HTTP redirect follows, so we hit the JSON API directly:
+    GET /r/<sub>/s/<code>.json returns the post listing just like a normal
+    /comments/ URL does. We pull the permalink from the first post and done.
+    """
+    m = REDDIT_SHORT_RE.search(url)
+    if not m:
         return url
+
+    subreddit, code = m.group(1), m.group(2)
+    api_url = f"https://www.reddit.com/r/{subreddit}/s/{code}.json?limit=1"
     try:
-        log.info("[reddit-short] Resolving shortlink: %s", url)
+        log.info("[reddit-short] Resolving via JSON API: %s", api_url)
         req = urllib.request.Request(
-            url,
-            headers={
-                "User-Agent": REDDIT_UA,
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-            },
+            api_url,
+            headers={"User-Agent": REDDIT_UA, "Accept": "application/json"},
         )
         loop = asyncio.get_running_loop()
-        # urlopen follows redirects automatically; grab the final URL.
-        final_url = await loop.run_in_executor(
+        raw = await loop.run_in_executor(
             None,
-            lambda: urllib.request.urlopen(req, timeout=10).url,
+            lambda: urllib.request.urlopen(req, timeout=10).read().decode(errors="replace"),
         )
-        if final_url and REDDIT_POST_RE.search(final_url):
-            # Strip query params and normalize to www.reddit.com
-            clean = final_url.split("?")[0].rstrip("/")
-            clean = clean.replace("old.reddit.com", "www.reddit.com")
-            log.info("[reddit-short] Resolved to: %s", clean)
-            return clean
-        log.warning("[reddit-short] Redirect did not land on a /comments/ URL: %s", final_url)
+        data = json.loads(raw)
+        permalink = data[0]["data"]["children"][0]["data"]["permalink"]
+        resolved = f"https://www.reddit.com{permalink}"
+        log.info("[reddit-short] Resolved to: %s", resolved)
+        return resolved
     except Exception as e:
-        log.warning("[reddit-short] Failed to resolve shortlink (%s) — using original.", e)
+        log.warning("[reddit-short] JSON API resolve failed (%s) — using original URL.", e)
     return url
 
 

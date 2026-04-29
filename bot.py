@@ -73,9 +73,6 @@ MAX_FILESIZE_MB        = _require_int_env("MAX_FILESIZE_MB", default="500")
 
 JOB_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
 
-# User-Agent passed to yt-dlp for non-Reddit invocations.
-# Reddit's extractor handles UA internally; overriding it breaks redirect
-# following for /s/ shortlinks.
 YT_DLP_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
     "AppleWebKit/537.36 (KHTML, like Gecko) "
@@ -105,8 +102,6 @@ AUTO_DOWNLOAD_DOMAINS = {
     "clips.twitch.tv",
 }
 
-# YouTube is intentionally excluded from auto-download (bot-detection makes it
-# unreliable in unattended runs); still reachable via /download.
 BLACKLISTED_DOMAINS = {
     "kkinstagram.com",
 }
@@ -166,12 +161,6 @@ REDDIT_UA = (
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 
-# Format selectors:
-# - Default: prefer h264+m4a up to 1080p, fall back broadly.
-# - Reddit: same but explicitly exclude HLS protocol (proto:m3u8 / proto:m3u8_native).
-#   Reddit's HLS CDN (v.redd.it) 403s on .ts fragment downloads from server IPs;
-#   DASH segments don't have this problem. Excluding by protocol guarantees
-#   yt-dlp never attempts HLS even when it's listed as the best quality.
 FORMAT_DEFAULT = (
     "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]"
     "/bestvideo[height<=1080]+bestaudio"
@@ -185,14 +174,8 @@ FORMAT_REDDIT = (
     "/best[protocol!=m3u8][protocol!=m3u8_native]"
 )
 
-# bot_message_id -> (original_poster_id, expires_at)
 _deletable: dict[int, tuple[int, float]] = {}
-
-# friend server: bot_message_id -> (original_human_user_id, expires_at)
 _friend_posts: dict[int, tuple[int, float]] = {}
-
-# Background tasks we own — keep references so they aren't GC'd mid-flight and
-# so exceptions are surfaced via the done-callback instead of disappearing.
 _active_tasks: set[asyncio.Task] = set()
 
 
@@ -226,7 +209,7 @@ def prune_friend_posts() -> None:
         _friend_posts.pop(mid, None)
 
 
-# ── Hostname helpers (safe URL matching) ──────────────────────────────────────
+# ── Hostname helpers ────────────────────────────────────────────────────────────
 
 def hostname_for(url: str) -> str:
     host = (urlparse(url).hostname or "").lower()
@@ -284,12 +267,6 @@ def _is_internal_ip(ip_str: str) -> bool:
 
 
 def validate_manual_url(url: str) -> tuple[bool, str]:
-    """Sanity-check a user-supplied URL for /download.
-
-    Allows arbitrary public hosts (yt-dlp's strength) but rejects schemes
-    other than http(s) and any host that resolves to a non-public address.
-    Reduces the SSRF surface from arbitrary user input.
-    """
     try:
         parsed = urlparse(url)
     except Exception:
@@ -356,39 +333,44 @@ async def run_subprocess(cmd: list[str], timeout: int = SUBPROCESS_TIMEOUT) -> t
 
 def _reddit_shortlink_location(url: str) -> str | None:
     """
-    Fetch the Location header from a Reddit /s/ shortlink without following
-    the redirect.  Reddit issues a 3xx pointing at the real /comments/ URL
-    before it has a chance to 403 the final destination.
+    Resolve a Reddit /s/ shortlink by sending a GET request and reading the
+    Location header from the first redirect response — without following it
+    or downloading any body.
 
-    Uses http.client directly so we can abort after reading the response
-    headers and never touch the body — fast and zero risk of hitting the 403.
+    Reddit 403s HEAD requests from server IPs, but responds to GET with a
+    3xx redirect before any auth check kicks in. We use http.client directly
+    with no redirect-following so we capture that first Location header and
+    close the connection immediately.
     """
     parsed = urlparse(url)
+    path = parsed.path + ("?" + parsed.query if parsed.query else "")
     try:
         conn = http.client.HTTPSConnection("www.reddit.com", timeout=8)
         conn.request(
-            "HEAD",
-            parsed.path + ("?" + parsed.query if parsed.query else ""),
+            "GET",
+            path,
             headers={
                 "User-Agent": REDDIT_UA,
-                "Accept": "text/html",
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+                "Accept-Language": "en-US,en;q=0.5",
             },
         )
         resp = conn.getresponse()
+        # Read and discard the body immediately so the connection doesn't hang.
+        resp.read()
         conn.close()
         if resp.status in (301, 302, 303, 307, 308):
             location = resp.getheader("Location", "")
             if location and "/comments/" in location:
-                # Make sure it's an absolute URL
                 if location.startswith("/"):
                     location = f"https://www.reddit.com{location}"
                 return location
         log.warning(
-            "[reddit-short] HEAD returned %d — no usable Location header.",
+            "[reddit-short] GET returned %d — no usable Location header.",
             resp.status,
         )
     except Exception as e:
-        log.warning("[reddit-short] HEAD request failed: %s", e)
+        log.warning("[reddit-short] GET request failed: %s", e)
     return None
 
 
@@ -549,16 +531,10 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
     tmp = tempfile.mkdtemp(prefix="cove_", dir=TMP_BASE)
     output_template = str(Path(tmp) / "%(title)s.%(ext)s")
 
-    # Reddit: use DASH-only format selector (HLS CDN 403s on fragment downloads
-    # from server IPs). All other sites: use the standard selector.
     fmt = FORMAT_REDDIT if is_reddit else FORMAT_DEFAULT
 
     cmd = ["yt-dlp"]
 
-    # Skip --user-agent for Reddit: yt-dlp's Reddit extractor manages its own
-    # session and UA internally. Overriding it breaks redirect-following for
-    # /s/ shortlinks (the generic extractor hits the URL before Reddit's
-    # extractor can claim it, causing a 403).
     if not is_reddit:
         cmd += ["--user-agent", YT_DLP_UA]
 
@@ -570,8 +546,6 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
         "--no-playlist",
         "--extractor-retries", "0",
         "--max-filesize", f"{MAX_FILESIZE_MB}M",
-        # OR semantics across repeated --match-filter: accept if duration is
-        # missing OR within limit. Post-download check still catches stragglers.
         "--match-filter", "!duration",
         "--match-filter", f"duration <= {MAX_DURATION_SECONDS}",
         "-o", output_template,
@@ -594,9 +568,6 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
     log.debug("[yt-dlp] Output:\n%s", out)
     _log.append(out.strip())
 
-    # yt-dlp short-circuits with exit 0 when --match-filter / --max-filesize
-    # reject the entry. Map those to the user-facing "too big" path so the
-    # message doesn't degenerate to "No MP4 file found after download".
     if "does not pass filter" in out:
         log.info("[cove] Rejected by match-filter (>%dmin)", MAX_DURATION_SECONDS // 60)
         shutil.rmtree(tmp, ignore_errors=True)
@@ -613,10 +584,6 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
             log.info("[cove] No video / network issue — ignoring silently.")
             _log.append("[NOVIDEO]")
         elif is_reddit and "[generic]" in out and not is_reddit_short:
-            # Reddit link-post → handed off to the generic extractor. That means
-            # the post points at an external article/image, not a Reddit video.
-            # Don't fire this for /s/ shortlinks — they legitimately hit [generic]
-            # first before yt-dlp's Reddit extractor takes over.
             log.info("[cove] Reddit link-post (external, no video) — ignoring silently.")
             _log.append("[NOVIDEO]")
         elif "Unsupported URL" in out and is_reddit and any(p in out for p in REDDIT_SILENT_URL_PATTERNS):
@@ -631,8 +598,6 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
         ):
             _log.append("[ERROR] YouTube bot detection triggered.")
         elif "empty media response" in out.lower():
-            # Instagram returns this when the account is banned/deleted or the
-            # post has been removed — the link is broken, not the bot.
             log.info("[cove] Instagram empty media response — account banned or post deleted.")
             _log.append("[ERROR] Link is broken (the account may have been banned or the post was deleted).")
         elif "Unsupported URL" in out:
@@ -775,9 +740,6 @@ class CoveBot(discord.Client):
         if message.author.bot:
             return
 
-        # Friend server only: intercept replies to Cove bot messages.
-        # Delete the user's reply and repost it as a reply to the same bot
-        # message, pinging the original human who triggered the bot.
         if is_friend_server(message.guild) and message.reference and self.user:
             try:
                 referenced = message.reference.resolved
@@ -789,7 +751,6 @@ class CoveBot(discord.Client):
                         prune_friend_posts()
                         entry = _friend_posts.get(referenced.id)
                         if entry is None:
-                            # Can't determine original poster — pass through untouched.
                             pass
                         else:
                             target_user_id, _ = entry

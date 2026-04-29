@@ -166,6 +166,25 @@ REDDIT_UA = (
     "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
 )
 
+# Format selectors:
+# - Default: prefer h264+m4a up to 1080p, fall back broadly.
+# - Reddit: same but explicitly exclude HLS protocol (proto:m3u8 / proto:m3u8_native).
+#   Reddit's HLS CDN (v.redd.it) 403s on .ts fragment downloads from server IPs;
+#   DASH segments don't have this problem. Excluding by protocol guarantees
+#   yt-dlp never attempts HLS even when it's listed as the best quality.
+FORMAT_DEFAULT = (
+    "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]"
+    "/bestvideo[height<=1080]+bestaudio"
+    "/best[height<=1080]"
+    "/best"
+)
+FORMAT_REDDIT = (
+    "bestvideo[height<=1080][ext=mp4][protocol!=m3u8][protocol!=m3u8_native]+bestaudio[ext=m4a][protocol!=m3u8][protocol!=m3u8_native]"
+    "/bestvideo[height<=1080][protocol!=m3u8][protocol!=m3u8_native]+bestaudio[protocol!=m3u8][protocol!=m3u8_native]"
+    "/best[height<=1080][protocol!=m3u8][protocol!=m3u8_native]"
+    "/best[protocol!=m3u8][protocol!=m3u8_native]"
+)
+
 # bot_message_id -> (original_poster_id, expires_at)
 _deletable: dict[int, tuple[int, float]] = {}
 
@@ -530,6 +549,10 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
     tmp = tempfile.mkdtemp(prefix="cove_", dir=TMP_BASE)
     output_template = str(Path(tmp) / "%(title)s.%(ext)s")
 
+    # Reddit: use DASH-only format selector (HLS CDN 403s on fragment downloads
+    # from server IPs). All other sites: use the standard selector.
+    fmt = FORMAT_REDDIT if is_reddit else FORMAT_DEFAULT
+
     cmd = ["yt-dlp"]
 
     # Skip --user-agent for Reddit: yt-dlp's Reddit extractor manages its own
@@ -539,13 +562,8 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
     if not is_reddit:
         cmd += ["--user-agent", YT_DLP_UA]
 
-    # Reddit's HLS CDN (v.redd.it) 403s on fragment downloads from server IPs.
-    # Force DASH-only so yt-dlp uses the DASH manifest which is not affected.
-    if is_reddit:
-        cmd += ["--extractor-args", "reddit:skip=hls"]
-
     cmd += [
-        "-f", "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
+        "-f", fmt,
         "--merge-output-format", "mp4",
         "-N", str(YT_DLP_FRAGMENTS),
         "--no-part",

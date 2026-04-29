@@ -539,6 +539,11 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
     if not is_reddit:
         cmd += ["--user-agent", YT_DLP_UA]
 
+    # Reddit's HLS CDN (v.redd.it) 403s on fragment downloads from server IPs.
+    # Force DASH-only so yt-dlp uses the DASH manifest which is not affected.
+    if is_reddit:
+        cmd += ["--extractor-args", "reddit:skip=hls"]
+
     cmd += [
         "-f", "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/bestvideo[height<=1080]+bestaudio/best[height<=1080]/best",
         "--merge-output-format", "mp4",

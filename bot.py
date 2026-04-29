@@ -156,6 +156,7 @@ TMP_BASE = "/dev/shm" if os.path.isdir("/dev/shm") else None
 URL_RE         = re.compile(r"https?://[^\s]+")
 REDDIT_RE      = re.compile(r'href="(https?://(?:old\.)?reddit\.com/r/[^/]+/comments/[^"]+)"')
 REDDIT_POST_RE = re.compile(r'reddit\.com/r/[^/]+/comments/')
+REDDIT_SHORT_RE = re.compile(r'reddit\.com/r/[^/]+/s/')
 
 REDDIT_UA = (
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
@@ -331,6 +332,37 @@ async def run_subprocess(cmd: list[str], timeout: int = SUBPROCESS_TIMEOUT) -> t
 
 # ── Reddit helpers ────────────────────────────────────────────────────────────
 
+async def resolve_reddit_shortlink(url: str) -> str:
+    """Follow a Reddit /s/ share shortlink to the real /comments/ URL."""
+    if not REDDIT_SHORT_RE.search(url):
+        return url
+    try:
+        log.info("[reddit-short] Resolving shortlink: %s", url)
+        req = urllib.request.Request(
+            url,
+            headers={
+                "User-Agent": REDDIT_UA,
+                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            },
+        )
+        loop = asyncio.get_running_loop()
+        # urlopen follows redirects automatically; grab the final URL.
+        final_url = await loop.run_in_executor(
+            None,
+            lambda: urllib.request.urlopen(req, timeout=10).url,
+        )
+        if final_url and REDDIT_POST_RE.search(final_url):
+            # Strip query params and normalize to www.reddit.com
+            clean = final_url.split("?")[0].rstrip("/")
+            clean = clean.replace("old.reddit.com", "www.reddit.com")
+            log.info("[reddit-short] Resolved to: %s", clean)
+            return clean
+        log.warning("[reddit-short] Redirect did not land on a /comments/ URL: %s", final_url)
+    except Exception as e:
+        log.warning("[reddit-short] Failed to resolve shortlink (%s) — using original.", e)
+    return url
+
+
 async def reddit_has_video(url: str) -> bool:
     if not REDDIT_POST_RE.search(url):
         return True
@@ -455,6 +487,7 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
 
     url = resolve_fixup_url(url)
     url = await resolve_arazu(url)
+    url = await resolve_reddit_shortlink(url)
     _log.append(f"[INFO] URL: {url}")
 
     is_reddit  = host_matches(hostname_for(url), {"reddit.com", "redd.it"})

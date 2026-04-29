@@ -3,6 +3,7 @@ from __future__ import annotations
 import discord
 from discord import app_commands
 import asyncio
+import http.client
 import ipaddress
 import logging
 import os
@@ -332,37 +333,57 @@ async def run_subprocess(cmd: list[str], timeout: int = SUBPROCESS_TIMEOUT) -> t
 
 # ── Reddit helpers ────────────────────────────────────────────────────────────
 
-async def resolve_reddit_shortlink(url: str) -> str:
-    """Resolve a Reddit /s/ share shortlink to the real /comments/ URL.
-
-    Reddit 403s plain HTTP redirect follows, so we hit the JSON API directly:
-    GET /r/<sub>/s/<code>.json returns the post listing just like a normal
-    /comments/ URL does. We pull the permalink from the first post and done.
+def _reddit_shortlink_location(url: str) -> str | None:
     """
-    m = REDDIT_SHORT_RE.search(url)
-    if not m:
+    Fetch the Location header from a Reddit /s/ shortlink without following
+    the redirect.  Reddit issues a 3xx pointing at the real /comments/ URL
+    before it has a chance to 403 the final destination.
+
+    Uses http.client directly so we can abort after reading the response
+    headers and never touch the body — fast and zero risk of hitting the 403.
+    """
+    parsed = urlparse(url)
+    try:
+        conn = http.client.HTTPSConnection("www.reddit.com", timeout=8)
+        conn.request(
+            "HEAD",
+            parsed.path + ("?" + parsed.query if parsed.query else ""),
+            headers={
+                "User-Agent": REDDIT_UA,
+                "Accept": "text/html",
+            },
+        )
+        resp = conn.getresponse()
+        conn.close()
+        if resp.status in (301, 302, 303, 307, 308):
+            location = resp.getheader("Location", "")
+            if location and "/comments/" in location:
+                # Make sure it's an absolute URL
+                if location.startswith("/"):
+                    location = f"https://www.reddit.com{location}"
+                return location
+        log.warning(
+            "[reddit-short] HEAD returned %d — no usable Location header.",
+            resp.status,
+        )
+    except Exception as e:
+        log.warning("[reddit-short] HEAD request failed: %s", e)
+    return None
+
+
+async def resolve_reddit_shortlink(url: str) -> str:
+    """Resolve a Reddit /s/ share shortlink to the real /comments/ URL."""
+    if not REDDIT_SHORT_RE.search(url):
         return url
 
-    subreddit, code = m.group(1), m.group(2)
-    api_url = f"https://www.reddit.com/r/{subreddit}/s/{code}.json?limit=1"
-    try:
-        log.info("[reddit-short] Resolving via JSON API: %s", api_url)
-        req = urllib.request.Request(
-            api_url,
-            headers={"User-Agent": REDDIT_UA, "Accept": "application/json"},
-        )
-        loop = asyncio.get_running_loop()
-        raw = await loop.run_in_executor(
-            None,
-            lambda: urllib.request.urlopen(req, timeout=10).read().decode(errors="replace"),
-        )
-        data = json.loads(raw)
-        permalink = data[0]["data"]["children"][0]["data"]["permalink"]
-        resolved = f"https://www.reddit.com{permalink}"
+    log.info("[reddit-short] Resolving shortlink: %s", url)
+    loop = asyncio.get_running_loop()
+    resolved = await loop.run_in_executor(None, _reddit_shortlink_location, url)
+    if resolved:
         log.info("[reddit-short] Resolved to: %s", resolved)
         return resolved
-    except Exception as e:
-        log.warning("[reddit-short] JSON API resolve failed (%s) — using original URL.", e)
+
+    log.warning("[reddit-short] Could not resolve %s — passing to yt-dlp as-is.", url)
     return url
 
 

@@ -1,9 +1,13 @@
 .env
 cookies.txt
+cookies.txt.*
 __pycache__/
 *.pyc
 tmp/
 dist/
 build/
+codex-reviews/
 ffmpeg2pass-*.log
 ffmpeg2pass-*.log.mbtree
+.git/
+.claude/

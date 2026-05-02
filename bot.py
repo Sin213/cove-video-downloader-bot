@@ -393,10 +393,14 @@ async def _reddit_shortlink_location(url: str) -> str | None:
         "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
         "Accept-Language": "en-US,en;q=0.5",
     }
+    # Force https://www.reddit.com so the single non-followed redirect lands on
+    # /comments/ rather than Reddit's scheme/host canonicalization hop.
+    parsed = urlparse(url)
+    target = urlunparse(("https", "www.reddit.com", parsed.path, parsed.params, parsed.query, ""))
     try:
         session = _get_http_session()
         async with session.get(
-            url,
+            target,
             headers=headers,
             allow_redirects=False,
             timeout=aiohttp.ClientTimeout(total=8),

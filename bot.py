@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 from __future__ import annotations
+import aiohttp
 import discord
 from discord import app_commands
 import asyncio
-import http.client
 import ipaddress
 import logging
 import os
@@ -13,7 +13,6 @@ import socket
 import sys
 import tempfile
 import json
-import urllib.request
 from pathlib import Path
 from time import monotonic
 from urllib.parse import urlparse, urlunparse
@@ -177,6 +176,52 @@ FORMAT_REDDIT = (
 _deletable: dict[int, tuple[int, float]] = {}
 _friend_posts: dict[int, tuple[int, float]] = {}
 _active_tasks: set[asyncio.Task] = set()
+_http_session: aiohttp.ClientSession | None = None
+
+# (value, expires_at_monotonic) — TTL caches for Reddit pre-checks.
+# Shortlinks resolve deterministically and never change; has_video can shift
+# if a post is edited, so it gets a shorter TTL.
+_reddit_shortlink_cache: dict[str, tuple[str, float]] = {}
+_reddit_has_video_cache: dict[str, tuple[bool, float]] = {}
+SHORTLINK_CACHE_TTL = 24 * 3600
+HAS_VIDEO_CACHE_TTL = 3600
+CACHE_MAX_ENTRIES = 512
+
+
+def _cache_get(cache: dict, key: str):
+    entry = cache.get(key)
+    if entry is None:
+        return None
+    value, expires = entry
+    if monotonic() >= expires:
+        cache.pop(key, None)
+        return None
+    return value
+
+
+def _cache_set(cache: dict, key: str, value, ttl: float) -> None:
+    if len(cache) >= CACHE_MAX_ENTRIES:
+        # Drop the oldest-expiring entries to keep the cache bounded.
+        for stale_key in sorted(cache, key=lambda k: cache[k][1])[: CACHE_MAX_ENTRIES // 4]:
+            cache.pop(stale_key, None)
+    cache[key] = (value, monotonic() + ttl)
+
+
+def _get_http_session() -> aiohttp.ClientSession:
+    global _http_session
+    if _http_session is None or _http_session.closed:
+        _http_session = aiohttp.ClientSession(
+            timeout=aiohttp.ClientTimeout(total=15),
+            headers={"User-Agent": REDDIT_UA},
+        )
+    return _http_session
+
+
+async def _close_http_session() -> None:
+    global _http_session
+    if _http_session is not None and not _http_session.closed:
+        await _http_session.close()
+    _http_session = None
 
 
 def _on_task_done(task: asyncio.Task) -> None:
@@ -266,7 +311,7 @@ def _is_internal_ip(ip_str: str) -> bool:
     )
 
 
-def validate_manual_url(url: str) -> tuple[bool, str]:
+async def validate_manual_url(url: str) -> tuple[bool, str]:
     try:
         parsed = urlparse(url)
     except Exception:
@@ -280,8 +325,9 @@ def validate_manual_url(url: str) -> tuple[bool, str]:
         return False, "URL points to a non-public address."
     if _is_internal_ip(host):
         return False, "URL points to a non-public address."
+    loop = asyncio.get_running_loop()
     try:
-        infos = socket.getaddrinfo(host, None)
+        infos = await loop.getaddrinfo(host, None)
     except socket.gaierror:
         return False, "Could not resolve URL host."
     for info in infos:
@@ -331,44 +377,41 @@ async def run_subprocess(cmd: list[str], timeout: int = SUBPROCESS_TIMEOUT) -> t
 
 # ── Reddit helpers ────────────────────────────────────────────────────────────
 
-def _reddit_shortlink_location(url: str) -> str | None:
+async def _reddit_shortlink_location(url: str) -> str | None:
     """
     Resolve a Reddit /s/ shortlink by sending a GET request and reading the
     Location header from the first redirect response — without following it
     or downloading any body.
 
     Reddit 403s HEAD requests from server IPs, but responds to GET with a
-    3xx redirect before any auth check kicks in. We use http.client directly
-    with no redirect-following so we capture that first Location header and
-    close the connection immediately.
+    3xx redirect before any auth check kicks in. We disable redirect-following
+    so we capture that first Location header and release the connection
+    immediately.
     """
-    parsed = urlparse(url)
-    path = parsed.path + ("?" + parsed.query if parsed.query else "")
+    headers = {
+        "User-Agent": REDDIT_UA,
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language": "en-US,en;q=0.5",
+    }
     try:
-        conn = http.client.HTTPSConnection("www.reddit.com", timeout=8)
-        conn.request(
-            "GET",
-            path,
-            headers={
-                "User-Agent": REDDIT_UA,
-                "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-                "Accept-Language": "en-US,en;q=0.5",
-            },
-        )
-        resp = conn.getresponse()
-        # Read and discard the body immediately so the connection doesn't hang.
-        resp.read()
-        conn.close()
-        if resp.status in (301, 302, 303, 307, 308):
-            location = resp.getheader("Location", "")
-            if location and "/comments/" in location:
-                if location.startswith("/"):
-                    location = f"https://www.reddit.com{location}"
-                return location
-        log.warning(
-            "[reddit-short] GET returned %d — no usable Location header.",
-            resp.status,
-        )
+        session = _get_http_session()
+        async with session.get(
+            url,
+            headers=headers,
+            allow_redirects=False,
+            timeout=aiohttp.ClientTimeout(total=8),
+        ) as resp:
+            await resp.read()
+            if resp.status in (301, 302, 303, 307, 308):
+                location = resp.headers.get("Location", "")
+                if location and "/comments/" in location:
+                    if location.startswith("/"):
+                        location = f"https://www.reddit.com{location}"
+                    return location
+            log.warning(
+                "[reddit-short] GET returned %d — no usable Location header.",
+                resp.status,
+            )
     except Exception as e:
         log.warning("[reddit-short] GET request failed: %s", e)
     return None
@@ -379,11 +422,16 @@ async def resolve_reddit_shortlink(url: str) -> str:
     if not REDDIT_SHORT_RE.search(url):
         return url
 
+    cached = _cache_get(_reddit_shortlink_cache, url)
+    if cached is not None:
+        log.info("[reddit-short] Cache hit for %s", url)
+        return cached
+
     log.info("[reddit-short] Resolving shortlink: %s", url)
-    loop = asyncio.get_running_loop()
-    resolved = await loop.run_in_executor(None, _reddit_shortlink_location, url)
+    resolved = await _reddit_shortlink_location(url)
     if resolved:
         log.info("[reddit-short] Resolved to: %s", resolved)
+        _cache_set(_reddit_shortlink_cache, url, resolved, SHORTLINK_CACHE_TTL)
         return resolved
 
     log.warning("[reddit-short] Could not resolve %s — passing to yt-dlp as-is.", url)
@@ -395,15 +443,13 @@ async def reddit_has_video(url: str) -> bool:
         return True
     api_url = url.rstrip("/").split("?")[0] + ".json?limit=1"
     try:
-        req = urllib.request.Request(
+        session = _get_http_session()
+        async with session.get(
             api_url,
             headers={"User-Agent": REDDIT_UA, "Accept": "application/json"},
-        )
-        loop = asyncio.get_running_loop()
-        raw = await loop.run_in_executor(
-            None,
-            lambda: urllib.request.urlopen(req, timeout=8).read().decode(errors="replace"),
-        )
+            timeout=aiohttp.ClientTimeout(total=8),
+        ) as resp:
+            raw = await resp.text(errors="replace")
         data = json.loads(raw)
         post = data[0]["data"]["children"][0]["data"]
         if post.get("is_video"):
@@ -425,15 +471,13 @@ async def resolve_arazu(url: str) -> str:
         return url
     try:
         log.info("[arazu] Resolving: %s", url)
-        req = urllib.request.Request(
+        session = _get_http_session()
+        async with session.get(
             url,
             headers={"User-Agent": "Mozilla/5.0 (compatible; CoveBot/1.0)"},
-        )
-        loop = asyncio.get_running_loop()
-        html = await loop.run_in_executor(
-            None,
-            lambda: urllib.request.urlopen(req, timeout=10).read().decode(errors="replace"),
-        )
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as resp:
+            html = await resp.text(errors="replace")
         match = REDDIT_RE.search(html)
         if match:
             reddit_url = match.group(1).replace("old.reddit.com", "www.reddit.com")
@@ -654,7 +698,7 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
         return src_path, "\n".join(_log)
 
 
-def cleanup_tmp(filepath: str):
+def _cleanup_tmp_sync(filepath: str):
     try:
         parent = str(Path(filepath).parent)
         if "cove_" in parent:
@@ -663,6 +707,11 @@ def cleanup_tmp(filepath: str):
             os.remove(filepath)
     except Exception:
         pass
+
+
+async def cleanup_tmp(filepath: str):
+    loop = asyncio.get_running_loop()
+    await loop.run_in_executor(None, _cleanup_tmp_sync, filepath)
 
 
 async def process_url(
@@ -708,7 +757,7 @@ async def process_url(
             log.exception("Unhandled exception in on_success")
             await on_error(f"Upload failed: {e}")
         finally:
-            cleanup_tmp(filepath)
+            await cleanup_tmp(filepath)
 
 
 # ── Bot ───────────────────────────────────────────────────────────────────────
@@ -735,6 +784,10 @@ class CoveBot(discord.Client):
                 name="for links & /download",
             )
         )
+
+    async def close(self):
+        await _close_http_session()
+        await super().close()
 
     async def on_message(self, message: discord.Message):
         if message.author.bot:
@@ -909,7 +962,7 @@ client = CoveBot()
 )
 @app_commands.describe(url="The video URL to download")
 async def download_cmd(interaction: discord.Interaction, url: str):
-    ok, err = validate_manual_url(url)
+    ok, err = await validate_manual_url(url)
     if not ok:
         try:
             await interaction.response.send_message(f"\u274c {err}", ephemeral=True)

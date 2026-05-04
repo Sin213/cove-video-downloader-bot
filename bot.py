@@ -175,6 +175,7 @@ FORMAT_REDDIT = (
 
 _deletable: dict[int, tuple[int, float]] = {}
 _friend_posts: dict[int, tuple[int, float]] = {}
+_friend_neet_skip_users: set[int] = set()
 _active_tasks: set[asyncio.Task] = set()
 _http_session: aiohttp.ClientSession | None = None
 
@@ -779,6 +780,10 @@ class CoveBot(discord.Client):
         self.tree.copy_global_to(guild=guild)
         await self.tree.sync(guild=guild)
         log.info("[Cove] Slash commands synced to guild %d", GUILD_ID)
+        if FRIEND_GUILD_ID != 0:
+            friend_guild = discord.Object(id=FRIEND_GUILD_ID)
+            await self.tree.sync(guild=friend_guild)
+            log.info("[Cove] Friend slash commands synced to guild %d", FRIEND_GUILD_ID)
 
     async def on_ready(self):
         log.info("[Cove] Logged in as %s (ID: %d)", self.user, self.user.id)
@@ -795,6 +800,11 @@ class CoveBot(discord.Client):
 
     async def on_message(self, message: discord.Message):
         if message.author.bot:
+            return
+
+        if is_friend_server(message.guild) and message.author.id in _friend_neet_skip_users:
+            _friend_neet_skip_users.discard(message.author.id)
+            log.info("[Cove] /neet skipped next friend message from %s", message.author)
             return
 
         if is_friend_server(message.guild) and message.reference and self.user:
@@ -1017,6 +1027,27 @@ async def download_cmd(interaction: discord.Interaction, url: str):
         on_too_big=on_too_big,
         on_no_video=on_no_video,
     )
+
+
+if FRIEND_GUILD_ID != 0:
+    @client.tree.command(
+        name="neet",
+        description="Ignore your next message in the friend server",
+        guild=discord.Object(id=FRIEND_GUILD_ID),
+    )
+    async def neet_cmd(interaction: discord.Interaction):
+        if not is_friend_server(interaction.guild):
+            await interaction.response.send_message(
+                "\u274c This command is only available in the friend server.",
+                ephemeral=True,
+            )
+            return
+
+        _friend_neet_skip_users.add(interaction.user.id)
+        await interaction.response.send_message(
+            "Got it. I will ignore your next message.",
+            ephemeral=True,
+        )
 
 
 client.run(TOKEN)

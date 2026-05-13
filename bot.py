@@ -42,6 +42,10 @@ def _require_int_env(name: str, *, allow_zero: bool = True, default: str | None 
     return value
 
 
+def _env_bool(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
+
 TOKEN           = os.getenv("DISCORD_TOKEN")
 if not TOKEN:
     sys.exit("[Cove] Required env var DISCORD_TOKEN is missing.")
@@ -71,6 +75,7 @@ YT_DLP_FRAGMENTS       = _require_int_env("YT_DLP_FRAGMENTS", default="4")
 MAX_FILESIZE_MB        = _require_int_env("MAX_FILESIZE_MB", default="500")
 MAX_URL_LENGTH         = _require_int_env("MAX_URL_LENGTH", allow_zero=False, default="2048")
 NEET_TTL_SECONDS       = _require_int_env("NEET_TTL_SECONDS", allow_zero=False, default="600")
+FAST_SOURCE_MODE       = _env_bool("FAST_SOURCE_MODE", "0")
 
 JOB_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
 
@@ -168,10 +173,23 @@ FORMAT_DEFAULT = (
     "/best[height<=1080]"
     "/best"
 )
+FORMAT_FAST = (
+    "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]"
+    "/bestvideo[height<=720][ext=mp4]+bestaudio"
+    "/best[height<=720][ext=mp4]"
+    "/best[height<=720]"
+    "/best"
+)
 FORMAT_REDDIT = (
     "bestvideo[height<=1080][ext=mp4][protocol!=m3u8][protocol!=m3u8_native]+bestaudio[ext=m4a][protocol!=m3u8][protocol!=m3u8_native]"
     "/bestvideo[height<=1080][protocol!=m3u8][protocol!=m3u8_native]+bestaudio[protocol!=m3u8][protocol!=m3u8_native]"
     "/best[height<=1080][protocol!=m3u8][protocol!=m3u8_native]"
+    "/best[protocol!=m3u8][protocol!=m3u8_native]"
+)
+FORMAT_REDDIT_FAST = (
+    "bestvideo[height<=720][ext=mp4][protocol!=m3u8][protocol!=m3u8_native]+bestaudio[ext=m4a][protocol!=m3u8][protocol!=m3u8_native]"
+    "/bestvideo[height<=720][protocol!=m3u8][protocol!=m3u8_native]+bestaudio[protocol!=m3u8][protocol!=m3u8_native]"
+    "/best[height<=720][protocol!=m3u8][protocol!=m3u8_native]"
     "/best[protocol!=m3u8][protocol!=m3u8_native]"
 )
 
@@ -622,7 +640,13 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
     tmp = tempfile.mkdtemp(prefix="cove_", dir=TMP_BASE)
     output_template = str(Path(tmp) / "%(title)s.%(ext)s")
 
-    fmt = FORMAT_REDDIT if is_reddit else FORMAT_DEFAULT
+    if FAST_SOURCE_MODE:
+        log.info("[cove] Fast source mode enabled; preferring <=720p sources.")
+
+    if is_reddit:
+        fmt = FORMAT_REDDIT_FAST if FAST_SOURCE_MODE else FORMAT_REDDIT
+    else:
+        fmt = FORMAT_FAST if FAST_SOURCE_MODE else FORMAT_DEFAULT
 
     cmd = ["yt-dlp"]
 

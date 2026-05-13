@@ -14,7 +14,7 @@ import sys
 import tempfile
 import json
 from pathlib import Path
-from time import monotonic
+from time import monotonic, time
 from urllib.parse import urlparse, urlunparse
 from dotenv import load_dotenv
 
@@ -69,6 +69,8 @@ DELETE_TTL_SECONDS     = _require_int_env("DELETE_TTL_SECONDS", default="21600")
 FRIEND_POST_TTL_SECONDS = _require_int_env("FRIEND_POST_TTL_SECONDS", default="86400")
 YT_DLP_FRAGMENTS       = _require_int_env("YT_DLP_FRAGMENTS", default="4")
 MAX_FILESIZE_MB        = _require_int_env("MAX_FILESIZE_MB", default="500")
+MAX_URL_LENGTH         = _require_int_env("MAX_URL_LENGTH", allow_zero=False, default="2048")
+NEET_TTL_SECONDS       = _require_int_env("NEET_TTL_SECONDS", allow_zero=False, default="600")
 
 JOB_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
 
@@ -175,7 +177,7 @@ FORMAT_REDDIT = (
 
 _deletable: dict[int, tuple[int, float]] = {}
 _friend_posts: dict[int, tuple[int, float]] = {}
-_friend_neet_skip_users: set[int] = set()
+_friend_neet_skip_users: dict[int, float] = {}
 _active_tasks: set[asyncio.Task] = set()
 _http_session: aiohttp.ClientSession | None = None
 
@@ -255,6 +257,34 @@ def prune_friend_posts() -> None:
         _friend_posts.pop(mid, None)
 
 
+def prune_neet_skips() -> None:
+    now = monotonic()
+    expired = [uid for uid, expires_at in _friend_neet_skip_users.items() if expires_at <= now]
+    for uid in expired:
+        _friend_neet_skip_users.pop(uid, None)
+
+
+def _sweep_orphaned_tmpdirs(min_age_seconds: float = 3600) -> None:
+    root = Path(TMP_BASE or tempfile.gettempdir())
+    cutoff = time() - min_age_seconds
+    try:
+        for path in root.glob("cove_*"):
+            if not path.is_dir():
+                continue
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            if stat.st_mtime <= cutoff:
+                try:
+                    shutil.rmtree(path)
+                    log.info("[Cove] Removed orphan temp dir: %s", path)
+                except OSError as e:
+                    log.warning("[Cove] Failed to remove orphan temp dir %s: %s", path, e)
+    except OSError as e:
+        log.warning("[Cove] Temp sweep failed: %s", e)
+
+
 # ── Hostname helpers ────────────────────────────────────────────────────────────
 
 def hostname_for(url: str) -> str:
@@ -289,6 +319,8 @@ def extract_extra_mentions(content: str) -> str:
 def extract_supported_url(content: str) -> str | None:
     for match in URL_RE.finditer(content):
         url = match.group(0).rstrip(").,>")
+        if len(url) > MAX_URL_LENGTH:
+            continue
         host = hostname_for(url)
         if host_matches(host, BLACKLISTED_DOMAINS):
             continue
@@ -313,6 +345,8 @@ def _is_internal_ip(ip_str: str) -> bool:
 
 
 async def validate_manual_url(url: str) -> tuple[bool, str]:
+    if len(url) > MAX_URL_LENGTH:
+        return False, "URL is too long."
     try:
         parsed = urlparse(url)
     except Exception:
@@ -447,6 +481,10 @@ async def reddit_has_video(url: str) -> bool:
     if not REDDIT_POST_RE.search(url):
         return True
     api_url = url.rstrip("/").split("?")[0] + ".json?limit=1"
+    cached = _cache_get(_reddit_has_video_cache, api_url)
+    if cached is not None:
+        log.info("[reddit-check] Cache hit for %s", api_url)
+        return cached
     try:
         session = _get_http_session()
         async with session.get(
@@ -458,13 +496,17 @@ async def reddit_has_video(url: str) -> bool:
         data = json.loads(raw)
         post = data[0]["data"]["children"][0]["data"]
         if post.get("is_video"):
+            _cache_set(_reddit_has_video_cache, api_url, True, HAS_VIDEO_CACHE_TTL)
             return True
         post_url = post.get("url", "")
         if host_matches(hostname_for(post_url), VIDEO_DOMAINS):
+            _cache_set(_reddit_has_video_cache, api_url, True, HAS_VIDEO_CACHE_TTL)
             return True
         if post.get("media") or post.get("secure_media"):
+            _cache_set(_reddit_has_video_cache, api_url, True, HAS_VIDEO_CACHE_TTL)
             return True
         log.info("[reddit-check] No video in post (url=%s)", post_url)
+        _cache_set(_reddit_has_video_cache, api_url, False, HAS_VIDEO_CACHE_TTL)
         return False
     except Exception as e:
         log.warning("[reddit-check] Pre-check failed (%s) — letting yt-dlp try anyway.", e)
@@ -776,6 +818,7 @@ class CoveBot(discord.Client):
         self.tree = app_commands.CommandTree(self)
 
     async def setup_hook(self):
+        await asyncio.get_running_loop().run_in_executor(None, _sweep_orphaned_tmpdirs)
         guild = discord.Object(id=GUILD_ID)
         self.tree.copy_global_to(guild=guild)
         await self.tree.sync(guild=guild)
@@ -802,8 +845,10 @@ class CoveBot(discord.Client):
         if message.author.bot:
             return
 
+        if is_friend_server(message.guild):
+            prune_neet_skips()
         if is_friend_server(message.guild) and message.author.id in _friend_neet_skip_users:
-            _friend_neet_skip_users.discard(message.author.id)
+            _friend_neet_skip_users.pop(message.author.id, None)
             log.info("[Cove] /neet skipped next friend message from %s", message.author)
             return
 
@@ -1043,7 +1088,8 @@ if FRIEND_GUILD_ID != 0:
             )
             return
 
-        _friend_neet_skip_users.add(interaction.user.id)
+        prune_neet_skips()
+        _friend_neet_skip_users[interaction.user.id] = monotonic() + NEET_TTL_SECONDS
         await interaction.response.send_message(
             "Got it. I will ignore your next message.",
             ephemeral=True,

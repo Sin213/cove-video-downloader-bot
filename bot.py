@@ -76,6 +76,7 @@ MAX_FILESIZE_MB        = _require_int_env("MAX_FILESIZE_MB", default="500")
 MAX_URL_LENGTH         = _require_int_env("MAX_URL_LENGTH", allow_zero=False, default="2048")
 NEET_TTL_SECONDS       = _require_int_env("NEET_TTL_SECONDS", allow_zero=False, default="600")
 FAST_SOURCE_MODE       = _env_bool("FAST_SOURCE_MODE", "0")
+USE_NVENC              = _env_bool("USE_NVENC", "0")
 
 JOB_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
 
@@ -567,6 +568,12 @@ async def get_duration(filepath: str) -> float | None:
         return None
 
 
+def ffmpeg_video_args(use_nvenc: bool) -> list[str]:
+    if use_nvenc:
+        return ["-c:v", "h264_nvenc", "-preset", "p4", "-tune", "hq"]
+    return ["-c:v", "libx264", "-preset", "veryfast"]
+
+
 async def compress_to_target(src: str, dest: str, target_mb: float) -> tuple[bool, str]:
     duration = await get_duration(src)
     if not duration or duration <= 0:
@@ -581,29 +588,39 @@ async def compress_to_target(src: str, dest: str, target_mb: float) -> tuple[boo
         target_mb, duration, video_kbps, AUDIO_KBPS,
     )
 
-    cmd = [
-        "ffmpeg", "-y",
-        "-i", src,
-        "-c:v", "libx264",
-        "-preset", "veryfast",
-        "-pix_fmt", "yuv420p",
-        "-b:v", f"{video_kbps}k",
-        "-maxrate", f"{int(video_kbps * 1.15)}k",
-        "-bufsize", f"{int(video_kbps * 2)}k",
-        "-c:a", "aac",
-        "-b:a", f"{AUDIO_KBPS}k",
-        "-movflags", "+faststart",
-        dest,
-    ]
-    code, out = await run_subprocess(cmd)
-    if code != 0:
+    def build_cmd(use_nvenc: bool) -> list[str]:
+        return [
+            "ffmpeg", "-y",
+            "-i", src,
+            *ffmpeg_video_args(use_nvenc),
+            "-pix_fmt", "yuv420p",
+            "-b:v", f"{video_kbps}k",
+            "-maxrate", f"{int(video_kbps * 1.15)}k",
+            "-bufsize", f"{int(video_kbps * 2)}k",
+            "-c:a", "aac",
+            "-b:a", f"{AUDIO_KBPS}k",
+            "-movflags", "+faststart",
+            dest,
+        ]
+
+    attempts = [USE_NVENC, False] if USE_NVENC else [False]
+    encoder_used = "libx264"
+    out = ""
+    for use_nvenc in attempts:
+        encoder_used = "h264_nvenc" if use_nvenc else "libx264"
+        code, out = await run_subprocess(build_cmd(use_nvenc))
+        if code == 0:
+            break
+        if use_nvenc:
+            log.warning("[ffmpeg] NVENC failed; retrying with libx264.")
+    else:
         log.error("[ffmpeg ERROR]\n%s", out)
         return False, out
 
     final_size  = os.path.getsize(dest)
     final_mb    = final_size / (1024 * 1024)
     target_size = int(target_mb * 1024 * 1024)
-    log.info("[ffmpeg] Output=%.2f MB", final_mb)
+    log.info("[ffmpeg] Encoder=%s Output=%.2f MB", encoder_used, final_mb)
 
     if final_size > target_size:
         log.warning("[ffmpeg] Overshot target: %.2f MB > %.2f MB", final_mb, target_mb)

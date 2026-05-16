@@ -140,6 +140,7 @@ VIDEO_DOMAINS = {
 NO_VIDEO_PHRASES = (
     "No video could be found",
     "no video",
+    "is not a video",
     "does not have a video",
     "no media",
     "HTTP Error 429",
@@ -331,6 +332,11 @@ def resolve_fixup_url(url: str) -> str:
     return url
 
 
+def is_twitter_photo_url(url: str) -> bool:
+    parsed = urlparse(url)
+    return host_matches(hostname_for(url), TWITTER_DOMAINS | FIXUP_DOMAINS) and "/photo/" in parsed.path
+
+
 def extract_extra_mentions(content: str) -> str:
     return URL_RE.sub("", content).strip()
 
@@ -342,6 +348,8 @@ def extract_supported_url(content: str) -> str | None:
             continue
         host = hostname_for(url)
         if host_matches(host, BLACKLISTED_DOMAINS):
+            continue
+        if is_twitter_photo_url(url):
             continue
         if host_matches(host, AUTO_DOWNLOAD_DOMAINS):
             return url

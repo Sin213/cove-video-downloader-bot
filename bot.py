@@ -590,21 +590,22 @@ async def compress_to_target(src: str, dest: str, target_mb: float) -> tuple[boo
     target_kbits = target_mb * 8 * 1024 * 0.97
     audio_kbits  = AUDIO_KBPS * duration
     video_kbps   = max(250, int((target_kbits - audio_kbits) / duration))
+    target_size  = int(target_mb * 1024 * 1024)
 
     log.info(
         "[ffmpeg] Target=%sMB Duration=%.1fs Video=%sk Audio=%sk",
         target_mb, duration, video_kbps, AUDIO_KBPS,
     )
 
-    def build_cmd(use_nvenc: bool) -> list[str]:
+    def build_cmd(use_nvenc: bool, bitrate_kbps: int) -> list[str]:
         return [
             "ffmpeg", "-y",
             "-i", src,
             *ffmpeg_video_args(use_nvenc),
             "-pix_fmt", "yuv420p",
-            "-b:v", f"{video_kbps}k",
-            "-maxrate", f"{int(video_kbps * 1.15)}k",
-            "-bufsize", f"{int(video_kbps * 2)}k",
+            "-b:v", f"{bitrate_kbps}k",
+            "-maxrate", f"{int(bitrate_kbps * 1.15)}k",
+            "-bufsize", f"{int(bitrate_kbps * 2)}k",
             "-c:a", "aac",
             "-b:a", f"{AUDIO_KBPS}k",
             "-movflags", "+faststart",
@@ -613,28 +614,47 @@ async def compress_to_target(src: str, dest: str, target_mb: float) -> tuple[boo
 
     attempts = [USE_NVENC, False] if USE_NVENC else [False]
     encoder_used = "libx264"
-    out = ""
+    last_error = ""
     for use_nvenc in attempts:
         encoder_used = "h264_nvenc" if use_nvenc else "libx264"
-        code, out = await run_subprocess(build_cmd(use_nvenc))
-        if code == 0:
-            break
+        bitrate_scales = [1.0] if use_nvenc else [1.0, 0.88, 0.76]
+        for scale in bitrate_scales:
+            attempt_kbps = max(250, int(video_kbps * scale))
+            code, out = await run_subprocess(build_cmd(use_nvenc, attempt_kbps))
+            if code != 0:
+                last_error = out
+                break
+
+            final_size = os.path.getsize(dest)
+            final_mb = final_size / (1024 * 1024)
+            log.info(
+                "[ffmpeg] Encoder=%s Video=%sk Output=%.2f MB",
+                encoder_used, attempt_kbps, final_mb,
+            )
+
+            if final_size <= target_size:
+                return True, f"{final_mb:.2f} MB"
+
+            last_error = (
+                f"Compressed file ({final_mb:.2f} MB) still exceeds "
+                f"the {target_mb} MB limit."
+            )
+            log.warning(
+                "[ffmpeg] Overshot target with %s at %sk: %.2f MB > %.2f MB",
+                encoder_used, attempt_kbps, final_mb, target_mb,
+            )
+
         if use_nvenc:
-            log.warning("[ffmpeg] NVENC failed; retrying with libx264.")
-    else:
-        log.error("[ffmpeg ERROR]\n%s", out)
-        return False, out
+            log.warning("[ffmpeg] NVENC failed or overshot; retrying with libx264.")
+            continue
 
-    final_size  = os.path.getsize(dest)
-    final_mb    = final_size / (1024 * 1024)
-    target_size = int(target_mb * 1024 * 1024)
-    log.info("[ffmpeg] Encoder=%s Output=%.2f MB", encoder_used, final_mb)
+        if code != 0:
+            log.error("[ffmpeg ERROR]\n%s", last_error)
 
-    if final_size > target_size:
-        log.warning("[ffmpeg] Overshot target: %.2f MB > %.2f MB", final_mb, target_mb)
-        return False, f"Compressed file ({final_mb:.2f} MB) still exceeds the {target_mb} MB limit."
+    if last_error:
+        return False, last_error
 
-    return True, f"{final_mb:.2f} MB"
+    return False, "ffmpeg did not produce an output file."
 
 
 # ── Download pipeline ─────────────────────────────────────────────────────────

@@ -17,6 +17,7 @@ from pathlib import Path
 from time import monotonic, time
 from urllib.parse import urlparse, urlunparse
 from dotenv import load_dotenv
+from cove_attribution import friend_post_content
 
 load_dotenv()
 
@@ -814,6 +815,133 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
         return src_path, "\n".join(_log)
 
 
+async def download_audio(url: str, guild: discord.Guild | None) -> tuple:
+    _log = []
+    target_mb = get_target_mb(guild)
+    target_size = int(target_mb * 1024 * 1024)
+
+    _log.append(f"[INFO] Boost tier: {guild.premium_tier if guild else 0} — limit: {target_mb}MB")
+
+    url = resolve_fixup_url(url)
+    url = await resolve_arazu(url)
+    url = await resolve_reddit_shortlink(url)
+    _log.append(f"[INFO] URL: {url}")
+
+    is_reddit  = host_matches(hostname_for(url), {"reddit.com", "redd.it"})
+    is_twitter = host_matches(hostname_for(url), TWITTER_DOMAINS)
+    is_youtube = host_matches(hostname_for(url), {"youtube.com", "youtu.be"})
+    is_reddit_short = REDDIT_SHORT_RE.search(url) is not None
+
+    if is_reddit:
+        has_video = await reddit_has_video(url)
+        if not has_video:
+            _log.append("[NOVIDEO]")
+            return None, "\n".join(_log)
+
+    tmp = tempfile.mkdtemp(prefix="cove_", dir=TMP_BASE)
+    keep_tmp = False
+    try:
+        output_template = str(Path(tmp) / "%(title)s.%(ext)s")
+
+        cmd = ["yt-dlp"]
+
+        if not is_reddit:
+            cmd += ["--user-agent", YT_DLP_UA]
+
+        cmd += [
+            "-f", "bestaudio/best",
+            "-x",
+            "--audio-format", "mp3",
+            "-N", str(YT_DLP_FRAGMENTS),
+            "--no-part",
+            "--no-playlist",
+            "--extractor-retries", "0",
+            "--max-filesize", f"{MAX_FILESIZE_MB}M",
+            "--match-filter", "!duration",
+            "--match-filter", f"duration <= {MAX_DURATION_SECONDS}",
+            "-o", output_template,
+        ]
+
+        if COOKIES_EXIST:
+            cmd.extend(["--cookies", COOKIES_FILE])
+            _log.append("[INFO] Using cookies.")
+        else:
+            _log.append("[WARN] No cookies.txt — some sites may fail.")
+
+        cmd.append(url)
+
+        log.info("[yt-dlp audio] Running: %s", ' '.join(cmd))
+        _log.append("[INFO] Downloading audio...")
+
+        code, out = await run_subprocess(cmd)
+
+        log.info("[yt-dlp audio] Exit code: %d", code)
+        log.debug("[yt-dlp audio] Output:\n%s", out)
+        _log.append(out.strip())
+
+        if "does not pass filter" in out:
+            log.info("[cove] Audio rejected by match-filter (>%dmin)", MAX_DURATION_SECONDS // 60)
+            _log.append(f"[TOOBIG] >{MAX_DURATION_SECONDS // 60}min")
+            return None, "\n".join(_log)
+        if "larger than max-filesize" in out.lower() or "file is larger than max" in out.lower():
+            log.info("[cove] Audio rejected by max-filesize (>%dMB)", MAX_FILESIZE_MB)
+            _log.append(f"[TOOBIG] >{MAX_FILESIZE_MB}MB")
+            return None, "\n".join(_log)
+
+        if code != 0:
+            if any(phrase.lower() in out.lower() for phrase in NO_VIDEO_PHRASES):
+                log.info("[cove] No audio / network issue — ignoring silently.")
+                _log.append("[NOVIDEO]")
+            elif is_reddit and "[generic]" in out and not is_reddit_short:
+                log.info("[cove] Reddit link-post (external, no audio) — ignoring silently.")
+                _log.append("[NOVIDEO]")
+            elif "Unsupported URL" in out and is_reddit and any(p in out for p in REDDIT_SILENT_URL_PATTERNS):
+                log.info("[cove] Reddit GIF/image URL — ignoring silently.")
+                _log.append("[NOVIDEO]")
+            elif "Unsupported URL" in out and is_twitter:
+                log.info("[cove] X/Twitter post has no downloadable audio — ignoring silently.")
+                _log.append("[NOVIDEO]")
+            elif is_youtube and (
+                "Sign in to confirm" in out
+                or "confirm you're not a bot" in out.lower()
+            ):
+                _log.append("[ERROR] YouTube bot detection triggered.")
+            elif "empty media response" in out.lower():
+                log.info("[cove] Instagram empty media response — account banned or post deleted.")
+                _log.append("[ERROR] Link is broken (the account may have been banned or the post was deleted).")
+            elif "Unsupported URL" in out:
+                _log.append("[ERROR] Unsupported or private URL.")
+            elif "HTTP Error 403" in out:
+                _log.append("[ERROR] Access denied (403). Cookies may be needed or expired.")
+            elif "HTTP Error 404" in out:
+                _log.append("[ERROR] Video not found (404).")
+            else:
+                last_error = out.strip().splitlines()[-1] if out.strip() else "Unknown error."
+                _log.append(f"[ERROR] {last_error}")
+            return None, "\n".join(_log)
+
+        mp3_files = list(Path(tmp).glob("*.mp3"))
+        if not mp3_files:
+            log.warning("[cove] Temp dir contents: %s", [f.name for f in Path(tmp).glob("*")])
+            _log.append("[ERROR] No MP3 file found after download.")
+            return None, "\n".join(_log)
+
+        audio_path = str(mp3_files[0])
+        audio_mb = os.path.getsize(audio_path) / (1024 * 1024)
+        _log.append(f"[INFO] Downloaded audio: {audio_mb:.1f} MB")
+        log.info("[cove] Downloaded audio: %s (%.1f MB)", mp3_files[0].name, audio_mb)
+
+        if os.path.getsize(audio_path) > target_size:
+            _log.append(f"[TOOBIG] {audio_mb:.1f}MB")
+            return None, "\n".join(_log)
+
+        keep_tmp = True
+        return audio_path, "\n".join(_log)
+    finally:
+        if not keep_tmp:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
 def _cleanup_tmp_sync(filepath: str):
     try:
         parent = str(Path(filepath).parent)
@@ -872,6 +1000,52 @@ async def process_url(
         except Exception as e:
             log.exception("Unhandled exception in on_success")
             await on_error(f"Upload failed: {e}")
+        finally:
+            await cleanup_tmp(filepath)
+
+
+async def process_audio_url(
+    url: str,
+    guild: discord.Guild | None,
+    on_success,
+    on_error,
+    on_too_big=None,
+    on_no_video=None,
+):
+    async with JOB_SEMAPHORE:
+        try:
+            filepath, log_text = await download_audio(url, guild)
+        except Exception:
+            log.exception("Unhandled exception during process_audio_url")
+            await on_error("Audio download failed.")
+            return
+
+        if any(line.strip() == "[NOVIDEO]" for line in log_text.splitlines()):
+            if on_no_video:
+                await on_no_video()
+            return
+
+        toobig_lines = [line for line in log_text.splitlines() if line.startswith("[TOOBIG]")]
+        if toobig_lines:
+            size_str = toobig_lines[0].replace("[TOOBIG] ", "")
+            if on_too_big:
+                await on_too_big(size_str)
+            else:
+                await on_error(f"Audio too big {NYO_EMOJI} ({size_str})")
+            return
+
+        if not filepath or not os.path.exists(filepath):
+            error_lines = [line for line in log_text.splitlines() if line.startswith("[ERROR]")]
+            msg = error_lines[0].replace("[ERROR] ", "") if error_lines else "Audio download failed."
+            log.error("Audio download failed. Full log:\n%s", log_text)
+            await on_error(msg)
+            return
+
+        try:
+            await on_success(filepath)
+        except Exception:
+            log.exception("Unhandled exception in audio on_success")
+            await on_error("Upload failed.")
         finally:
             await cleanup_tmp(filepath)
 
@@ -972,16 +1146,10 @@ class CoveBot(discord.Client):
                 pass
 
             if friend_mode:
-                embed = discord.Embed()
-                embed.set_author(
-                    name=f"{display_name} posted:",
-                    icon_url=message.author.display_avatar.url,
-                )
                 sent = await message.channel.send(
-                    content=extra_mentions if extra_mentions else None,
-                    embed=embed,
+                    content=friend_post_content(display_name, extra_mentions),
                     file=discord.File(filepath),
-                    allowed_mentions=discord.AllowedMentions(users=False, everyone=False, roles=False),
+                    allowed_mentions=discord.AllowedMentions(users=True, everyone=False, roles=False),
                 )
                 prune_friend_posts()
                 _friend_posts[sent.id] = (author_id, monotonic() + FRIEND_POST_TTL_SECONDS)
@@ -1108,13 +1276,8 @@ async def download_cmd(interaction: discord.Interaction, url: str):
 
     async def on_success(filepath: str):
         if friend_mode:
-            embed = discord.Embed()
-            embed.set_author(
-                name=f"{interaction.user.display_name} posted:",
-                icon_url=interaction.user.display_avatar.url,
-            )
             sent = await interaction.followup.send(
-                embed=embed,
+                content=friend_post_content(interaction.user.display_name, ""),
                 file=discord.File(filepath),
             )
             prune_friend_posts()
@@ -1134,6 +1297,60 @@ async def download_cmd(interaction: discord.Interaction, url: str):
         )
 
     await process_url(
+        url,
+        interaction.guild,
+        on_success,
+        on_error,
+        on_too_big=on_too_big,
+        on_no_video=on_no_video,
+    )
+
+
+@client.tree.command(
+    name="audio",
+    description="Download an MP3 audio file from any supported site",
+)
+@app_commands.describe(url="The video URL to extract audio from")
+async def audio_cmd(interaction: discord.Interaction, url: str):
+    ok, err = await validate_manual_url(url)
+    if not ok:
+        try:
+            await interaction.response.send_message(f"\u274c {err}", ephemeral=True)
+        except (discord.errors.NotFound, discord.errors.HTTPException):
+            pass
+        return
+
+    try:
+        await interaction.response.defer(thinking=True)
+    except (discord.errors.NotFound, discord.errors.HTTPException):
+        return
+
+    friend_mode = is_friend_server(interaction.guild)
+    poster_id   = interaction.user.id
+
+    async def on_success(filepath: str):
+        if friend_mode:
+            sent = await interaction.followup.send(
+                content=friend_post_content(interaction.user.display_name, ""),
+                file=discord.File(filepath),
+            )
+            prune_friend_posts()
+            _friend_posts[sent.id] = (poster_id, monotonic() + FRIEND_POST_TTL_SECONDS)
+        else:
+            await interaction.followup.send(file=discord.File(filepath))
+
+    async def on_error(msg: str):
+        await interaction.followup.send(f"\u274c {msg}")
+
+    async def on_no_video():
+        await interaction.followup.send("\u274c No audio found at that link.")
+
+    async def on_too_big(size_str: str):
+        await interaction.followup.send(
+            f"Audio too big {NYO_EMOJI} ({size_str}, max {get_target_mb(interaction.guild)}MB)"
+        )
+
+    await process_audio_url(
         url,
         interaction.guild,
         on_success,

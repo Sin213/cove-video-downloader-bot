@@ -11,12 +11,12 @@ A self-hosted Discord bot that automatically detects video links in chat and dow
 ## Features
 
 - **Auto-download** — detects supported links posted in chat and downloads them automatically
-- **Attribution embed** — shows who posted the original link (e.g. "DrunkenSquirrel posted:") without pinging them
+- **Attribution line** — shows mentions first, then the poster's display name as plain text
 - **Smart compression** — uses ffmpeg to compress videos to fit within Discord's upload limit for your server's boost tier
 - **Silent ignore** — if a link has no video (image posts, text posts, rate limits), the bot removes the ⏳ and does nothing
-- **Slash command** — `/download <url>` for manual downloads
+- **Slash commands** — `/download <url>` for manual video downloads and `/audio <url>` for MP3 audio extraction
 - **Cookie support** — place a `cookies.txt` next to `bot.py` for sites that require authentication
-- **Friend server mode** — optional second server where the bot deletes the original message and silently tags the poster
+- **Friend server mode** — optional second server where the bot deletes the original message and posts plain-text attribution
 
 ---
 
@@ -32,7 +32,7 @@ Anything yt-dlp supports, with auto-download triggered for:
 - arazu.io
 
 YouTube is intentionally **not** auto-triggered (Google's bot-detection makes it
-unreliable in unattended runs). It's still available via `/download <youtube-url>`.
+unreliable in unattended runs). It's still available via `/download <youtube-url>` and `/audio <youtube-url>`.
 
 ---
 
@@ -130,11 +130,12 @@ When `FRIEND_GUILD_ID` is set, the bot activates a special mode in that server o
 
 | Behavior | Main Server | Friend Server |
 |---|---|---|
-| Post video | ✅ embed + file | ✅ embed + file |
+| Post video | ✅ attribution + file | ✅ attribution + file |
 | Delete original message | ❌ | ✅ |
-| @mention poster | ❌ | ✅ silent (no ping) |
+| Ping tagged users | ❌ | ✅ |
+| Show poster name | ✅ silent mention | ✅ plaintext name |
 
-The silent mention renders the poster's name as a clickable tag in the bot's message but sends **zero notification**. This requires the bot to have the **Manage Messages** permission in the friend server. If it's missing, the delete step is silently skipped.
+Friend server mode pings users who were tagged in the original message, adds the original poster's display name as plain text, then deletes the original message. The delete step requires the bot to have the **Manage Messages** permission in the friend server. If it's missing, the delete step is silently skipped.
 
 ---
 

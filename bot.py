@@ -106,10 +106,10 @@ YT_DLP_UA = (
 )
 
 BOOST_TIER_LIMITS_MB = {
-    0: 24.0,
-    1: 24.0,
-    2: 48.5,
-    3: 97.0,
+    0: 9.5,
+    1: 9.5,
+    2: 49.0,
+    3: 99.0,
 }
 
 GIF_MAX_DURATION = 10.0
@@ -519,7 +519,7 @@ def is_friend_server(guild: discord.Guild | None) -> bool:
 def get_target_mb(guild: discord.Guild | None) -> float:
     if guild is None:
         return BOOST_TIER_LIMITS_MB[0]
-    return guild.filesize_limit / (1024 * 1024) * 0.97
+    return BOOST_TIER_LIMITS_MB.get(guild.premium_tier, 9.5)
 
 
 def _check_bot_permissions(channel: discord.abc.GuildChannel, bot_member: discord.Member) -> tuple[bool, str]:

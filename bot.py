@@ -418,6 +418,29 @@ def clean_env():
 
 ENV = clean_env()
 
+_SENSITIVE_PATTERNS = re.compile(
+    r"/(?:home|usr|tmp|etc|var|dev|root|proc|sys)/\S+"
+    r"|[A-Z_]{2,}=\S+"
+    r"|\b\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?\b"
+    r"|\b[0-9a-fA-F]{32,}\b"
+    r"|(?:cookie|token|secret|password|credential)\S*"
+    , re.IGNORECASE,
+)
+
+
+def _sanitize_error_line(raw: str) -> str:
+    line = raw.strip()
+    if not line:
+        return "Download failed."
+    if line.upper().startswith("ERROR:"):
+        line = line[6:].strip()
+    if not line:
+        return "Download failed."
+    cleaned = _SENSITIVE_PATTERNS.sub("[redacted]", line)
+    if cleaned.strip() == "[redacted]" or not cleaned.strip():
+        return "Download failed."
+    return cleaned
+
 
 # ── Subprocess ────────────────────────────────────────────────────────────────
 
@@ -768,8 +791,8 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
         elif "HTTP Error 404" in out:
             _log.append("[ERROR] Video not found (404).")
         else:
-            last_error = out.strip().splitlines()[-1] if out.strip() else "Unknown error."
-            _log.append(f"[ERROR] {last_error}")
+            raw_last = out.strip().splitlines()[-1] if out.strip() else ""
+            _log.append(f"[ERROR] {_sanitize_error_line(raw_last)}")
         shutil.rmtree(tmp, ignore_errors=True)
         return None, "\n".join(_log)
 
@@ -916,8 +939,8 @@ async def download_audio(url: str, guild: discord.Guild | None) -> tuple:
             elif "HTTP Error 404" in out:
                 _log.append("[ERROR] Video not found (404).")
             else:
-                last_error = out.strip().splitlines()[-1] if out.strip() else "Unknown error."
-                _log.append(f"[ERROR] {last_error}")
+                raw_last = out.strip().splitlines()[-1] if out.strip() else ""
+                _log.append(f"[ERROR] {_sanitize_error_line(raw_last)}")
             return None, "\n".join(_log)
 
         mp3_files = list(Path(tmp).glob("*.mp3"))
@@ -1382,4 +1405,5 @@ if FRIEND_GUILD_ID != 0:
         )
 
 
-client.run(TOKEN)
+if __name__ == "__main__":
+    client.run(TOKEN)

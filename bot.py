@@ -934,6 +934,11 @@ async def convert_to_gif(
         return False, "Could not read video duration."
 
     clip_duration = min(duration, max_duration)
+    if target_mb < 15:
+        clip_duration = min(clip_duration, 6.0)
+    elif target_mb < 30:
+        clip_duration = min(clip_duration, 8.0)
+
     target_size = int(target_mb * 1024 * 1024)
     palette_path = dest + ".palette.png"
 
@@ -942,7 +947,12 @@ async def convert_to_gif(
         (380, 12),
         (320, 10),
         (240, 8),
+        (180, 6),
     ]
+    if target_mb < 15:
+        quality_levels = quality_levels[2:]
+    elif target_mb < 30:
+        quality_levels = quality_levels[1:]
 
     final_mb = 0.0
     async with ENCODE_SEMAPHORE:
@@ -976,7 +986,7 @@ async def convert_to_gif(
                     os.remove(palette_path)
                 except OSError:
                     pass
-                return True, f"{final_mb:.2f} MB"
+                return True, f"{final_mb:.2f} MB ({clip_duration:.0f}s)"
 
             log.warning("[gif] Too large at %dp %dfps (%.2fMB), trying lower quality", width, fps, final_mb)
 

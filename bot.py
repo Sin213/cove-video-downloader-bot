@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import socket
+import subprocess
 import sys
 import tempfile
 import json
@@ -63,6 +64,11 @@ WHITELIST_IDS = {
 
 COOKIES_FILE  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
 COOKIES_EXIST = os.path.exists(COOKIES_FILE)
+if COOKIES_EXIST:
+    try:
+        os.chmod(COOKIES_FILE, 0o600)
+    except OSError as e:
+        log.warning("[Cove] Could not restrict cookies.txt permissions: %s", e)
 
 AUDIO_KBPS           = 128
 MAX_DURATION_SECONDS = 600
@@ -78,6 +84,9 @@ MAX_URL_LENGTH         = _require_int_env("MAX_URL_LENGTH", allow_zero=False, de
 NEET_TTL_SECONDS       = _require_int_env("NEET_TTL_SECONDS", allow_zero=False, default="600")
 FAST_SOURCE_MODE       = _env_bool("FAST_SOURCE_MODE", "0")
 USE_NVENC              = _env_bool("USE_NVENC", "0")
+USER_RATE_LIMIT        = _require_int_env("USER_RATE_LIMIT", default="10")
+USER_RATE_WINDOW       = _require_int_env("USER_RATE_WINDOW", default="60")
+YT_DLP_MIN_VERSION     = os.getenv("YT_DLP_MIN_VERSION", "2024.01.01")
 
 JOB_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
 
@@ -199,6 +208,7 @@ FORMAT_REDDIT_FAST = (
 _deletable: dict[int, tuple[int, float]] = {}
 _friend_posts: dict[int, tuple[int, float]] = {}
 _friend_neet_skip_users: dict[int, float] = {}
+_user_request_times: dict[int, list[float]] = {}
 _active_tasks: set[asyncio.Task] = set()
 _http_session: aiohttp.ClientSession | None = None
 
@@ -210,6 +220,8 @@ _reddit_has_video_cache: dict[str, tuple[bool, float]] = {}
 SHORTLINK_CACHE_TTL = 24 * 3600
 HAS_VIDEO_CACHE_TTL = 3600
 CACHE_MAX_ENTRIES = 512
+MAX_HTTP_RESPONSE_BYTES = 1024 * 1024
+MAX_SUBPROCESS_OUTPUT_BYTES = 512 * 1024
 
 
 def _cache_get(cache: dict, key: str):
@@ -285,7 +297,19 @@ def prune_neet_skips() -> None:
         _friend_neet_skip_users.pop(uid, None)
 
 
-def _sweep_orphaned_tmpdirs(min_age_seconds: float = 3600) -> None:
+def _check_user_rate_limit(user_id: int) -> bool:
+    now = monotonic()
+    times = _user_request_times.get(user_id, [])
+    times = [t for t in times if now - t < USER_RATE_WINDOW]
+    if len(times) >= USER_RATE_LIMIT:
+        _user_request_times[user_id] = times
+        return False
+    times.append(now)
+    _user_request_times[user_id] = times
+    return True
+
+
+def _sweep_orphaned_tmpdirs(min_age_seconds: float = 900) -> None:
     root = Path(TMP_BASE or tempfile.gettempdir())
     cutoff = time() - min_age_seconds
     try:
@@ -349,6 +373,7 @@ def extract_supported_url(content: str) -> str | None:
             continue
         host = hostname_for(url)
         if host_matches(host, BLACKLISTED_DOMAINS):
+            log.info("[security] Blocked blacklisted domain: %s", host)
             continue
         if is_twitter_photo_url(url):
             continue
@@ -387,6 +412,7 @@ async def validate_manual_url(url: str) -> tuple[bool, str]:
     if host in {"localhost", "ip6-localhost", "ip6-loopback"}:
         return False, "URL points to a non-public address."
     if _is_internal_ip(host):
+        log.warning("[security] Blocked SSRF attempt to internal IP: %s", host)
         return False, "URL points to a non-public address."
     loop = asyncio.get_running_loop()
     try:
@@ -395,6 +421,7 @@ async def validate_manual_url(url: str) -> tuple[bool, str]:
         return False, "Could not resolve URL host."
     for info in infos:
         if _is_internal_ip(info[4][0]):
+            log.warning("[security] Blocked SSRF attempt: %s resolved to internal IP %s", host, info[4][0])
             return False, "URL points to a non-public address."
     return True, ""
 
@@ -409,6 +436,20 @@ def get_target_mb(guild: discord.Guild | None) -> float:
     return BOOST_TIER_LIMITS_MB.get(guild.premium_tier, 9.5)
 
 
+def _check_bot_permissions(channel: discord.abc.GuildChannel, bot_member: discord.Member) -> tuple[bool, str]:
+    perms = channel.permissions_for(bot_member)
+    missing = []
+    if not perms.send_messages:
+        missing.append("Send Messages")
+    if not perms.attach_files:
+        missing.append("Attach Files")
+    if not perms.add_reactions:
+        missing.append("Add Reactions")
+    if missing:
+        return False, ", ".join(missing)
+    return True, ""
+
+
 def clean_env():
     env = os.environ.copy()
     env.pop("PYTHONHOME", None)
@@ -417,6 +458,27 @@ def clean_env():
 
 
 ENV = clean_env()
+
+
+def _check_ytdlp_version():
+    try:
+        result = subprocess.run(
+            ["yt-dlp", "--version"],
+            capture_output=True, text=True, timeout=5, env=ENV,
+        )
+        version = result.stdout.strip()
+        if version < YT_DLP_MIN_VERSION:
+            log.warning(
+                "[security] yt-dlp version %s is older than minimum %s",
+                version, YT_DLP_MIN_VERSION,
+            )
+        else:
+            log.info("[Cove] yt-dlp version: %s", version)
+    except Exception as e:
+        log.warning("[security] Could not check yt-dlp version: %s", e)
+
+
+_check_ytdlp_version()
 
 _SENSITIVE_PATTERNS = re.compile(
     r"/(?:home|usr|tmp|etc|var|dev|root|proc|sys)/\S+"
@@ -442,6 +504,19 @@ def _sanitize_error_line(raw: str) -> str:
     return cleaned
 
 
+def _sanitize_filename(name: str) -> str:
+    if not name or not name.strip():
+        return "video"
+    name = name.replace("\x00", "").replace("/", "_").replace("\\", "_")
+    name = name.replace("..", "_")
+    parts = name.rsplit(".", 1)
+    stem = parts[0][:190]
+    ext = parts[1] if len(parts) > 1 else ""
+    if ext:
+        return f"{stem}.{ext[:10]}"
+    return stem if stem else "video"
+
+
 # ── Subprocess ────────────────────────────────────────────────────────────────
 
 async def run_subprocess(cmd: list[str], timeout: int = SUBPROCESS_TIMEOUT) -> tuple[int, str]:
@@ -456,9 +531,9 @@ async def run_subprocess(cmd: list[str], timeout: int = SUBPROCESS_TIMEOUT) -> t
     except asyncio.TimeoutError:
         proc.kill()
         stdout, _ = await proc.communicate()
-        output = stdout.decode(errors="replace")
+        output = stdout[:MAX_SUBPROCESS_OUTPUT_BYTES].decode(errors="replace")
         return 124, output + "\n[ERROR] Subprocess timed out."
-    return proc.returncode, stdout.decode(errors="replace")
+    return proc.returncode, stdout[:MAX_SUBPROCESS_OUTPUT_BYTES].decode(errors="replace")
 
 
 # ── Reddit helpers ────────────────────────────────────────────────────────────
@@ -543,7 +618,12 @@ async def reddit_has_video(url: str) -> bool:
             headers={"User-Agent": REDDIT_UA, "Accept": "application/json"},
             timeout=aiohttp.ClientTimeout(total=8),
         ) as resp:
-            raw = await resp.text(errors="replace")
+            content_type = resp.headers.get("Content-Type", "")
+            if "json" not in content_type and "text" not in content_type:
+                log.warning("[security] Reddit API returned unexpected Content-Type: %s", content_type)
+                return True
+            body = await resp.content.read(MAX_HTTP_RESPONSE_BYTES)
+            raw = body.decode(errors="replace")
         data = json.loads(raw)
         post = data[0]["data"]["children"][0]["data"]
         if post.get("is_video"):
@@ -575,7 +655,8 @@ async def resolve_arazu(url: str) -> str:
             headers={"User-Agent": "Mozilla/5.0 (compatible; CoveBot/1.0)"},
             timeout=aiohttp.ClientTimeout(total=10),
         ) as resp:
-            html = await resp.text(errors="replace")
+            body = await resp.content.read(MAX_HTTP_RESPONSE_BYTES)
+            html = body.decode(errors="replace")
         match = REDDIT_RE.search(html)
         if match:
             reddit_url = match.group(1).replace("old.reddit.com", "www.reddit.com")
@@ -707,6 +788,7 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
             return None, "\n".join(_log)
 
     tmp = tempfile.mkdtemp(prefix="cove_", dir=TMP_BASE)
+    os.chmod(tmp, 0o700)
     output_template = str(Path(tmp) / "%(title)s.%(ext)s")
 
     if FAST_SOURCE_MODE:
@@ -804,9 +886,14 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
         return None, "\n".join(_log)
 
     src_path = str(mp4_files[0])
+    safe_name = _sanitize_filename(mp4_files[0].name)
+    if mp4_files[0].name != safe_name:
+        safe_path = str(mp4_files[0].parent / safe_name)
+        os.rename(src_path, safe_path)
+        src_path = safe_path
     orig_mb  = os.path.getsize(src_path) / (1024 * 1024)
     _log.append(f"[INFO] Downloaded: {orig_mb:.1f} MB")
-    log.info("[cove] Downloaded: %s (%.1f MB)", mp4_files[0].name, orig_mb)
+    log.info("[cove] Downloaded: %s (%.1f MB)", safe_name, orig_mb)
 
     duration = await get_duration(src_path)
     if duration and duration > MAX_DURATION_SECONDS:
@@ -862,6 +949,7 @@ async def download_audio(url: str, guild: discord.Guild | None) -> tuple:
             return None, "\n".join(_log)
 
     tmp = tempfile.mkdtemp(prefix="cove_", dir=TMP_BASE)
+    os.chmod(tmp, 0o700)
     keep_tmp = False
     try:
         output_template = str(Path(tmp) / "%(title)s.%(ext)s")
@@ -950,9 +1038,14 @@ async def download_audio(url: str, guild: discord.Guild | None) -> tuple:
             return None, "\n".join(_log)
 
         audio_path = str(mp3_files[0])
+        safe_name = _sanitize_filename(mp3_files[0].name)
+        if mp3_files[0].name != safe_name:
+            safe_path = str(mp3_files[0].parent / safe_name)
+            os.rename(audio_path, safe_path)
+            audio_path = safe_path
         audio_mb = os.path.getsize(audio_path) / (1024 * 1024)
         _log.append(f"[INFO] Downloaded audio: {audio_mb:.1f} MB")
-        log.info("[cove] Downloaded audio: %s (%.1f MB)", mp3_files[0].name, audio_mb)
+        log.info("[cove] Downloaded audio: %s (%.1f MB)", safe_name, audio_mb)
 
         if os.path.getsize(audio_path) > target_size:
             _log.append(f"[TOOBIG] {audio_mb:.1f}MB")
@@ -1150,6 +1243,16 @@ class CoveBot(discord.Client):
         if not url:
             return
 
+        if not _check_user_rate_limit(message.author.id):
+            log.warning("[security] Rate limit hit for user %d in #%s", message.author.id, message.channel)
+            return
+
+        if message.guild and message.guild.me:
+            perms_ok, missing = _check_bot_permissions(message.channel, message.guild.me)
+            if not perms_ok:
+                log.warning("[security] Missing permissions in #%s: %s", message.channel, missing)
+                return
+
         log.info("[Cove] Auto-triggered by %s in #%s: %s", message.author, message.channel, url)
 
         try:
@@ -1289,6 +1392,16 @@ async def download_cmd(interaction: discord.Interaction, url: str):
             pass
         return
 
+    if not _check_user_rate_limit(interaction.user.id):
+        try:
+            await interaction.response.send_message(
+                "\u274c You're sending too many requests. Please wait a moment.",
+                ephemeral=True,
+            )
+        except (discord.errors.NotFound, discord.errors.HTTPException):
+            pass
+        return
+
     try:
         await interaction.response.defer(thinking=True)
     except (discord.errors.NotFound, discord.errors.HTTPException):
@@ -1339,6 +1452,16 @@ async def audio_cmd(interaction: discord.Interaction, url: str):
     if not ok:
         try:
             await interaction.response.send_message(f"\u274c {err}", ephemeral=True)
+        except (discord.errors.NotFound, discord.errors.HTTPException):
+            pass
+        return
+
+    if not _check_user_rate_limit(interaction.user.id):
+        try:
+            await interaction.response.send_message(
+                "\u274c You're sending too many requests. Please wait a moment.",
+                ephemeral=True,
+            )
         except (discord.errors.NotFound, discord.errors.HTTPException):
             pass
         return

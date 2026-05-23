@@ -6,6 +6,7 @@ from unittest.mock import patch, AsyncMock
 
 from bot import (
     ffmpeg_video_args,
+    parse_timestamp,
     _inflight_urls,
     _init_persistent_cache,
     _persist_cache_entry,
@@ -20,6 +21,8 @@ from bot import (
     YT_DLP_FRAGMENTS,
     PROCESS_NICE,
     FFMPEG_TIMEOUT,
+    GIF_MAX_DURATION,
+    BOOST_TIER_LIMITS_MB,
 )
 
 
@@ -141,3 +144,43 @@ def test_process_nice_default():
 
 def test_ffmpeg_timeout_default():
     assert FFMPEG_TIMEOUT == 300
+
+
+def test_parse_timestamp_seconds():
+    assert parse_timestamp("90") == 90.0
+
+
+def test_parse_timestamp_minutes_seconds():
+    assert parse_timestamp("1:30") == 90.0
+
+
+def test_parse_timestamp_hours_minutes_seconds():
+    assert parse_timestamp("1:30:00") == 5400.0
+
+
+def test_parse_timestamp_zero():
+    assert parse_timestamp("0") == 0.0
+    assert parse_timestamp("0:00") == 0.0
+
+
+def test_parse_timestamp_decimal():
+    assert parse_timestamp("1:30.5") == 90.5
+
+
+def test_parse_timestamp_invalid():
+    assert parse_timestamp("abc") is None
+    assert parse_timestamp("") is None
+    assert parse_timestamp("::") is None
+
+
+def test_parse_timestamp_negative_clamps_to_zero():
+    assert parse_timestamp("-5") == 0.0
+
+
+def test_gif_max_duration():
+    assert GIF_MAX_DURATION == 10.0
+
+
+def test_boost_tier_limits_updated():
+    assert BOOST_TIER_LIMITS_MB[0] >= 24.0
+    assert BOOST_TIER_LIMITS_MB[1] >= 24.0

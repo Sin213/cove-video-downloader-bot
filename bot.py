@@ -106,11 +106,13 @@ YT_DLP_UA = (
 )
 
 BOOST_TIER_LIMITS_MB = {
-    0: 9.5,
-    1: 9.5,
-    2: 49.0,
-    3: 99.0,
+    0: 24.0,
+    1: 24.0,
+    2: 48.5,
+    3: 97.0,
 }
+
+GIF_MAX_DURATION = 10.0
 
 AUTO_DOWNLOAD_DOMAINS = {
     "twitter.com",
@@ -433,6 +435,23 @@ def extract_extra_mentions(content: str) -> str:
     return URL_RE.sub("", content).strip()
 
 
+def parse_timestamp(ts: str) -> float | None:
+    ts = ts.strip()
+    if not ts:
+        return None
+    parts = ts.split(":")
+    try:
+        if len(parts) == 1:
+            return max(0.0, float(parts[0]))
+        if len(parts) == 2:
+            return max(0.0, int(parts[0]) * 60 + float(parts[1]))
+        if len(parts) == 3:
+            return max(0.0, int(parts[0]) * 3600 + int(parts[1]) * 60 + float(parts[2]))
+    except (ValueError, IndexError):
+        return None
+    return None
+
+
 def extract_supported_url(content: str) -> str | None:
     for match in URL_RE.finditer(content):
         url = match.group(0).rstrip(").,>")
@@ -500,7 +519,7 @@ def is_friend_server(guild: discord.Guild | None) -> bool:
 def get_target_mb(guild: discord.Guild | None) -> float:
     if guild is None:
         return BOOST_TIER_LIMITS_MB[0]
-    return BOOST_TIER_LIMITS_MB.get(guild.premium_tier, 9.5)
+    return guild.filesize_limit / (1024 * 1024) * 0.97
 
 
 def _check_bot_permissions(channel: discord.abc.GuildChannel, bot_member: discord.Member) -> tuple[bool, str]:
@@ -907,6 +926,67 @@ async def compress_to_target(src: str, dest: str, target_mb: float) -> tuple[boo
         return False, "ffmpeg did not produce an output file."
 
 
+async def convert_to_gif(
+    src: str, dest: str, target_mb: float, max_duration: float = GIF_MAX_DURATION,
+) -> tuple[bool, str]:
+    duration = await get_duration(src)
+    if not duration or duration <= 0:
+        return False, "Could not read video duration."
+
+    clip_duration = min(duration, max_duration)
+    target_size = int(target_mb * 1024 * 1024)
+    palette_path = dest + ".palette.png"
+
+    quality_levels = [
+        (480, 15),
+        (380, 12),
+        (320, 10),
+        (240, 8),
+    ]
+
+    final_mb = 0.0
+    async with ENCODE_SEMAPHORE:
+        for width, fps in quality_levels:
+            vf = f"fps={fps},scale={width}:-1:flags=lanczos"
+
+            code, out = await run_subprocess([
+                "ffmpeg", "-y", "-t", str(clip_duration), "-i", src,
+                "-vf", f"{vf},palettegen=stats_mode=diff",
+                palette_path,
+            ], timeout=FFMPEG_TIMEOUT, nice=True)
+            if code != 0:
+                return False, out
+
+            code, out = await run_subprocess([
+                "ffmpeg", "-y", "-t", str(clip_duration), "-i", src,
+                "-i", palette_path,
+                "-filter_complex",
+                f"[0:v] {vf} [x]; [x][1:v] paletteuse=dither=bayer:bayer_scale=5",
+                dest,
+            ], timeout=FFMPEG_TIMEOUT, nice=True)
+            if code != 0:
+                return False, out
+
+            final_size = os.path.getsize(dest)
+            final_mb = final_size / (1024 * 1024)
+            log.info("[gif] %dp %dfps %.1fs → %.2f MB", width, fps, clip_duration, final_mb)
+
+            if final_size <= target_size:
+                try:
+                    os.remove(palette_path)
+                except OSError:
+                    pass
+                return True, f"{final_mb:.2f} MB"
+
+            log.warning("[gif] Too large at %dp %dfps (%.2fMB), trying lower quality", width, fps, final_mb)
+
+    try:
+        os.remove(palette_path)
+    except OSError:
+        pass
+    return False, f"GIF too large even at lowest quality ({final_mb:.2f}MB > {target_mb}MB)."
+
+
 # ── Download pipeline ─────────────────────────────────────────────────────────
 
 async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
@@ -1071,6 +1151,240 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
 
         _log.append("[WARN] Compression failed, but original fits. Using original.")
         return src_path, "\n".join(_log)
+
+
+async def download_and_clip(
+    url: str, guild: discord.Guild | None, start: float, end: float,
+) -> tuple:
+    _log = []
+    target_mb   = get_target_mb(guild)
+    target_size = int(target_mb * 1024 * 1024)
+    clip_duration = end - start
+
+    _log.append(f"[INFO] Clip: {start:.1f}s → {end:.1f}s ({clip_duration:.1f}s)")
+
+    url = resolve_fixup_url(url)
+    url = await resolve_arazu(url)
+    url = await resolve_reddit_shortlink(url)
+    _log.append(f"[INFO] URL: {url}")
+
+    is_reddit  = host_matches(hostname_for(url), {"reddit.com", "redd.it"})
+    is_twitter = host_matches(hostname_for(url), TWITTER_DOMAINS)
+    is_youtube = host_matches(hostname_for(url), {"youtube.com", "youtu.be"})
+    is_reddit_short = REDDIT_SHORT_RE.search(url) is not None
+
+    if is_reddit:
+        has_video = await reddit_has_video(url)
+        if not has_video:
+            _log.append("[NOVIDEO]")
+            return None, "\n".join(_log)
+
+    tmp = tempfile.mkdtemp(prefix="cove_", dir=TMP_BASE)
+    os.chmod(tmp, 0o700)
+    output_template = str(Path(tmp) / "%(title)s.%(ext)s")
+
+    if is_reddit:
+        fmt = FORMAT_REDDIT_FAST if FAST_SOURCE_MODE else FORMAT_REDDIT
+    else:
+        fmt = FORMAT_FAST if FAST_SOURCE_MODE else FORMAT_DEFAULT
+
+    cmd = ["yt-dlp"]
+    if not is_reddit:
+        cmd += ["--user-agent", YT_DLP_UA]
+
+    cmd += [
+        "-f", fmt,
+        "--merge-output-format", "mp4",
+        "-N", str(YT_DLP_FRAGMENTS),
+        "--no-part",
+        "--no-playlist",
+        "--extractor-retries", "0",
+        "--max-filesize", f"{MAX_FILESIZE_MB}M",
+        "--download-sections", f"*{start}-{end}",
+        "-o", output_template,
+    ]
+
+    if USE_ARIA2C:
+        cmd += ["--downloader", "aria2c", "--downloader-args", "aria2c:-x16 -s16 -k1M"]
+
+    if COOKIES_EXIST:
+        cmd.extend(["--cookies", COOKIES_FILE])
+
+    cmd.append(url)
+
+    log.info("[yt-dlp clip] Running: %s", ' '.join(cmd))
+    _log.append("[INFO] Downloading clip...")
+
+    code, out = await run_subprocess(cmd)
+    log.info("[yt-dlp clip] Exit code: %d", code)
+    _log.append(out.strip())
+
+    if code != 0:
+        if any(phrase.lower() in out.lower() for phrase in NO_VIDEO_PHRASES):
+            _log.append("[NOVIDEO]")
+        elif "Unsupported URL" in out and is_reddit and any(p in out for p in REDDIT_SILENT_URL_PATTERNS):
+            _log.append("[NOVIDEO]")
+        elif "Unsupported URL" in out and is_twitter:
+            _log.append("[NOVIDEO]")
+        elif "Unsupported URL" in out:
+            _log.append("[ERROR] Unsupported or private URL.")
+        elif "HTTP Error 403" in out:
+            _log.append("[ERROR] Access denied (403). Cookies may be needed or expired.")
+        elif "HTTP Error 404" in out:
+            _log.append("[ERROR] Video not found (404).")
+        else:
+            raw_last = out.strip().splitlines()[-1] if out.strip() else ""
+            _log.append(f"[ERROR] {_sanitize_error_line(raw_last)}")
+        shutil.rmtree(tmp, ignore_errors=True)
+        return None, "\n".join(_log)
+
+    mp4_files = list(Path(tmp).glob("*.mp4"))
+    if not mp4_files:
+        _log.append("[ERROR] No MP4 file found after download.")
+        shutil.rmtree(tmp, ignore_errors=True)
+        return None, "\n".join(_log)
+
+    src_path = str(mp4_files[0])
+    safe_name = _sanitize_filename(mp4_files[0].name)
+    if mp4_files[0].name != safe_name:
+        safe_path = str(mp4_files[0].parent / safe_name)
+        os.rename(src_path, safe_path)
+        src_path = safe_path
+    orig_mb = os.path.getsize(src_path) / (1024 * 1024)
+    _log.append(f"[INFO] Clip downloaded: {orig_mb:.1f} MB")
+
+    if os.path.getsize(src_path) <= target_size:
+        _log.append(f"[INFO] Under {target_mb:.0f}MB — skipping compression.")
+        return src_path, "\n".join(_log)
+
+    compressed = str(Path(tmp) / "compressed.mp4")
+    _log.append(f"[INFO] Compressing to ≤{target_mb:.0f}MB...")
+    ok, result = await compress_to_target(src_path, compressed, target_mb)
+
+    if ok:
+        _log.append(f"[OK] Final size: {result}")
+        return compressed, "\n".join(_log)
+
+    if orig_mb > target_mb:
+        _log.append(f"[ERROR] Clip ({orig_mb:.1f}MB) exceeds the {target_mb:.0f}MB limit even after compression.")
+        shutil.rmtree(tmp, ignore_errors=True)
+        return None, "\n".join(_log)
+
+    _log.append("[WARN] Compression failed, but original fits. Using original.")
+    return src_path, "\n".join(_log)
+
+
+async def download_and_gif(url: str, guild: discord.Guild | None) -> tuple:
+    _log = []
+    target_mb = get_target_mb(guild)
+
+    url = resolve_fixup_url(url)
+    url = await resolve_arazu(url)
+    url = await resolve_reddit_shortlink(url)
+    _log.append(f"[INFO] URL: {url}")
+
+    is_reddit  = host_matches(hostname_for(url), {"reddit.com", "redd.it"})
+    is_twitter = host_matches(hostname_for(url), TWITTER_DOMAINS)
+    is_youtube = host_matches(hostname_for(url), {"youtube.com", "youtu.be"})
+    is_reddit_short = REDDIT_SHORT_RE.search(url) is not None
+
+    if is_reddit:
+        has_video = await reddit_has_video(url)
+        if not has_video:
+            _log.append("[NOVIDEO]")
+            return None, "\n".join(_log)
+
+    tmp = tempfile.mkdtemp(prefix="cove_", dir=TMP_BASE)
+    os.chmod(tmp, 0o700)
+    output_template = str(Path(tmp) / "%(title)s.%(ext)s")
+
+    if is_reddit:
+        fmt = FORMAT_REDDIT_FAST if FAST_SOURCE_MODE else FORMAT_REDDIT
+    else:
+        fmt = FORMAT_FAST if FAST_SOURCE_MODE else FORMAT_DEFAULT
+
+    cmd = ["yt-dlp"]
+    if not is_reddit:
+        cmd += ["--user-agent", YT_DLP_UA]
+
+    cmd += [
+        "-f", fmt,
+        "--merge-output-format", "mp4",
+        "-N", str(YT_DLP_FRAGMENTS),
+        "--no-part",
+        "--no-playlist",
+        "--extractor-retries", "0",
+        "--max-filesize", f"{MAX_FILESIZE_MB}M",
+        "--match-filter", "!duration",
+        "--match-filter", f"duration <= {MAX_DURATION_SECONDS}",
+        "-o", output_template,
+    ]
+
+    if USE_ARIA2C:
+        cmd += ["--downloader", "aria2c", "--downloader-args", "aria2c:-x16 -s16 -k1M"]
+
+    if COOKIES_EXIST:
+        cmd.extend(["--cookies", COOKIES_FILE])
+
+    cmd.append(url)
+
+    log.info("[yt-dlp gif] Running: %s", ' '.join(cmd))
+    _log.append("[INFO] Downloading for GIF...")
+
+    code, out = await run_subprocess(cmd)
+    log.info("[yt-dlp gif] Exit code: %d", code)
+    _log.append(out.strip())
+
+    if "does not pass filter" in out:
+        _log.append(f"[TOOBIG] >{MAX_DURATION_SECONDS // 60}min")
+        shutil.rmtree(tmp, ignore_errors=True)
+        return None, "\n".join(_log)
+
+    if code != 0:
+        if any(phrase.lower() in out.lower() for phrase in NO_VIDEO_PHRASES):
+            _log.append("[NOVIDEO]")
+        elif "Unsupported URL" in out and is_reddit and any(p in out for p in REDDIT_SILENT_URL_PATTERNS):
+            _log.append("[NOVIDEO]")
+        elif "Unsupported URL" in out and is_twitter:
+            _log.append("[NOVIDEO]")
+        elif "Unsupported URL" in out:
+            _log.append("[ERROR] Unsupported or private URL.")
+        elif "HTTP Error 403" in out:
+            _log.append("[ERROR] Access denied (403). Cookies may be needed or expired.")
+        elif "HTTP Error 404" in out:
+            _log.append("[ERROR] Video not found (404).")
+        else:
+            raw_last = out.strip().splitlines()[-1] if out.strip() else ""
+            _log.append(f"[ERROR] {_sanitize_error_line(raw_last)}")
+        shutil.rmtree(tmp, ignore_errors=True)
+        return None, "\n".join(_log)
+
+    mp4_files = list(Path(tmp).glob("*.mp4"))
+    if not mp4_files:
+        _log.append("[ERROR] No MP4 file found after download.")
+        shutil.rmtree(tmp, ignore_errors=True)
+        return None, "\n".join(_log)
+
+    src_path = str(mp4_files[0])
+    safe_name = _sanitize_filename(mp4_files[0].name)
+    if mp4_files[0].name != safe_name:
+        safe_path = str(mp4_files[0].parent / safe_name)
+        os.rename(src_path, safe_path)
+        src_path = safe_path
+
+    gif_name = Path(safe_name).stem + ".gif"
+    gif_path = str(Path(tmp) / gif_name)
+
+    _log.append("[INFO] Converting to GIF...")
+    ok, result = await convert_to_gif(src_path, gif_path, target_mb)
+
+    if ok:
+        _log.append(f"[OK] GIF: {result}")
+        return gif_path, "\n".join(_log)
+
+    _log.append(f"[ERROR] {result}")
+    shutil.rmtree(tmp, ignore_errors=True)
+    return None, "\n".join(_log)
 
 
 async def download_audio(url: str, guild: discord.Guild | None) -> tuple:
@@ -1323,6 +1637,85 @@ async def process_audio_url(
         except Exception:
             log.exception("Unhandled exception in audio on_success")
             await on_error("Upload failed.")
+        finally:
+            await cleanup_tmp(filepath)
+
+
+async def process_clip_url(
+    url: str,
+    guild: discord.Guild | None,
+    start: float,
+    end: float,
+    on_success,
+    on_error,
+    on_no_video=None,
+):
+    async with JOB_SEMAPHORE:
+        try:
+            filepath, log_text = await download_and_clip(url, guild, start, end)
+        except Exception as e:
+            log.exception("Unhandled exception during process_clip_url")
+            await on_error(f"Unexpected error: {e}")
+            return
+
+        if any(line.strip() == "[NOVIDEO]" for line in log_text.splitlines()):
+            if on_no_video:
+                await on_no_video()
+            return
+
+        if not filepath or not os.path.exists(filepath):
+            error_lines = [line for line in log_text.splitlines() if line.startswith("[ERROR]")]
+            msg = error_lines[0].replace("[ERROR] ", "") if error_lines else "Clip failed."
+            log.error("Clip failed. Full log:\n%s", log_text)
+            await on_error(msg)
+            return
+
+        try:
+            await on_success(filepath)
+        except Exception as e:
+            log.exception("Unhandled exception in clip on_success")
+            await on_error(f"Upload failed: {e}")
+        finally:
+            await cleanup_tmp(filepath)
+
+
+async def process_gif_url(
+    url: str,
+    guild: discord.Guild | None,
+    on_success,
+    on_error,
+    on_no_video=None,
+):
+    async with JOB_SEMAPHORE:
+        try:
+            filepath, log_text = await download_and_gif(url, guild)
+        except Exception as e:
+            log.exception("Unhandled exception during process_gif_url")
+            await on_error(f"Unexpected error: {e}")
+            return
+
+        if any(line.strip() == "[NOVIDEO]" for line in log_text.splitlines()):
+            if on_no_video:
+                await on_no_video()
+            return
+
+        toobig_lines = [line for line in log_text.splitlines() if line.startswith("[TOOBIG]")]
+        if toobig_lines:
+            await on_error(f"Source video too long (max {MAX_DURATION_SECONDS // 60}min)")
+            return
+
+        if not filepath or not os.path.exists(filepath):
+            error_lines = [line for line in log_text.splitlines() if line.startswith("[ERROR]")]
+            msg = error_lines[0].replace("[ERROR] ", "") if error_lines else "GIF conversion failed."
+            log.error("GIF failed. Full log:\n%s", log_text)
+            await on_error(msg)
+            return
+
+        try:
+            await on_success(filepath)
+        except Exception as e:
+            log.exception("Unhandled exception in gif on_success")
+            await on_error(f"Upload failed: {e}")
         finally:
             await cleanup_tmp(filepath)
 
@@ -1664,6 +2057,160 @@ async def audio_cmd(interaction: discord.Interaction, url: str):
         on_success,
         on_error,
         on_too_big=on_too_big,
+        on_no_video=on_no_video,
+    )
+
+
+@client.tree.command(
+    name="clip",
+    description="Download a specific time range from a video",
+)
+@app_commands.describe(
+    url="The video URL to clip",
+    start="Start time (e.g. 1:30, 90, 0:05)",
+    end="End time (e.g. 2:00, 120, 0:30)",
+)
+async def clip_cmd(interaction: discord.Interaction, url: str, start: str, end: str):
+    ok, err = await validate_manual_url(url)
+    if not ok:
+        try:
+            await interaction.response.send_message(f"❌ {err}", ephemeral=True)
+        except (discord.errors.NotFound, discord.errors.HTTPException):
+            pass
+        return
+
+    start_sec = parse_timestamp(start)
+    end_sec = parse_timestamp(end)
+    if start_sec is None or end_sec is None:
+        try:
+            await interaction.response.send_message(
+                "❌ Invalid timestamp format. Use e.g. `1:30` or `90`.",
+                ephemeral=True,
+            )
+        except (discord.errors.NotFound, discord.errors.HTTPException):
+            pass
+        return
+
+    if start_sec >= end_sec:
+        try:
+            await interaction.response.send_message(
+                "❌ Start time must be before end time.", ephemeral=True,
+            )
+        except (discord.errors.NotFound, discord.errors.HTTPException):
+            pass
+        return
+
+    clip_duration = end_sec - start_sec
+    if clip_duration > MAX_DURATION_SECONDS:
+        try:
+            await interaction.response.send_message(
+                f"❌ Clip is too long ({clip_duration:.0f}s, max {MAX_DURATION_SECONDS // 60}min).",
+                ephemeral=True,
+            )
+        except (discord.errors.NotFound, discord.errors.HTTPException):
+            pass
+        return
+
+    if not _check_user_rate_limit(interaction.user.id):
+        try:
+            await interaction.response.send_message(
+                "❌ You're sending too many requests. Please wait a moment.",
+                ephemeral=True,
+            )
+        except (discord.errors.NotFound, discord.errors.HTTPException):
+            pass
+        return
+
+    try:
+        await interaction.response.defer(thinking=True)
+    except (discord.errors.NotFound, discord.errors.HTTPException):
+        return
+
+    friend_mode = is_friend_server(interaction.guild)
+    poster_id   = interaction.user.id
+
+    async def on_success(filepath: str):
+        if friend_mode:
+            sent = await interaction.followup.send(
+                content=friend_post_content(interaction.user.display_name, ""),
+                file=discord.File(filepath),
+            )
+            prune_friend_posts()
+            _friend_posts[sent.id] = (poster_id, monotonic() + FRIEND_POST_TTL_SECONDS)
+        else:
+            await interaction.followup.send(file=discord.File(filepath))
+
+    async def on_error(msg: str):
+        await interaction.followup.send(f"❌ {msg}")
+
+    async def on_no_video():
+        await interaction.followup.send("❌ No video found at that link.")
+
+    await process_clip_url(
+        url,
+        interaction.guild,
+        start_sec,
+        end_sec,
+        on_success,
+        on_error,
+        on_no_video=on_no_video,
+    )
+
+
+@client.tree.command(
+    name="gif",
+    description="Convert a video to a high-quality GIF (max 10s)",
+)
+@app_commands.describe(url="The video URL to convert to GIF")
+async def gif_cmd(interaction: discord.Interaction, url: str):
+    ok, err = await validate_manual_url(url)
+    if not ok:
+        try:
+            await interaction.response.send_message(f"❌ {err}", ephemeral=True)
+        except (discord.errors.NotFound, discord.errors.HTTPException):
+            pass
+        return
+
+    if not _check_user_rate_limit(interaction.user.id):
+        try:
+            await interaction.response.send_message(
+                "❌ You're sending too many requests. Please wait a moment.",
+                ephemeral=True,
+            )
+        except (discord.errors.NotFound, discord.errors.HTTPException):
+            pass
+        return
+
+    try:
+        await interaction.response.defer(thinking=True)
+    except (discord.errors.NotFound, discord.errors.HTTPException):
+        return
+
+    friend_mode = is_friend_server(interaction.guild)
+    poster_id   = interaction.user.id
+
+    async def on_success(filepath: str):
+        if friend_mode:
+            sent = await interaction.followup.send(
+                content=friend_post_content(interaction.user.display_name, ""),
+                file=discord.File(filepath),
+            )
+            prune_friend_posts()
+            _friend_posts[sent.id] = (poster_id, monotonic() + FRIEND_POST_TTL_SECONDS)
+        else:
+            await interaction.followup.send(file=discord.File(filepath))
+
+    async def on_error(msg: str):
+        await interaction.followup.send(f"❌ {msg}")
+
+    async def on_no_video():
+        await interaction.followup.send("❌ No video found at that link.")
+
+    await process_gif_url(
+        url,
+        interaction.guild,
+        on_success,
+        on_error,
         on_no_video=on_no_video,
     )
 

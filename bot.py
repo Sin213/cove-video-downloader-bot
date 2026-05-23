@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import json
+import sqlite3
 from pathlib import Path
 from time import monotonic, time
 from urllib.parse import urlparse, urlunparse
@@ -74,11 +75,11 @@ AUDIO_KBPS           = 128
 MAX_DURATION_SECONDS = 600
 NYO_EMOJI            = "<:NYO:1312902725750624316>"
 
-MAX_CONCURRENT_JOBS    = _require_int_env("MAX_CONCURRENT_JOBS", default="3")
+MAX_CONCURRENT_JOBS    = _require_int_env("MAX_CONCURRENT_JOBS", default="8")
 SUBPROCESS_TIMEOUT     = _require_int_env("SUBPROCESS_TIMEOUT", default="900")
 DELETE_TTL_SECONDS     = _require_int_env("DELETE_TTL_SECONDS", default="21600")
 FRIEND_POST_TTL_SECONDS = _require_int_env("FRIEND_POST_TTL_SECONDS", default="86400")
-YT_DLP_FRAGMENTS       = _require_int_env("YT_DLP_FRAGMENTS", default="4")
+YT_DLP_FRAGMENTS       = _require_int_env("YT_DLP_FRAGMENTS", default="16")
 MAX_FILESIZE_MB        = _require_int_env("MAX_FILESIZE_MB", default="500")
 MAX_URL_LENGTH         = _require_int_env("MAX_URL_LENGTH", allow_zero=False, default="2048")
 NEET_TTL_SECONDS       = _require_int_env("NEET_TTL_SECONDS", allow_zero=False, default="600")
@@ -87,8 +88,16 @@ USE_NVENC              = _env_bool("USE_NVENC", "0")
 USER_RATE_LIMIT        = _require_int_env("USER_RATE_LIMIT", default="10")
 USER_RATE_WINDOW       = _require_int_env("USER_RATE_WINDOW", default="60")
 YT_DLP_MIN_VERSION     = os.getenv("YT_DLP_MIN_VERSION", "2024.01.01")
+USE_HEVC               = _env_bool("USE_HEVC", "0")
+USE_HWACCEL            = _env_bool("USE_HWACCEL", "1")
+NVENC_MAX_SESSIONS     = _require_int_env("NVENC_MAX_SESSIONS", default="3")
+PROCESS_NICE           = _require_int_env("PROCESS_NICE", default="10")
+FFMPEG_TIMEOUT         = _require_int_env("FFMPEG_TIMEOUT", default="300")
+USE_ARIA2C_ENV         = _env_bool("USE_ARIA2C", "1")
+PERSISTENT_CACHE       = _env_bool("PERSISTENT_CACHE", "1")
 
 JOB_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
+ENCODE_SEMAPHORE = asyncio.Semaphore(NVENC_MAX_SESSIONS)
 
 YT_DLP_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -237,10 +246,67 @@ def _cache_get(cache: dict, key: str):
 
 def _cache_set(cache: dict, key: str, value, ttl: float) -> None:
     if len(cache) >= CACHE_MAX_ENTRIES:
-        # Drop the oldest-expiring entries to keep the cache bounded.
         for stale_key in sorted(cache, key=lambda k: cache[k][1])[: CACHE_MAX_ENTRIES // 4]:
             cache.pop(stale_key, None)
     cache[key] = (value, monotonic() + ttl)
+
+
+_inflight_urls: set[str] = set()
+
+CACHE_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache.db")
+
+
+def _init_persistent_cache() -> None:
+    if not PERSISTENT_CACHE:
+        return
+    try:
+        conn = sqlite3.connect(CACHE_DB_PATH)
+        conn.execute("""CREATE TABLE IF NOT EXISTS url_cache (
+            key TEXT PRIMARY KEY,
+            value TEXT NOT NULL,
+            cache_type TEXT NOT NULL,
+            expires_at REAL NOT NULL
+        )""")
+        conn.execute("DELETE FROM url_cache WHERE expires_at <= ?", (time(),))
+        now_mono = monotonic()
+        now_wall = time()
+        for row in conn.execute("SELECT key, value, cache_type, expires_at FROM url_cache"):
+            key, value, cache_type, expires_at = row
+            remaining = expires_at - now_wall
+            if remaining <= 0:
+                continue
+            mono_expires = now_mono + remaining
+            if cache_type == "shortlink":
+                _reddit_shortlink_cache[key] = (value, mono_expires)
+            elif cache_type == "has_video":
+                _reddit_has_video_cache[key] = (value == "1", mono_expires)
+        conn.commit()
+        conn.close()
+        log.info(
+            "[Cove] Loaded %d shortlink + %d has_video entries from persistent cache",
+            len(_reddit_shortlink_cache), len(_reddit_has_video_cache),
+        )
+    except Exception as e:
+        log.warning("[Cove] Could not load persistent cache: %s", e)
+
+
+def _persist_cache_entry(key: str, value, cache_type: str, ttl: float) -> None:
+    if not PERSISTENT_CACHE:
+        return
+    str_value = str(int(value)) if isinstance(value, bool) else str(value)
+    try:
+        conn = sqlite3.connect(CACHE_DB_PATH)
+        conn.execute(
+            "INSERT OR REPLACE INTO url_cache (key, value, cache_type, expires_at) VALUES (?, ?, ?, ?)",
+            (key, str_value, cache_type, time() + ttl),
+        )
+        conn.commit()
+        conn.close()
+    except Exception as e:
+        log.warning("[cache] Failed to persist: %s", e)
+
+
+_init_persistent_cache()
 
 
 def _get_http_session() -> aiohttp.ClientSession:
@@ -249,6 +315,7 @@ def _get_http_session() -> aiohttp.ClientSession:
         _http_session = aiohttp.ClientSession(
             timeout=aiohttp.ClientTimeout(total=15),
             headers={"User-Agent": REDDIT_UA},
+            connector=aiohttp.TCPConnector(limit=30, limit_per_host=10),
         )
     return _http_session
 
@@ -480,6 +547,37 @@ def _check_ytdlp_version():
 
 _check_ytdlp_version()
 
+
+def _check_aria2c() -> bool:
+    try:
+        result = subprocess.run(
+            ["aria2c", "--version"], capture_output=True, timeout=5, env=ENV,
+        )
+        if result.returncode == 0:
+            log.info("[Cove] aria2c detected — available as external downloader.")
+            return True
+    except (FileNotFoundError, subprocess.TimeoutExpired):
+        pass
+    return False
+
+
+HAS_ARIA2C = _check_aria2c()
+USE_ARIA2C = HAS_ARIA2C and USE_ARIA2C_ENV
+
+
+def _log_shm_info() -> None:
+    if TMP_BASE == "/dev/shm":
+        try:
+            stat = os.statvfs("/dev/shm")
+            total_gb = (stat.f_blocks * stat.f_frsize) / (1024 ** 3)
+            avail_gb = (stat.f_bavail * stat.f_frsize) / (1024 ** 3)
+            log.info("[Cove] /dev/shm: %.1fGB total, %.1fGB available", total_gb, avail_gb)
+        except OSError:
+            pass
+
+
+_log_shm_info()
+
 _SENSITIVE_PATTERNS = re.compile(
     r"/(?:home|usr|tmp|etc|var|dev|root|proc|sys)/\S+"
     r"|[A-Z_]{2,}=\S+"
@@ -519,7 +617,11 @@ def _sanitize_filename(name: str) -> str:
 
 # ── Subprocess ────────────────────────────────────────────────────────────────
 
-async def run_subprocess(cmd: list[str], timeout: int = SUBPROCESS_TIMEOUT) -> tuple[int, str]:
+async def run_subprocess(
+    cmd: list[str], timeout: int = SUBPROCESS_TIMEOUT, nice: bool = False,
+) -> tuple[int, str]:
+    if nice and PROCESS_NICE > 0:
+        cmd = ["nice", "-n", str(PROCESS_NICE)] + cmd
     proc = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
@@ -597,6 +699,7 @@ async def resolve_reddit_shortlink(url: str) -> str:
     if resolved:
         log.info("[reddit-short] Resolved to: %s", resolved)
         _cache_set(_reddit_shortlink_cache, url, resolved, SHORTLINK_CACHE_TTL)
+        _persist_cache_entry(url, resolved, "shortlink", SHORTLINK_CACHE_TTL)
         return resolved
 
     log.warning("[reddit-short] Could not resolve %s — passing to yt-dlp as-is.", url)
@@ -628,16 +731,20 @@ async def reddit_has_video(url: str) -> bool:
         post = data[0]["data"]["children"][0]["data"]
         if post.get("is_video"):
             _cache_set(_reddit_has_video_cache, api_url, True, HAS_VIDEO_CACHE_TTL)
+            _persist_cache_entry(api_url, True, "has_video", HAS_VIDEO_CACHE_TTL)
             return True
         post_url = post.get("url", "")
         if host_matches(hostname_for(post_url), VIDEO_DOMAINS):
             _cache_set(_reddit_has_video_cache, api_url, True, HAS_VIDEO_CACHE_TTL)
+            _persist_cache_entry(api_url, True, "has_video", HAS_VIDEO_CACHE_TTL)
             return True
         if post.get("media") or post.get("secure_media"):
             _cache_set(_reddit_has_video_cache, api_url, True, HAS_VIDEO_CACHE_TTL)
+            _persist_cache_entry(api_url, True, "has_video", HAS_VIDEO_CACHE_TTL)
             return True
         log.info("[reddit-check] No video in post (url=%s)", post_url)
         _cache_set(_reddit_has_video_cache, api_url, False, HAS_VIDEO_CACHE_TTL)
+        _persist_cache_entry(api_url, False, "has_video", HAS_VIDEO_CACHE_TTL)
         return False
     except Exception as e:
         log.warning("[reddit-check] Pre-check failed (%s) — letting yt-dlp try anyway.", e)
@@ -681,9 +788,12 @@ async def get_duration(filepath: str) -> float | None:
         return None
 
 
-def ffmpeg_video_args(use_nvenc: bool) -> list[str]:
+def ffmpeg_video_args(use_nvenc: bool, use_hevc: bool = False) -> list[str]:
     if use_nvenc:
-        return ["-c:v", "h264_nvenc", "-preset", "p4", "-tune", "hq"]
+        codec = "hevc_nvenc" if use_hevc else "h264_nvenc"
+        return ["-c:v", codec, "-preset", "p5", "-tune", "hq"]
+    if use_hevc:
+        return ["-c:v", "libx265", "-preset", "fast"]
     return ["-c:v", "libx264", "-preset", "veryfast"]
 
 
@@ -692,74 +802,109 @@ async def compress_to_target(src: str, dest: str, target_mb: float) -> tuple[boo
     if not duration or duration <= 0:
         return False, "Could not read video duration."
 
+    audio_kbps = 96 if duration < 30 else AUDIO_KBPS
     target_kbits = target_mb * 8 * 1024 * 0.97
-    audio_kbits  = AUDIO_KBPS * duration
+    audio_kbits  = audio_kbps * duration
     video_kbps   = max(250, int((target_kbits - audio_kbits) / duration))
     target_size  = int(target_mb * 1024 * 1024)
 
+    source_mb = os.path.getsize(src) / (1024 * 1024)
+    overshoot = source_mb / target_mb
+    if overshoot > 4:
+        initial_scale = max(0.5, target_mb / source_mb * 1.1)
+    elif overshoot > 2.5:
+        initial_scale = 0.76
+    elif overshoot > 1.5:
+        initial_scale = 0.88
+    else:
+        initial_scale = 1.0
+
     log.info(
-        "[ffmpeg] Target=%sMB Duration=%.1fs Video=%sk Audio=%sk",
-        target_mb, duration, video_kbps, AUDIO_KBPS,
+        "[ffmpeg] Target=%sMB Duration=%.1fs Video=%sk Audio=%sk Scale=%.2f",
+        target_mb, duration, video_kbps, audio_kbps, initial_scale,
     )
 
-    def build_cmd(use_nvenc: bool, bitrate_kbps: int) -> list[str]:
-        return [
-            "ffmpeg", "-y",
-            "-i", src,
-            *ffmpeg_video_args(use_nvenc),
+    def build_cmd(use_nvenc: bool, bitrate_kbps: int, use_hevc: bool = False) -> list[str]:
+        cmd = ["ffmpeg", "-y"]
+        if use_nvenc and USE_HWACCEL:
+            cmd += ["-hwaccel", "cuda"]
+        cmd += ["-i", src]
+        cmd += ffmpeg_video_args(use_nvenc, use_hevc)
+        if use_nvenc:
+            cmd += ["-multipass", "fullres"]
+        cmd += [
             "-pix_fmt", "yuv420p",
             "-b:v", f"{bitrate_kbps}k",
             "-maxrate", f"{int(bitrate_kbps * 1.15)}k",
             "-bufsize", f"{int(bitrate_kbps * 2)}k",
             "-c:a", "aac",
-            "-b:a", f"{AUDIO_KBPS}k",
+            "-b:a", f"{audio_kbps}k",
             "-movflags", "+faststart",
             dest,
         ]
+        return cmd
 
-    attempts = [USE_NVENC, False] if USE_NVENC else [False]
-    encoder_used = "libx264"
-    last_error = ""
-    for use_nvenc in attempts:
-        encoder_used = "h264_nvenc" if use_nvenc else "libx264"
-        bitrate_scales = [1.0] if use_nvenc else [1.0, 0.88, 0.76]
-        for scale in bitrate_scales:
-            attempt_kbps = max(250, int(video_kbps * scale))
-            code, out = await run_subprocess(build_cmd(use_nvenc, attempt_kbps))
+    async with ENCODE_SEMAPHORE:
+        encoder_attempts: list[tuple[bool, bool]] = []
+        if USE_NVENC:
+            encoder_attempts.append((True, USE_HEVC))
+        encoder_attempts.append((False, False))
+
+        encoder_used = "libx264"
+        last_error = ""
+        for use_nvenc, use_hevc in encoder_attempts:
+            if use_hevc:
+                encoder_used = "hevc_nvenc" if use_nvenc else "libx265"
+            else:
+                encoder_used = "h264_nvenc" if use_nvenc else "libx264"
+
+            base_scales = [1.0, 0.88, 0.76]
+            scales = [s for s in base_scales if s <= initial_scale + 0.01]
+            if not scales:
+                scales = [initial_scale]
+            scales[0] = min(scales[0], initial_scale)
+
+            for scale in scales:
+                attempt_kbps = max(250, int(video_kbps * scale))
+                code, out = await run_subprocess(
+                    build_cmd(use_nvenc, attempt_kbps, use_hevc),
+                    timeout=FFMPEG_TIMEOUT,
+                    nice=True,
+                )
+                if code != 0:
+                    last_error = out
+                    break
+
+                final_size = os.path.getsize(dest)
+                final_mb = final_size / (1024 * 1024)
+                log.info(
+                    "[ffmpeg] Encoder=%s Video=%sk Output=%.2f MB",
+                    encoder_used, attempt_kbps, final_mb,
+                )
+
+                if final_size <= target_size:
+                    return True, f"{final_mb:.2f} MB"
+
+                last_error = (
+                    f"Compressed file ({final_mb:.2f} MB) still exceeds "
+                    f"the {target_mb} MB limit."
+                )
+                log.warning(
+                    "[ffmpeg] Overshot target with %s at %sk: %.2f MB > %.2f MB",
+                    encoder_used, attempt_kbps, final_mb, target_mb,
+                )
+
+            if use_nvenc:
+                log.warning("[ffmpeg] NVENC failed or overshot; retrying with software encoder.")
+                continue
+
             if code != 0:
-                last_error = out
-                break
+                log.error("[ffmpeg ERROR]\n%s", last_error)
 
-            final_size = os.path.getsize(dest)
-            final_mb = final_size / (1024 * 1024)
-            log.info(
-                "[ffmpeg] Encoder=%s Video=%sk Output=%.2f MB",
-                encoder_used, attempt_kbps, final_mb,
-            )
+        if last_error:
+            return False, last_error
 
-            if final_size <= target_size:
-                return True, f"{final_mb:.2f} MB"
-
-            last_error = (
-                f"Compressed file ({final_mb:.2f} MB) still exceeds "
-                f"the {target_mb} MB limit."
-            )
-            log.warning(
-                "[ffmpeg] Overshot target with %s at %sk: %.2f MB > %.2f MB",
-                encoder_used, attempt_kbps, final_mb, target_mb,
-            )
-
-        if use_nvenc:
-            log.warning("[ffmpeg] NVENC failed or overshot; retrying with libx264.")
-            continue
-
-        if code != 0:
-            log.error("[ffmpeg ERROR]\n%s", last_error)
-
-    if last_error:
-        return False, last_error
-
-    return False, "ffmpeg did not produce an output file."
+        return False, "ffmpeg did not produce an output file."
 
 
 # ── Download pipeline ─────────────────────────────────────────────────────────
@@ -816,6 +961,9 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
         "--match-filter", f"duration <= {MAX_DURATION_SECONDS}",
         "-o", output_template,
     ]
+
+    if USE_ARIA2C:
+        cmd += ["--downloader", "aria2c", "--downloader-args", "aria2c:-x16 -s16 -k1M"]
 
     if COOKIES_EXIST:
         cmd.extend(["--cookies", COOKIES_FILE])
@@ -973,6 +1121,9 @@ async def download_audio(url: str, guild: discord.Guild | None) -> tuple:
             "-o", output_template,
         ]
 
+        if USE_ARIA2C:
+            cmd += ["--downloader", "aria2c", "--downloader-args", "aria2c:-x16 -s16 -k1M"]
+
         if COOKIES_EXIST:
             cmd.extend(["--cookies", COOKIES_FILE])
             _log.append("[INFO] Using cookies.")
@@ -1082,42 +1233,52 @@ async def process_url(
     on_too_big=None,
     on_no_video=None,
 ):
-    async with JOB_SEMAPHORE:
-        try:
-            filepath, log_text = await download_and_compress(url, guild)
-        except Exception as e:
-            log.exception("Unhandled exception during process_url")
-            await on_error(f"Unexpected error: {e}")
-            return
+    canonical = url.lower().rstrip("/")
+    if canonical in _inflight_urls:
+        log.info("[dedup] Skipping already-in-flight URL: %s", url)
+        if on_no_video:
+            await on_no_video()
+        return
+    _inflight_urls.add(canonical)
+    try:
+        async with JOB_SEMAPHORE:
+            try:
+                filepath, log_text = await download_and_compress(url, guild)
+            except Exception as e:
+                log.exception("Unhandled exception during process_url")
+                await on_error(f"Unexpected error: {e}")
+                return
 
-        if any(line.strip() == "[NOVIDEO]" for line in log_text.splitlines()):
-            if on_no_video:
-                await on_no_video()
-            return
+            if any(line.strip() == "[NOVIDEO]" for line in log_text.splitlines()):
+                if on_no_video:
+                    await on_no_video()
+                return
 
-        toobig_lines = [line for line in log_text.splitlines() if line.startswith("[TOOBIG]")]
-        if toobig_lines:
-            duration_str = toobig_lines[0].replace("[TOOBIG] ", "")
-            if on_too_big:
-                await on_too_big(duration_str)
-            else:
-                await on_error(f"Video too big {NYO_EMOJI} ({duration_str}, max {MAX_DURATION_SECONDS // 60}min)")
-            return
+            toobig_lines = [line for line in log_text.splitlines() if line.startswith("[TOOBIG]")]
+            if toobig_lines:
+                duration_str = toobig_lines[0].replace("[TOOBIG] ", "")
+                if on_too_big:
+                    await on_too_big(duration_str)
+                else:
+                    await on_error(f"Video too big {NYO_EMOJI} ({duration_str}, max {MAX_DURATION_SECONDS // 60}min)")
+                return
 
-        if not filepath or not os.path.exists(filepath):
-            error_lines = [line for line in log_text.splitlines() if line.startswith("[ERROR]")]
-            msg = error_lines[0].replace("[ERROR] ", "") if error_lines else "Download failed."
-            log.error("Download failed. Full log:\n%s", log_text)
-            await on_error(msg)
-            return
+            if not filepath or not os.path.exists(filepath):
+                error_lines = [line for line in log_text.splitlines() if line.startswith("[ERROR]")]
+                msg = error_lines[0].replace("[ERROR] ", "") if error_lines else "Download failed."
+                log.error("Download failed. Full log:\n%s", log_text)
+                await on_error(msg)
+                return
 
-        try:
-            await on_success(filepath)
-        except Exception as e:
-            log.exception("Unhandled exception in on_success")
-            await on_error(f"Upload failed: {e}")
-        finally:
-            await cleanup_tmp(filepath)
+            try:
+                await on_success(filepath)
+            except Exception as e:
+                log.exception("Unhandled exception in on_success")
+                await on_error(f"Upload failed: {e}")
+            finally:
+                await cleanup_tmp(filepath)
+    finally:
+        _inflight_urls.discard(canonical)
 
 
 async def process_audio_url(
@@ -1189,6 +1350,7 @@ class CoveBot(discord.Client):
 
     async def on_ready(self):
         log.info("[Cove] Logged in as %s (ID: %d)", self.user, self.user.id)
+        _get_http_session()
         await self.change_presence(
             activity=discord.Activity(
                 type=discord.ActivityType.watching,

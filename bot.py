@@ -15,9 +15,10 @@ import sys
 import tempfile
 import json
 import sqlite3
+import html
 from pathlib import Path
 from time import monotonic, time
-from urllib.parse import urlparse, urlunparse
+from urllib.parse import parse_qsl, unquote, urlencode, urlparse, urlunparse
 from dotenv import load_dotenv
 from cove_attribution import friend_post_content
 
@@ -172,6 +173,11 @@ NO_VIDEO_PHRASES = (
     "TransportError",
     "Unable to download webpage",
 )
+
+INSTAGRAM_IMAGE_MARKER = "[INSTAGRAM_IMAGE]"
+DIRECT_GIF_MARKER = "[DIRECT_GIF]"
+INSTAGRAM_IMAGE_EXTENSIONS = {"jpg", "jpeg", "png", "webp", "heic"}
+INSTAGRAM_VIDEO_EXTENSIONS = {"mp4", "m4v", "mov", "webm"}
 
 REDDIT_SILENT_URL_PATTERNS = (
     "i.redd.it",
@@ -426,6 +432,109 @@ def resolve_fixup_url(url: str) -> str:
     return url
 
 
+def rewrite_instagram_image_url(url: str, log_text: str) -> str | None:
+    if (
+        INSTAGRAM_IMAGE_MARKER in log_text.splitlines()
+        and _is_supported_instagram_post_url(url)
+    ):
+        return replace_hostname(url, "www.kkinstagram.com")
+    return None
+
+
+async def send_instagram_image_rewrite(message: discord.Message, url: str, log_text: str) -> bool:
+    rewritten = rewrite_instagram_image_url(url, log_text)
+    if not rewritten:
+        return False
+    try:
+        await message.channel.send(rewritten)
+    except discord.HTTPException as e:
+        log.warning("[cove] Failed to send Instagram image/text rewrite: %s", e)
+        return False
+    try:
+        await message.delete()
+    except discord.Forbidden as e:
+        log.info("[cove] Could not delete original Instagram image/text message: %s", e)
+    except discord.HTTPException as e:
+        log.warning("[cove] Failed to delete original Instagram image/text message: %s", e)
+    return True
+
+
+def extract_direct_gif_url(content: str) -> str | None:
+    for match in URL_RE.finditer(content):
+        url = match.group(0).rstrip(").,>")
+        if len(url) > MAX_URL_LENGTH:
+            continue
+        cleaned_reddit_gif = clean_reddit_preview_gif_url(url)
+        if cleaned_reddit_gif:
+            return cleaned_reddit_gif
+        parsed = urlparse(url)
+        if host_matches(hostname_for(url), {"reddit.com"}) and parsed.path == "/media":
+            for key, value in parse_qsl(parsed.query):
+                if key == "url" and urlparse(value).path.lower().endswith(".gif"):
+                    return value
+        if parsed.path.lower().endswith(".gif"):
+            return url
+    return None
+
+
+async def send_direct_gif_embed(message: discord.Message, url: str) -> bool:
+    try:
+        await message.channel.send(url)
+    except discord.HTTPException as e:
+        log.warning("[cove] Failed to repost direct GIF URL: %s", e)
+        return False
+    log.info("[cove] Reposted direct GIF URL for Discord embed: %s", url)
+    try:
+        await message.delete()
+        log.info("[cove] Deleted original direct GIF message after repost.")
+    except discord.Forbidden as e:
+        log.info("[cove] Could not delete original direct GIF message: %s", e)
+    except discord.HTTPException as e:
+        log.warning("[cove] Failed to delete original direct GIF message: %s", e)
+    return True
+
+
+def clean_reddit_preview_gif_url(url: str) -> str | None:
+    url = html.unescape(url)
+    parsed = urlparse(url)
+    if hostname_for(url) != "preview.redd.it":
+        return None
+    if not parsed.path.lower().endswith(".gif"):
+        return None
+    query = urlencode(
+        [
+            (key, value)
+            for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+            if key.lower() != "format"
+        ]
+    )
+    return urlunparse(parsed._replace(query=query))
+
+
+def _find_reddit_preview_gif_url(value) -> str | None:
+    if isinstance(value, str):
+        return clean_reddit_preview_gif_url(value)
+    if isinstance(value, list):
+        for item in value:
+            found = _find_reddit_preview_gif_url(item)
+            if found:
+                return found
+    if isinstance(value, dict):
+        for item in value.values():
+            found = _find_reddit_preview_gif_url(item)
+            if found:
+                return found
+    return None
+
+
+def direct_gif_url_from_log(log_text: str) -> str | None:
+    lines = log_text.splitlines()
+    for index, line in enumerate(lines):
+        if line.strip() == DIRECT_GIF_MARKER and index + 1 < len(lines):
+            return extract_direct_gif_url(unquote(lines[index + 1]))
+    return None
+
+
 def is_twitter_photo_url(url: str) -> bool:
     parsed = urlparse(url)
     return host_matches(hostname_for(url), TWITTER_DOMAINS | FIXUP_DOMAINS) and "/photo/" in parsed.path
@@ -657,6 +766,154 @@ async def run_subprocess(
     return proc.returncode, stdout[:MAX_SUBPROCESS_OUTPUT_BYTES].decode(errors="replace")
 
 
+# ── Instagram helpers ────────────────────────────────────────────────────────
+
+def _is_instagram_image_entry(entry: dict) -> bool:
+    entries = entry.get("entries")
+    if isinstance(entries, list):
+        has_image_child = False
+        for child in entries:
+            if child is None:
+                continue
+            if not isinstance(child, dict) or not _is_instagram_image_entry(child):
+                return False
+            has_image_child = True
+        return has_image_child
+
+    if entry.get("duration") is not None:
+        return False
+
+    ext = str(entry.get("ext") or "").lower()
+    if ext in INSTAGRAM_IMAGE_EXTENSIONS:
+        return True
+
+    media_url = str(entry.get("url") or "").lower()
+    path = urlparse(media_url).path
+    if any(path.endswith(f".{ext}") for ext in INSTAGRAM_IMAGE_EXTENSIONS):
+        return True
+
+    formats = entry.get("formats")
+    if isinstance(formats, list) and not formats:
+        return any(
+            entry.get(key) not in (None, "")
+            for key in (
+                "description",
+                "title",
+                "uploader",
+                "channel",
+                "timestamp",
+                "upload_date",
+                "like_count",
+                "comment_count",
+            )
+        )
+
+    return False
+
+
+def _instagram_entry_has_video(entry: dict) -> bool:
+    entries = entry.get("entries")
+    if isinstance(entries, list):
+        return any(
+            isinstance(child, dict) and _instagram_entry_has_video(child)
+            for child in entries
+        )
+
+    if entry.get("duration") is not None:
+        return True
+
+    ext = str(entry.get("ext") or "").lower()
+    if ext in INSTAGRAM_VIDEO_EXTENSIONS:
+        return True
+
+    formats = entry.get("formats")
+    if isinstance(formats, list):
+        for fmt in formats:
+            if not isinstance(fmt, dict):
+                continue
+            vcodec = str(fmt.get("vcodec") or "").lower()
+            if vcodec and vcodec != "none":
+                return True
+            format_ext = str(fmt.get("ext") or fmt.get("video_ext") or "").lower()
+            if format_ext in INSTAGRAM_VIDEO_EXTENSIONS:
+                return True
+            format_url = str(fmt.get("url") or "").lower()
+            format_path = urlparse(format_url).path
+            if any(format_path.endswith(f".{ext}") for ext in INSTAGRAM_VIDEO_EXTENSIONS):
+                return True
+
+    media_url = str(entry.get("url") or "").lower()
+    path = urlparse(media_url).path
+    return any(path.endswith(f".{ext}") for ext in INSTAGRAM_VIDEO_EXTENSIONS)
+
+
+def _instagram_video_playlist_index(metadata: dict) -> int | None:
+    entries = metadata.get("entries")
+    if not isinstance(entries, list):
+        return None
+    for index, entry in enumerate(entries, start=1):
+        if isinstance(entry, dict) and _instagram_entry_has_video(entry):
+            return index
+    return None
+
+
+def _is_supported_instagram_post_url(url: str) -> bool:
+    if hostname_for(url) != "instagram.com":
+        return False
+    parts = [part for part in urlparse(url).path.split("/") if part]
+    return len(parts) == 2 and parts[0] == "p" and bool(parts[1])
+
+
+def _load_ytdlp_json(output: str) -> dict | None:
+    json_start = output.find("{")
+    if json_start < 0:
+        return None
+    try:
+        metadata = json.loads(output[json_start:])
+    except (ValueError, TypeError):
+        return None
+    return metadata if isinstance(metadata, dict) else None
+
+
+async def instagram_post_probe(url: str) -> tuple[bool, int | None]:
+    if not _is_supported_instagram_post_url(url):
+        return False, None
+
+    cmd = [
+        "yt-dlp",
+        "--dump-single-json",
+        "--ignore-no-formats",
+        "--skip-download",
+        "--extractor-retries",
+        "0",
+        "--user-agent",
+        YT_DLP_UA,
+    ]
+    if COOKIES_EXIST:
+        cmd.extend(["--cookies", COOKIES_FILE])
+    cmd.append(url)
+
+    _code, out = await run_subprocess(cmd)
+
+    metadata = _load_ytdlp_json(out)
+    if metadata is None:
+        return False, None
+
+    playlist_index = _instagram_video_playlist_index(metadata)
+    if playlist_index is not None or _instagram_entry_has_video(metadata):
+        return False, playlist_index
+
+    if _is_instagram_image_entry(metadata):
+        return True, None
+
+    return False, None
+
+
+async def instagram_is_image_post(url: str) -> bool:
+    image_only, _ = await instagram_post_probe(url)
+    return image_only
+
+
 # ── Reddit helpers ────────────────────────────────────────────────────────────
 
 async def _reddit_shortlink_location(url: str) -> str | None:
@@ -723,6 +980,37 @@ async def resolve_reddit_shortlink(url: str) -> str:
 
     log.warning("[reddit-short] Could not resolve %s — passing to yt-dlp as-is.", url)
     return url
+
+
+async def reddit_preview_gif_url(url: str) -> str | None:
+    if not REDDIT_POST_RE.search(url):
+        return None
+    api_url = url.rstrip("/").split("?")[0] + ".json?limit=1"
+    try:
+        session = _get_http_session()
+        async with session.get(
+            api_url,
+            headers={"User-Agent": REDDIT_UA, "Accept": "application/json"},
+            timeout=aiohttp.ClientTimeout(total=8),
+        ) as resp:
+            content_type = resp.headers.get("Content-Type", "")
+            if "json" not in content_type and "text" not in content_type:
+                log.warning("[security] Reddit API returned unexpected Content-Type: %s", content_type)
+                return None
+            body = await resp.content.read(MAX_HTTP_RESPONSE_BYTES)
+            raw = body.decode(errors="replace")
+        data = json.loads(raw)
+        post = data[0]["data"]["children"][0]["data"]
+    except Exception as e:
+        log.warning("[reddit-gif] Preview GIF check failed (%s) — using normal flow.", e)
+        return None
+
+    if post.get("is_video") or post.get("media") or post.get("secure_media"):
+        return None
+    gif_url = _find_reddit_preview_gif_url(post.get("preview"))
+    if gif_url:
+        log.info("[reddit-gif] Found preview GIF for repost: %s", gif_url)
+    return gif_url
 
 
 async def reddit_has_video(url: str) -> bool:
@@ -1014,7 +1302,17 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
     is_reddit  = host_matches(hostname_for(url), {"reddit.com", "redd.it"})
     is_twitter = host_matches(hostname_for(url), TWITTER_DOMAINS)
     is_youtube = host_matches(hostname_for(url), {"youtube.com", "youtu.be"})
+    is_instagram = host_matches(hostname_for(url), {"instagram.com"})
     is_reddit_short = REDDIT_SHORT_RE.search(url) is not None
+    instagram_playlist_item = None
+
+    if is_instagram:
+        instagram_image_only, instagram_playlist_item = await instagram_post_probe(url)
+        if instagram_image_only:
+            log.info("[cove] Instagram image/text post detected, sending kkinstagram rewrite.")
+            _log.append(INSTAGRAM_IMAGE_MARKER)
+            _log.append("[NOVIDEO]")
+            return None, "\n".join(_log)
 
     if is_reddit:
         has_video = await reddit_has_video(url)
@@ -1044,13 +1342,17 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
         "--merge-output-format", "mp4",
         "-N", str(YT_DLP_FRAGMENTS),
         "--no-part",
-        "--no-playlist",
         "--extractor-retries", "0",
         "--max-filesize", f"{MAX_FILESIZE_MB}M",
         "--match-filter", "!duration",
         "--match-filter", f"duration <= {MAX_DURATION_SECONDS}",
         "-o", output_template,
     ]
+
+    if is_instagram and instagram_playlist_item is not None:
+        cmd += ["--playlist-items", str(instagram_playlist_item)]
+    else:
+        cmd.append("--no-playlist")
 
     if USE_ARIA2C:
         cmd += ["--downloader", "aria2c", "--downloader-args", "aria2c:-x16 -s16 -k1M"]
@@ -1085,13 +1387,30 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
 
     if code != 0:
         if any(phrase.lower() in out.lower() for phrase in NO_VIDEO_PHRASES):
-            log.info("[cove] No video / network issue — ignoring silently.")
+            if is_instagram:
+                log.info("[cove] Instagram no-video response did not classify as image/text, ignoring without rewrite.")
+            else:
+                log.info("[cove] No video / network issue — ignoring silently.")
             _log.append("[NOVIDEO]")
         elif is_reddit and "[generic]" in out and not is_reddit_short:
-            log.info("[cove] Reddit link-post (external, no video) — ignoring silently.")
+            reddit_direct_gif = extract_direct_gif_url(unquote(out))
+            if reddit_direct_gif:
+                log.info("[cove] Reddit direct GIF resolved by yt-dlp, sending embed repost.")
+                _log.append(DIRECT_GIF_MARKER)
+                _log.append(reddit_direct_gif)
+            else:
+                log.info("[cove] Reddit link-post (external, no video) — ignoring silently.")
             _log.append("[NOVIDEO]")
-        elif "Unsupported URL" in out and is_reddit and any(p in out for p in REDDIT_SILENT_URL_PATTERNS):
-            log.info("[cove] Reddit GIF/image URL — ignoring silently.")
+        elif "Unsupported URL" in out and is_reddit and any(
+            p in unquote(out) for p in REDDIT_SILENT_URL_PATTERNS
+        ):
+            reddit_direct_gif = extract_direct_gif_url(unquote(out))
+            if reddit_direct_gif:
+                log.info("[cove] Reddit direct GIF resolved by yt-dlp, sending embed repost.")
+                _log.append(DIRECT_GIF_MARKER)
+                _log.append(reddit_direct_gif)
+            else:
+                log.info("[cove] Reddit GIF/image URL — ignoring silently.")
             _log.append("[NOVIDEO]")
         elif "Unsupported URL" in out and is_twitter:
             log.info("[cove] X/Twitter post has no downloadable video — ignoring silently.")
@@ -1561,7 +1880,7 @@ async def process_url(
     if canonical in _inflight_urls:
         log.info("[dedup] Skipping already-in-flight URL: %s", url)
         if on_no_video:
-            await on_no_video()
+            await on_no_video("")
         return
     _inflight_urls.add(canonical)
     try:
@@ -1575,7 +1894,7 @@ async def process_url(
 
             if any(line.strip() == "[NOVIDEO]" for line in log_text.splitlines()):
                 if on_no_video:
-                    await on_no_video()
+                    await on_no_video(log_text)
                 return
 
             toobig_lines = [line for line in log_text.splitlines() if line.startswith("[TOOBIG]")]
@@ -1804,6 +2123,21 @@ class CoveBot(discord.Client):
             except discord.HTTPException:
                 pass
 
+        direct_gif_url = extract_direct_gif_url(message.content)
+        if direct_gif_url:
+            if not _check_user_rate_limit(message.author.id):
+                log.warning("[security] Rate limit hit for user %d in #%s", message.author.id, message.channel)
+                return
+
+            if message.guild and message.guild.me:
+                perms_ok, missing = _check_bot_permissions(message.channel, message.guild.me)
+                if not perms_ok:
+                    log.warning("[security] Missing permissions in #%s: %s", message.channel, missing)
+                    return
+
+            await send_direct_gif_embed(message, direct_gif_url)
+            return
+
         url = extract_supported_url(message.content)
         if not url:
             return
@@ -1817,6 +2151,11 @@ class CoveBot(discord.Client):
             if not perms_ok:
                 log.warning("[security] Missing permissions in #%s: %s", message.channel, missing)
                 return
+
+        reddit_gif_url = await reddit_preview_gif_url(url)
+        if reddit_gif_url:
+            await send_direct_gif_embed(message, reddit_gif_url)
+            return
 
         log.info("[Cove] Auto-triggered by %s in #%s: %s", message.author, message.channel, url)
 
@@ -1874,11 +2213,16 @@ class CoveBot(discord.Client):
                     except discord.HTTPException:
                         pass
 
-        async def on_no_video():
+        async def on_no_video(log_text: str = ""):
             try:
                 await message.remove_reaction("\u23f3", self.user)
             except discord.HTTPException:
                 pass
+            if await send_instagram_image_rewrite(message, url, log_text):
+                return
+            gif_url = direct_gif_url_from_log(log_text)
+            if gif_url:
+                await send_direct_gif_embed(message, gif_url)
 
         async def on_too_big(duration_str: str):
             try:
@@ -1989,7 +2333,7 @@ async def download_cmd(interaction: discord.Interaction, url: str):
     async def on_error(msg: str):
         await interaction.followup.send(f"\u274c {msg}")
 
-    async def on_no_video():
+    async def on_no_video(log_text: str = ""):
         await interaction.followup.send("\u274c No video found at that link.")
 
     async def on_too_big(duration_str: str):

@@ -15,6 +15,7 @@ import sys
 import tempfile
 import json
 import sqlite3
+from html import unescape as html_unescape
 from pathlib import Path
 from time import monotonic, time
 from urllib.parse import unquote, urlparse, urlunparse
@@ -175,8 +176,11 @@ NO_VIDEO_PHRASES = (
 
 INSTAGRAM_IMAGE_MARKER = "[INSTAGRAM_IMAGE]"
 REDDIT_GIF_MARKER = "[REDDIT_GIF]"
+REDDIT_IMAGE_MARKER = "[REDDIT_IMAGE]"
 INSTAGRAM_IMAGE_EXTENSIONS = {"jpg", "jpeg", "png", "webp", "heic"}
 INSTAGRAM_VIDEO_EXTENSIONS = {"mp4", "m4v", "mov", "webm"}
+REDDIT_IMAGE_EXTENSIONS = {"jpg", "jpeg", "png", "webp"}
+REDDIT_IMAGE_HOSTS = {"i.redd.it", "preview.redd.it"}
 
 REDDIT_SILENT_URL_PATTERNS = (
     "i.redd.it",
@@ -458,11 +462,12 @@ async def send_instagram_image_rewrite(message: discord.Message, url: str, log_t
     return True
 
 
-def reddit_media_gif_url_from_text(text: str) -> str | None:
+def reddit_media_url_from_text(text: str, extensions: set[str]) -> str | None:
     for match in URL_RE.finditer(unquote(text)):
         url = match.group(0).rstrip(").,>")
         parsed = urlparse(url)
-        if hostname_for(url) == "i.redd.it" and parsed.path.lower().endswith(".gif"):
+        ext = parsed.path.rsplit(".", 1)[-1].lower()
+        if hostname_for(url) in REDDIT_IMAGE_HOSTS and ext in extensions:
             return url
         if not host_matches(hostname_for(url), {"reddit.com"}):
             continue
@@ -470,9 +475,18 @@ def reddit_media_gif_url_from_text(text: str) -> str | None:
             continue
         for part in parsed.query.split("&"):
             key, _, value = part.partition("=")
-            if key == "url" and urlparse(value).path.lower().endswith(".gif"):
+            ext = urlparse(value).path.rsplit(".", 1)[-1].lower()
+            if key == "url" and ext in extensions:
                 return value
     return None
+
+
+def reddit_media_gif_url_from_text(text: str) -> str | None:
+    return reddit_media_url_from_text(text, {"gif"})
+
+
+def reddit_media_image_url_from_text(text: str) -> str | None:
+    return reddit_media_url_from_text(text, REDDIT_IMAGE_EXTENSIONS)
 
 
 def reddit_gif_url_from_log(log_text: str) -> str | None:
@@ -480,6 +494,14 @@ def reddit_gif_url_from_log(log_text: str) -> str | None:
     for index, line in enumerate(lines):
         if line.strip() == REDDIT_GIF_MARKER and index + 1 < len(lines):
             return reddit_media_gif_url_from_text(lines[index + 1])
+    return None
+
+
+def reddit_image_url_from_log(log_text: str) -> str | None:
+    lines = log_text.splitlines()
+    for index, line in enumerate(lines):
+        if line.strip() == REDDIT_IMAGE_MARKER and index + 1 < len(lines):
+            return reddit_media_image_url_from_text(lines[index + 1])
     return None
 
 
@@ -503,6 +525,134 @@ async def send_reddit_gif_repost(message: discord.Message, url: str) -> bool:
     except discord.HTTPException as e:
         log.warning("[cove] Failed to delete original Reddit GIF message: %s", e)
     return True
+
+
+def reddit_image_url_from_post(post: dict) -> str | None:
+    for key in ("url_overridden_by_dest", "url"):
+        value = post.get(key)
+        if not isinstance(value, str):
+            continue
+        image_url = reddit_media_image_url_from_text(value)
+        if image_url:
+            return image_url
+
+    media_metadata = post.get("media_metadata")
+    if not isinstance(media_metadata, dict):
+        return None
+    for item in media_metadata.values():
+        if not isinstance(item, dict):
+            continue
+        source = item.get("s")
+        if not isinstance(source, dict):
+            continue
+        image_url = source.get("u") or source.get("gif")
+        if not isinstance(image_url, str):
+            continue
+        image_url = html_unescape(image_url)
+        if reddit_media_image_url_from_text(image_url):
+            return image_url
+    return None
+
+
+async def reddit_image_url(url: str) -> str | None:
+    if not REDDIT_POST_RE.search(url):
+        return None
+    api_url = url.rstrip("/").split("?")[0] + ".json?limit=1"
+    try:
+        session = _get_http_session()
+        async with session.get(
+            api_url,
+            headers={"User-Agent": REDDIT_UA, "Accept": "application/json"},
+            timeout=aiohttp.ClientTimeout(total=8),
+        ) as resp:
+            content_type = resp.headers.get("Content-Type", "")
+            if "json" not in content_type and "text" not in content_type:
+                log.warning("[security] Reddit image API returned unexpected Content-Type: %s", content_type)
+                return None
+            body = await resp.content.read(MAX_HTTP_RESPONSE_BYTES)
+            raw = body.decode(errors="replace")
+        data = json.loads(raw)
+        post = data[0]["data"]["children"][0]["data"]
+        return reddit_image_url_from_post(post)
+    except Exception as e:
+        log.warning("[reddit-image] Failed to resolve image URL: %s", e)
+        return None
+
+
+async def download_reddit_image(url: str, guild: discord.Guild | None) -> str | None:
+    parsed = urlparse(url)
+    ext = parsed.path.rsplit(".", 1)[-1].lower()
+    if hostname_for(url) not in REDDIT_IMAGE_HOSTS or ext not in REDDIT_IMAGE_EXTENSIONS:
+        return None
+
+    target_size = int(get_target_mb(guild) * 1024 * 1024)
+    tmp = tempfile.mkdtemp(prefix="cove_reddit_image_", dir=TMP_BASE)
+    os.chmod(tmp, 0o700)
+    filename = _sanitize_filename(Path(unquote(parsed.path)).name) or f"reddit-image.{ext}"
+    filepath = str(Path(tmp) / filename)
+    downloaded = False
+
+    try:
+        session = _get_http_session()
+        async with session.get(
+            url,
+            headers={"User-Agent": REDDIT_UA, "Accept": "image/*,*/*;q=0.8"},
+            timeout=aiohttp.ClientTimeout(total=20),
+        ) as resp:
+            if resp.status != 200:
+                log.warning("[reddit-image] Image GET returned HTTP %d.", resp.status)
+                return None
+            content_type = resp.headers.get("Content-Type", "")
+            if not content_type.lower().startswith("image/"):
+                log.warning("[reddit-image] Unexpected image Content-Type: %s", content_type)
+                return None
+            content_length = resp.headers.get("Content-Length")
+            if content_length:
+                try:
+                    if int(content_length) > target_size:
+                        log.info("[reddit-image] Image too large for Discord limit.")
+                        return None
+                except ValueError:
+                    pass
+            size = 0
+            with open(filepath, "wb") as f:
+                async for chunk in resp.content.iter_chunked(1024 * 64):
+                    size += len(chunk)
+                    if size > target_size:
+                        log.info("[reddit-image] Image exceeded Discord limit while downloading.")
+                        return None
+                    f.write(chunk)
+        downloaded = True
+        return filepath
+    except Exception as e:
+        log.warning("[reddit-image] Failed to download image: %s", e)
+        return None
+    finally:
+        if not downloaded:
+            shutil.rmtree(tmp, ignore_errors=True)
+
+
+async def send_reddit_image_repost(message: discord.Message, url: str) -> bool:
+    filepath = await download_reddit_image(url, message.guild)
+    if not filepath:
+        return False
+    try:
+        try:
+            await message.channel.send(file=discord.File(filepath))
+        except discord.HTTPException as e:
+            log.warning("[cove] Failed to repost Reddit image file: %s", e)
+            return False
+        log.info("[cove] Reposted Reddit image file for Discord upload: %s", url)
+        try:
+            await message.delete()
+            log.info("[cove] Deleted original Reddit image message after repost.")
+        except discord.Forbidden as e:
+            log.info("[cove] Could not delete original Reddit image message: %s", e)
+        except discord.HTTPException as e:
+            log.warning("[cove] Failed to delete original Reddit image message: %s", e)
+        return True
+    finally:
+        shutil.rmtree(str(Path(filepath).parent), ignore_errors=True)
 
 
 def is_twitter_photo_url(url: str) -> bool:
@@ -1258,6 +1408,11 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
     if is_reddit:
         has_video = await reddit_has_video(url)
         if not has_video:
+            image_url = await reddit_image_url(url)
+            if image_url:
+                log.info("[cove] Reddit post resolved to direct image, sending file repost.")
+                _log.append(REDDIT_IMAGE_MARKER)
+                _log.append(image_url)
             _log.append("[NOVIDEO]")
             return None, "\n".join(_log)
 
@@ -1340,7 +1495,13 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
                 _log.append(REDDIT_GIF_MARKER)
                 _log.append(reddit_gif_url)
             else:
-                log.info("[cove] Reddit link-post (external, no video) — ignoring silently.")
+                reddit_image_url_from_output = reddit_media_image_url_from_text(out)
+                if reddit_image_url_from_output:
+                    log.info("[cove] Reddit post resolved to direct image, sending file repost.")
+                    _log.append(REDDIT_IMAGE_MARKER)
+                    _log.append(reddit_image_url_from_output)
+                else:
+                    log.info("[cove] Reddit link-post (external, no video) — ignoring silently.")
             _log.append("[NOVIDEO]")
         elif "Unsupported URL" in out and is_reddit and any(
             p in unquote(out) for p in REDDIT_SILENT_URL_PATTERNS
@@ -1351,7 +1512,13 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
                 _log.append(REDDIT_GIF_MARKER)
                 _log.append(reddit_gif_url)
             else:
-                log.info("[cove] Reddit GIF/image URL — ignoring silently.")
+                reddit_image_url_from_output = reddit_media_image_url_from_text(out)
+                if reddit_image_url_from_output:
+                    log.info("[cove] Reddit post resolved to direct image, sending file repost.")
+                    _log.append(REDDIT_IMAGE_MARKER)
+                    _log.append(reddit_image_url_from_output)
+                else:
+                    log.info("[cove] Reddit GIF/image URL — ignoring silently.")
             _log.append("[NOVIDEO]")
         elif "Unsupported URL" in out and is_twitter:
             log.info("[cove] X/Twitter post has no downloadable video — ignoring silently.")
@@ -2144,6 +2311,10 @@ class CoveBot(discord.Client):
             reddit_gif_url = reddit_gif_url_from_log(log_text)
             if reddit_gif_url:
                 await send_reddit_gif_repost(message, reddit_gif_url)
+                return
+            reddit_image_url_from_output = reddit_image_url_from_log(log_text)
+            if reddit_image_url_from_output:
+                await send_reddit_image_repost(message, reddit_image_url_from_output)
 
         async def on_too_big(duration_str: str):
             try:

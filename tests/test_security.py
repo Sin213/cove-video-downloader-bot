@@ -8,8 +8,12 @@ from bot import (
     instagram_is_image_post,
     process_url,
     reddit_gif_url_from_log,
+    reddit_image_url_from_log,
+    reddit_image_url_from_post,
     reddit_media_gif_url_from_text,
+    reddit_media_image_url_from_text,
     rewrite_instagram_image_url,
+    send_reddit_image_repost,
     send_reddit_gif_repost,
     send_instagram_image_rewrite,
     _instagram_entry_has_video,
@@ -28,7 +32,10 @@ class FakeChannel:
         self.events = events
         self.send_error = send_error
 
-    async def send(self, content):
+    async def send(self, content=None, **kwargs):
+        if "file" in kwargs:
+            self.events.append(("send_file", Path(kwargs["file"].fp.name).name))
+            return
         self.events.append(("send", content))
         if self.send_error:
             raise self.send_error
@@ -298,6 +305,33 @@ def test_reddit_media_url_extracts_direct_gif():
     )
 
 
+def test_reddit_media_url_extracts_direct_image():
+    assert (
+        reddit_media_image_url_from_text(
+            "ERROR: Unsupported URL: "
+            "https://www.reddit.com/media?url=https%3A%2F%2Fi.redd.it%2Fexample.jpg"
+        )
+        == "https://i.redd.it/example.jpg"
+    )
+
+
+def test_reddit_image_url_from_gallery_post():
+    assert (
+        reddit_image_url_from_post(
+            {
+                "media_metadata": {
+                    "abc": {
+                        "s": {
+                            "u": "https://preview.redd.it/example.jpg?width=960&amp;format=pjpg&amp;auto=webp&amp;s=abc"
+                        }
+                    }
+                }
+            }
+        )
+        == "https://preview.redd.it/example.jpg?width=960&format=pjpg&auto=webp&s=abc"
+    )
+
+
 def test_process_url_reddit_unsupported_direct_gif_sends_repost(monkeypatch):
     url = "https://old.reddit.com/r/Transmogrification/comments/1nwzkfx/flameforged_gnomie"
     sent = []
@@ -331,6 +365,32 @@ def test_process_url_reddit_unsupported_direct_gif_sends_repost(monkeypatch):
     assert sent == [("send", "https://i.redd.it/isd965xyhwsf1.gif")]
 
 
+def test_process_url_reddit_no_video_direct_image_sends_repost(monkeypatch):
+    url = "https://www.reddit.com/r/shitposting/comments/example/title/"
+    sent = []
+
+    async def fail_success(filepath):
+        raise AssertionError("on_success should not run")
+
+    async def fail_error(message):
+        raise AssertionError(f"on_error should not run: {message}")
+
+    async def fail_too_big(duration):
+        raise AssertionError(f"on_too_big should not run: {duration}")
+
+    async def on_no_video(log_text=""):
+        image_url = reddit_image_url_from_log(log_text)
+        if image_url:
+            sent.append(("send_image", image_url))
+
+    monkeypatch.setattr("bot.reddit_has_video", lambda url: asyncio.sleep(0, result=False))
+    monkeypatch.setattr("bot.reddit_image_url", lambda url: asyncio.sleep(0, result="https://i.redd.it/example.jpg"))
+
+    asyncio.run(process_url(url, None, fail_success, fail_error, fail_too_big, on_no_video))
+
+    assert sent == [("send_image", "https://i.redd.it/example.jpg")]
+
+
 def test_reddit_gif_repost_deletes_after_success():
     events = []
     message = FakeMessage(events)
@@ -353,6 +413,26 @@ def test_reddit_gif_repost_requires_embed_links_permission():
 
     assert result is False
     assert events == []
+
+
+def test_reddit_image_repost_uploads_file_and_deletes_after_success(monkeypatch, tmp_path):
+    image_path = tmp_path / "example.jpg"
+    image_path.write_bytes(b"image")
+    events = []
+    message = FakeMessage(events)
+
+    monkeypatch.setattr(
+        "bot.download_reddit_image",
+        lambda url, guild: asyncio.sleep(0, result=str(image_path)),
+    )
+
+    result = asyncio.run(send_reddit_image_repost(message, "https://i.redd.it/example.jpg"))
+
+    assert result is True
+    assert events == [
+        ("send_file", "example.jpg"),
+        ("delete", None),
+    ]
 
 
 def test_successful_instagram_image_rewrite_deletes_original_message():

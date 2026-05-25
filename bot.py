@@ -15,10 +15,9 @@ import sys
 import tempfile
 import json
 import sqlite3
-import html
 from pathlib import Path
 from time import monotonic, time
-from urllib.parse import parse_qsl, unquote, urlencode, urlparse, urlunparse
+from urllib.parse import unquote, urlparse, urlunparse
 from dotenv import load_dotenv
 from cove_attribution import friend_post_content
 
@@ -175,7 +174,7 @@ NO_VIDEO_PHRASES = (
 )
 
 INSTAGRAM_IMAGE_MARKER = "[INSTAGRAM_IMAGE]"
-DIRECT_GIF_MARKER = "[DIRECT_GIF]"
+REDDIT_GIF_MARKER = "[REDDIT_GIF]"
 INSTAGRAM_IMAGE_EXTENSIONS = {"jpg", "jpeg", "png", "webp", "heic"}
 INSTAGRAM_VIDEO_EXTENSIONS = {"mp4", "m4v", "mov", "webm"}
 
@@ -459,80 +458,51 @@ async def send_instagram_image_rewrite(message: discord.Message, url: str, log_t
     return True
 
 
-def extract_direct_gif_url(content: str) -> str | None:
-    for match in URL_RE.finditer(content):
+def reddit_media_gif_url_from_text(text: str) -> str | None:
+    for match in URL_RE.finditer(unquote(text)):
         url = match.group(0).rstrip(").,>")
-        if len(url) > MAX_URL_LENGTH:
-            continue
-        cleaned_reddit_gif = clean_reddit_preview_gif_url(url)
-        if cleaned_reddit_gif:
-            return cleaned_reddit_gif
         parsed = urlparse(url)
-        if host_matches(hostname_for(url), {"reddit.com"}) and parsed.path == "/media":
-            for key, value in parse_qsl(parsed.query):
-                if key == "url" and urlparse(value).path.lower().endswith(".gif"):
-                    return value
-        if parsed.path.lower().endswith(".gif"):
+        if hostname_for(url) == "i.redd.it" and parsed.path.lower().endswith(".gif"):
             return url
+        if not host_matches(hostname_for(url), {"reddit.com"}):
+            continue
+        if parsed.path != "/media":
+            continue
+        for part in parsed.query.split("&"):
+            key, _, value = part.partition("=")
+            if key == "url" and urlparse(value).path.lower().endswith(".gif"):
+                return value
     return None
 
 
-async def send_direct_gif_embed(message: discord.Message, url: str) -> bool:
+def reddit_gif_url_from_log(log_text: str) -> str | None:
+    lines = log_text.splitlines()
+    for index, line in enumerate(lines):
+        if line.strip() == REDDIT_GIF_MARKER and index + 1 < len(lines):
+            return reddit_media_gif_url_from_text(lines[index + 1])
+    return None
+
+
+async def send_reddit_gif_repost(message: discord.Message, url: str) -> bool:
+    if message.guild and message.guild.me:
+        perms = message.channel.permissions_for(message.guild.me)
+        if not perms.embed_links:
+            log.warning("[cove] Cannot repost Reddit GIF without Embed Links permission in #%s.", message.channel)
+            return False
     try:
         await message.channel.send(url)
     except discord.HTTPException as e:
-        log.warning("[cove] Failed to repost direct GIF URL: %s", e)
+        log.warning("[cove] Failed to repost Reddit GIF URL: %s", e)
         return False
-    log.info("[cove] Reposted direct GIF URL for Discord embed: %s", url)
+    log.info("[cove] Reposted Reddit GIF URL for Discord embed: %s", url)
     try:
         await message.delete()
-        log.info("[cove] Deleted original direct GIF message after repost.")
+        log.info("[cove] Deleted original Reddit GIF message after repost.")
     except discord.Forbidden as e:
-        log.info("[cove] Could not delete original direct GIF message: %s", e)
+        log.info("[cove] Could not delete original Reddit GIF message: %s", e)
     except discord.HTTPException as e:
-        log.warning("[cove] Failed to delete original direct GIF message: %s", e)
+        log.warning("[cove] Failed to delete original Reddit GIF message: %s", e)
     return True
-
-
-def clean_reddit_preview_gif_url(url: str) -> str | None:
-    url = html.unescape(url)
-    parsed = urlparse(url)
-    if hostname_for(url) != "preview.redd.it":
-        return None
-    if not parsed.path.lower().endswith(".gif"):
-        return None
-    query = urlencode(
-        [
-            (key, value)
-            for key, value in parse_qsl(parsed.query, keep_blank_values=True)
-            if key.lower() != "format"
-        ]
-    )
-    return urlunparse(parsed._replace(query=query))
-
-
-def _find_reddit_preview_gif_url(value) -> str | None:
-    if isinstance(value, str):
-        return clean_reddit_preview_gif_url(value)
-    if isinstance(value, list):
-        for item in value:
-            found = _find_reddit_preview_gif_url(item)
-            if found:
-                return found
-    if isinstance(value, dict):
-        for item in value.values():
-            found = _find_reddit_preview_gif_url(item)
-            if found:
-                return found
-    return None
-
-
-def direct_gif_url_from_log(log_text: str) -> str | None:
-    lines = log_text.splitlines()
-    for index, line in enumerate(lines):
-        if line.strip() == DIRECT_GIF_MARKER and index + 1 < len(lines):
-            return extract_direct_gif_url(unquote(lines[index + 1]))
-    return None
 
 
 def is_twitter_photo_url(url: str) -> bool:
@@ -571,6 +541,8 @@ def extract_supported_url(content: str) -> str | None:
             log.info("[security] Blocked blacklisted domain: %s", host)
             continue
         if is_twitter_photo_url(url):
+            continue
+        if urlparse(url).path.lower().endswith(".gif"):
             continue
         if host_matches(host, AUTO_DOWNLOAD_DOMAINS):
             return url
@@ -982,37 +954,6 @@ async def resolve_reddit_shortlink(url: str) -> str:
     return url
 
 
-async def reddit_preview_gif_url(url: str) -> str | None:
-    if not REDDIT_POST_RE.search(url):
-        return None
-    api_url = url.rstrip("/").split("?")[0] + ".json?limit=1"
-    try:
-        session = _get_http_session()
-        async with session.get(
-            api_url,
-            headers={"User-Agent": REDDIT_UA, "Accept": "application/json"},
-            timeout=aiohttp.ClientTimeout(total=8),
-        ) as resp:
-            content_type = resp.headers.get("Content-Type", "")
-            if "json" not in content_type and "text" not in content_type:
-                log.warning("[security] Reddit API returned unexpected Content-Type: %s", content_type)
-                return None
-            body = await resp.content.read(MAX_HTTP_RESPONSE_BYTES)
-            raw = body.decode(errors="replace")
-        data = json.loads(raw)
-        post = data[0]["data"]["children"][0]["data"]
-    except Exception as e:
-        log.warning("[reddit-gif] Preview GIF check failed (%s) — using normal flow.", e)
-        return None
-
-    if post.get("is_video") or post.get("media") or post.get("secure_media"):
-        return None
-    gif_url = _find_reddit_preview_gif_url(post.get("preview"))
-    if gif_url:
-        log.info("[reddit-gif] Found preview GIF for repost: %s", gif_url)
-    return gif_url
-
-
 async def reddit_has_video(url: str) -> bool:
     if not REDDIT_POST_RE.search(url):
         return True
@@ -1393,22 +1334,22 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
                 log.info("[cove] No video / network issue — ignoring silently.")
             _log.append("[NOVIDEO]")
         elif is_reddit and "[generic]" in out and not is_reddit_short:
-            reddit_direct_gif = extract_direct_gif_url(unquote(out))
-            if reddit_direct_gif:
-                log.info("[cove] Reddit direct GIF resolved by yt-dlp, sending embed repost.")
-                _log.append(DIRECT_GIF_MARKER)
-                _log.append(reddit_direct_gif)
+            reddit_gif_url = reddit_media_gif_url_from_text(out)
+            if reddit_gif_url:
+                log.info("[cove] Reddit post resolved to direct GIF, sending embed repost.")
+                _log.append(REDDIT_GIF_MARKER)
+                _log.append(reddit_gif_url)
             else:
                 log.info("[cove] Reddit link-post (external, no video) — ignoring silently.")
             _log.append("[NOVIDEO]")
         elif "Unsupported URL" in out and is_reddit and any(
             p in unquote(out) for p in REDDIT_SILENT_URL_PATTERNS
         ):
-            reddit_direct_gif = extract_direct_gif_url(unquote(out))
-            if reddit_direct_gif:
-                log.info("[cove] Reddit direct GIF resolved by yt-dlp, sending embed repost.")
-                _log.append(DIRECT_GIF_MARKER)
-                _log.append(reddit_direct_gif)
+            reddit_gif_url = reddit_media_gif_url_from_text(out)
+            if reddit_gif_url:
+                log.info("[cove] Reddit post resolved to direct GIF, sending embed repost.")
+                _log.append(REDDIT_GIF_MARKER)
+                _log.append(reddit_gif_url)
             else:
                 log.info("[cove] Reddit GIF/image URL — ignoring silently.")
             _log.append("[NOVIDEO]")
@@ -2123,21 +2064,6 @@ class CoveBot(discord.Client):
             except discord.HTTPException:
                 pass
 
-        direct_gif_url = extract_direct_gif_url(message.content)
-        if direct_gif_url:
-            if not _check_user_rate_limit(message.author.id):
-                log.warning("[security] Rate limit hit for user %d in #%s", message.author.id, message.channel)
-                return
-
-            if message.guild and message.guild.me:
-                perms_ok, missing = _check_bot_permissions(message.channel, message.guild.me)
-                if not perms_ok:
-                    log.warning("[security] Missing permissions in #%s: %s", message.channel, missing)
-                    return
-
-            await send_direct_gif_embed(message, direct_gif_url)
-            return
-
         url = extract_supported_url(message.content)
         if not url:
             return
@@ -2151,11 +2077,6 @@ class CoveBot(discord.Client):
             if not perms_ok:
                 log.warning("[security] Missing permissions in #%s: %s", message.channel, missing)
                 return
-
-        reddit_gif_url = await reddit_preview_gif_url(url)
-        if reddit_gif_url:
-            await send_direct_gif_embed(message, reddit_gif_url)
-            return
 
         log.info("[Cove] Auto-triggered by %s in #%s: %s", message.author, message.channel, url)
 
@@ -2220,9 +2141,9 @@ class CoveBot(discord.Client):
                 pass
             if await send_instagram_image_rewrite(message, url, log_text):
                 return
-            gif_url = direct_gif_url_from_log(log_text)
-            if gif_url:
-                await send_direct_gif_embed(message, gif_url)
+            reddit_gif_url = reddit_gif_url_from_log(log_text)
+            if reddit_gif_url:
+                await send_reddit_gif_repost(message, reddit_gif_url)
 
         async def on_too_big(duration_str: str):
             try:

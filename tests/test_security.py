@@ -4,16 +4,13 @@ from pathlib import Path
 import pytest
 
 from bot import (
-    clean_reddit_preview_gif_url,
-    direct_gif_url_from_log,
-    DIRECT_GIF_MARKER,
-    extract_direct_gif_url,
     extract_supported_url,
     instagram_is_image_post,
     process_url,
-    reddit_preview_gif_url,
+    reddit_gif_url_from_log,
+    reddit_media_gif_url_from_text,
     rewrite_instagram_image_url,
-    send_direct_gif_embed,
+    send_reddit_gif_repost,
     send_instagram_image_rewrite,
     _instagram_entry_has_video,
     _is_instagram_image_entry,
@@ -36,12 +33,16 @@ class FakeChannel:
         if self.send_error:
             raise self.send_error
 
+    def permissions_for(self, member):
+        return member.permissions
+
 
 class FakeMessage:
-    def __init__(self, events, send_error=None, delete_error=None):
+    def __init__(self, events, send_error=None, delete_error=None, guild=None):
         self.events = events
         self.channel = FakeChannel(events, send_error)
         self.delete_error = delete_error
+        self.guild = guild
 
     async def delete(self):
         self.events.append(("delete", None))
@@ -53,30 +54,19 @@ class FakeDiscordError(Exception):
     pass
 
 
-class FakeResponse:
-    def __init__(self, body, content_type="application/json"):
-        self.headers = {"Content-Type": content_type}
-        self.content = self
-        self.body = body
-
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, exc_type, exc, tb):
-        return False
-
-    async def read(self, limit=None):
-        return self.body.encode()
+class FakePermissions:
+    def __init__(self, embed_links=True):
+        self.embed_links = embed_links
 
 
-class FakeSession:
-    def __init__(self, body):
-        self.body = body
-        self.urls = []
+class FakeMember:
+    def __init__(self, permissions):
+        self.permissions = permissions
 
-    def get(self, url, **kwargs):
-        self.urls.append(url)
-        return FakeResponse(self.body)
+
+class FakeGuild:
+    def __init__(self, permissions):
+        self.me = FakeMember(permissions)
 
 
 def test_sanitize_strips_filesystem_paths():
@@ -294,176 +284,18 @@ def test_rewritten_instagram_url_is_not_auto_downloaded():
     assert extract_supported_url("https://kkinstagram.com/p/abc123/") is None
 
 
-def test_direct_gif_url_reposts_successfully():
-    events = []
-    message = FakeMessage(events)
-
-    result = asyncio.run(
-        send_direct_gif_embed(
-            message,
-            "https://cdn.example.com/reaction.GIF?width=400",
-        )
-    )
-
-    assert result is True
-    assert events == [
-        ("send", "https://cdn.example.com/reaction.GIF?width=400"),
-        ("delete", None),
-    ]
+def test_direct_gif_url_is_not_auto_downloaded():
+    assert extract_supported_url("https://i.redd.it/isd965xyhwsf1.gif") is None
 
 
-def test_direct_gif_original_message_deletes_only_after_repost_success():
-    events = []
-    message = FakeMessage(events)
-
-    asyncio.run(send_direct_gif_embed(message, "https://cdn.example.com/a.gif"))
-
-    assert events == [
-        ("send", "https://cdn.example.com/a.gif"),
-        ("delete", None),
-    ]
-
-
-def test_direct_gif_repost_failure_leaves_original_message(monkeypatch):
-    monkeypatch.setattr("bot.discord.HTTPException", FakeDiscordError)
-    events = []
-    message = FakeMessage(events, send_error=FakeDiscordError("send failed"))
-
-    result = asyncio.run(send_direct_gif_embed(message, "https://cdn.example.com/a.gif"))
-
-    assert result is False
-    assert events == [("send", "https://cdn.example.com/a.gif")]
-
-
-def test_direct_gif_matching_ignores_non_gif_urls():
-    assert extract_direct_gif_url("https://example.com/image.png") is None
-    assert extract_direct_gif_url("https://tenor.com/view/funny-cat") is None
-    assert extract_direct_gif_url("https://giphy.com/gifs/funny-cat") is None
-
-
-def test_direct_gif_matching_accepts_case_insensitive_gif_with_query_string():
+def test_reddit_media_url_extracts_direct_gif():
     assert (
-        extract_direct_gif_url("look https://media.tenor.com/abc/FUNNY.GIF?itemid=1")
-        == "https://media.tenor.com/abc/FUNNY.GIF?itemid=1"
-    )
-
-
-def test_direct_reddit_preview_gif_matching_cleans_mp4_format_query():
-    assert (
-        extract_direct_gif_url(
-            "https://preview.redd.it/isd965xyhwsf1.gif?width=800&format=mp4&s=abc"
+        reddit_media_gif_url_from_text(
+            "ERROR: Unsupported URL: "
+            "https://www.reddit.com/media?url=https%3A%2F%2Fi.redd.it%2Fisd965xyhwsf1.gif"
         )
-        == "https://preview.redd.it/isd965xyhwsf1.gif?width=800&s=abc"
+        == "https://i.redd.it/isd965xyhwsf1.gif"
     )
-
-
-def test_direct_gif_forbidden_delete_failure_does_not_crash(monkeypatch):
-    monkeypatch.setattr("bot.discord.Forbidden", FakeDiscordError)
-    events = []
-    message = FakeMessage(events, delete_error=FakeDiscordError("delete forbidden"))
-
-    result = asyncio.run(send_direct_gif_embed(message, "https://cdn.example.com/a.gif"))
-
-    assert result is True
-    assert events == [
-        ("send", "https://cdn.example.com/a.gif"),
-        ("delete", None),
-    ]
-
-
-def test_reddit_preview_gif_url_removes_format_query_only():
-    assert (
-        clean_reddit_preview_gif_url(
-            "https://preview.redd.it/isd965xyhwsf1.gif?width=800&amp;format=mp4&amp;s=abc"
-        )
-        == "https://preview.redd.it/isd965xyhwsf1.gif?width=800&s=abc"
-    )
-
-
-def test_reddit_preview_gif_url_rejects_non_preview_cdn():
-    assert clean_reddit_preview_gif_url("https://i.redd.it/isd965xyhwsf1.gif") is None
-
-
-def test_reddit_post_preview_gif_is_detected_from_json(monkeypatch):
-    body = """
-    [{
-      "data": {
-        "children": [{
-          "data": {
-            "is_video": false,
-            "media": null,
-            "secure_media": null,
-            "preview": {
-              "images": [{
-                "variants": {
-                  "gif": {
-                    "source": {
-                      "url": "https://preview.redd.it/isd965xyhwsf1.gif?width=800&amp;format=mp4&amp;s=abc"
-                    }
-                  }
-                }
-              }]
-            }
-          }
-        }]
-      }
-    }]
-    """
-    session = FakeSession(body)
-    monkeypatch.setattr("bot._get_http_session", lambda: session)
-
-    result = asyncio.run(
-        reddit_preview_gif_url(
-            "https://old.reddit.com/r/Transmogrification/comments/1nwzkfx/flameforged_gnomie"
-        )
-    )
-
-    assert result == "https://preview.redd.it/isd965xyhwsf1.gif?width=800&s=abc"
-    assert session.urls == [
-        "https://old.reddit.com/r/Transmogrification/comments/1nwzkfx/flameforged_gnomie.json?limit=1"
-    ]
-
-
-def test_reddit_video_post_does_not_rewrite_preview_gif(monkeypatch):
-    body = """
-    [{
-      "data": {
-        "children": [{
-          "data": {
-            "is_video": true,
-            "preview": {
-              "images": [{
-                "source": {
-                  "url": "https://preview.redd.it/isd965xyhwsf1.gif?format=mp4&amp;s=abc"
-                }
-              }]
-            }
-          }
-        }]
-      }
-    }]
-    """
-    monkeypatch.setattr("bot._get_http_session", lambda: FakeSession(body))
-
-    assert (
-        asyncio.run(
-            reddit_preview_gif_url(
-                "https://old.reddit.com/r/Transmogrification/comments/1nwzkfx/flameforged_gnomie"
-            )
-        )
-        is None
-    )
-
-
-def test_reddit_unsupported_media_log_extracts_decoded_direct_gif():
-    log_text = (
-        f"{DIRECT_GIF_MARKER}\n"
-        "ERROR: Unsupported URL: "
-        "https://www.reddit.com/media?url=https%3A%2F%2Fi.redd.it%2Fisd965xyhwsf1.gif"
-        "\n[NOVIDEO]"
-    )
-
-    assert direct_gif_url_from_log(log_text) == "https://i.redd.it/isd965xyhwsf1.gif"
 
 
 def test_process_url_reddit_unsupported_direct_gif_sends_repost(monkeypatch):
@@ -487,17 +319,40 @@ def test_process_url_reddit_unsupported_direct_gif_sends_repost(monkeypatch):
         raise AssertionError(f"on_too_big should not run: {duration}")
 
     async def on_no_video(log_text=""):
-        gif_url = direct_gif_url_from_log(log_text)
+        gif_url = reddit_gif_url_from_log(log_text)
         if gif_url:
             sent.append(("send", gif_url))
 
     monkeypatch.setattr("bot.run_subprocess", fake_run_subprocess)
-    monkeypatch.setattr("bot.reddit_preview_gif_url", lambda url: asyncio.sleep(0, result=None))
     monkeypatch.setattr("bot.reddit_has_video", lambda url: asyncio.sleep(0, result=True))
 
     asyncio.run(process_url(url, None, fail_success, fail_error, fail_too_big, on_no_video))
 
     assert sent == [("send", "https://i.redd.it/isd965xyhwsf1.gif")]
+
+
+def test_reddit_gif_repost_deletes_after_success():
+    events = []
+    message = FakeMessage(events)
+
+    result = asyncio.run(send_reddit_gif_repost(message, "https://i.redd.it/isd965xyhwsf1.gif"))
+
+    assert result is True
+    assert events == [
+        ("send", "https://i.redd.it/isd965xyhwsf1.gif"),
+        ("delete", None),
+    ]
+
+
+def test_reddit_gif_repost_requires_embed_links_permission():
+    events = []
+    guild = FakeGuild(FakePermissions(embed_links=False))
+    message = FakeMessage(events, guild=guild)
+
+    result = asyncio.run(send_reddit_gif_repost(message, "https://i.redd.it/isd965xyhwsf1.gif"))
+
+    assert result is False
+    assert events == []
 
 
 def test_successful_instagram_image_rewrite_deletes_original_message():

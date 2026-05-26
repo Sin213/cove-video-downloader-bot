@@ -133,6 +133,10 @@ AUTO_DOWNLOAD_DOMAINS = {
 
 BLACKLISTED_DOMAINS = {
     "kkinstagram.com",
+    "fixupx.com",
+    "fxtwitter.com",
+    "vxtwitter.com",
+    "twittpr.com",
 }
 
 FIXUP_DOMAINS = {
@@ -228,6 +232,7 @@ FORMAT_REDDIT_FAST = (
 _deletable: dict[int, tuple[int, float]] = {}
 _friend_posts: dict[int, tuple[int, float]] = {}
 _friend_neet_skip_users: dict[int, float] = {}
+_processed_source_messages: dict[int, float] = {}
 _user_request_times: dict[int, list[float]] = {}
 _active_tasks: set[asyncio.Task] = set()
 _http_session: aiohttp.ClientSession | None = None
@@ -263,6 +268,11 @@ def _cache_set(cache: dict, key: str, value, ttl: float) -> None:
 
 
 _inflight_urls: set[str] = set()
+SOURCE_MESSAGE_DEDUP_TTL_SECONDS = max(DELETE_TTL_SECONDS, FRIEND_POST_TTL_SECONDS)
+
+
+def _inflight_key(kind: str, url: str) -> str:
+    return f"{kind}:{url.lower().rstrip('/')}"
 
 CACHE_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache.db")
 
@@ -315,6 +325,12 @@ def _persist_cache_entry(key: str, value, cache_type: str, ttl: float) -> None:
         conn.close()
     except Exception as e:
         log.warning("[cache] Failed to persist: %s", e)
+
+
+async def _persist_cache_entry_async(key: str, value, cache_type: str, ttl: float) -> None:
+    if not PERSISTENT_CACHE:
+        return
+    await asyncio.to_thread(_persist_cache_entry, key, value, cache_type, ttl)
 
 
 _init_persistent_cache()
@@ -373,6 +389,21 @@ def prune_neet_skips() -> None:
     expired = [uid for uid, expires_at in _friend_neet_skip_users.items() if expires_at <= now]
     for uid in expired:
         _friend_neet_skip_users.pop(uid, None)
+
+
+def prune_processed_source_messages() -> None:
+    now = monotonic()
+    expired = [mid for mid, expires_at in _processed_source_messages.items() if expires_at <= now]
+    for mid in expired:
+        _processed_source_messages.pop(mid, None)
+
+
+def mark_source_message_processing(message_id: int) -> bool:
+    prune_processed_source_messages()
+    if message_id in _processed_source_messages:
+        return False
+    _processed_source_messages[message_id] = monotonic() + SOURCE_MESSAGE_DEDUP_TTL_SECONDS
+    return True
 
 
 def _check_user_rate_limit(user_id: int) -> bool:
@@ -1097,7 +1128,7 @@ async def resolve_reddit_shortlink(url: str) -> str:
     if resolved:
         log.info("[reddit-short] Resolved to: %s", resolved)
         _cache_set(_reddit_shortlink_cache, url, resolved, SHORTLINK_CACHE_TTL)
-        _persist_cache_entry(url, resolved, "shortlink", SHORTLINK_CACHE_TTL)
+        await _persist_cache_entry_async(url, resolved, "shortlink", SHORTLINK_CACHE_TTL)
         return resolved
 
     log.warning("[reddit-short] Could not resolve %s — passing to yt-dlp as-is.", url)
@@ -1129,20 +1160,20 @@ async def reddit_has_video(url: str) -> bool:
         post = data[0]["data"]["children"][0]["data"]
         if post.get("is_video"):
             _cache_set(_reddit_has_video_cache, api_url, True, HAS_VIDEO_CACHE_TTL)
-            _persist_cache_entry(api_url, True, "has_video", HAS_VIDEO_CACHE_TTL)
+            await _persist_cache_entry_async(api_url, True, "has_video", HAS_VIDEO_CACHE_TTL)
             return True
         post_url = post.get("url", "")
         if host_matches(hostname_for(post_url), VIDEO_DOMAINS):
             _cache_set(_reddit_has_video_cache, api_url, True, HAS_VIDEO_CACHE_TTL)
-            _persist_cache_entry(api_url, True, "has_video", HAS_VIDEO_CACHE_TTL)
+            await _persist_cache_entry_async(api_url, True, "has_video", HAS_VIDEO_CACHE_TTL)
             return True
         if post.get("media") or post.get("secure_media"):
             _cache_set(_reddit_has_video_cache, api_url, True, HAS_VIDEO_CACHE_TTL)
-            _persist_cache_entry(api_url, True, "has_video", HAS_VIDEO_CACHE_TTL)
+            await _persist_cache_entry_async(api_url, True, "has_video", HAS_VIDEO_CACHE_TTL)
             return True
         log.info("[reddit-check] No video in post (url=%s)", post_url)
         _cache_set(_reddit_has_video_cache, api_url, False, HAS_VIDEO_CACHE_TTL)
-        _persist_cache_entry(api_url, False, "has_video", HAS_VIDEO_CACHE_TTL)
+        await _persist_cache_entry_async(api_url, False, "has_video", HAS_VIDEO_CACHE_TTL)
         return False
     except Exception as e:
         log.warning("[reddit-check] Pre-check failed (%s) — letting yt-dlp try anyway.", e)
@@ -1186,17 +1217,89 @@ async def get_duration(filepath: str) -> float | None:
         return None
 
 
+async def get_media_info(filepath: str) -> dict | None:
+    cmd = ["ffprobe", "-v", "quiet", "-print_format", "json", "-show_format", "-show_streams", filepath]
+    code, out = await run_subprocess(cmd)
+    if code != 0:
+        return None
+    try:
+        return json.loads(out)
+    except Exception:
+        return None
+
+
+def duration_from_media_info(info: dict | None) -> float | None:
+    if not info:
+        return None
+    try:
+        duration = float(info.get("format", {}).get("duration"))
+    except (TypeError, ValueError):
+        return None
+    return duration if duration > 0 else None
+
+
+def discord_mp4_compatibility(info: dict | None, filepath: str) -> tuple[bool, str]:
+    if not info:
+        return False, "ffprobe=unreadable"
+
+    fmt = info.get("format") if isinstance(info, dict) else {}
+    format_name = str(fmt.get("format_name") or "")
+    streams = info.get("streams") if isinstance(info, dict) else []
+    if not isinstance(streams, list):
+        streams = []
+
+    video_streams = [s for s in streams if s.get("codec_type") == "video"]
+    audio_streams = [s for s in streams if s.get("codec_type") == "audio"]
+    video = video_streams[0] if video_streams else {}
+    audio = audio_streams[0] if audio_streams else {}
+
+    video_codec = str(video.get("codec_name") or "none")
+    pix_fmt = str(video.get("pix_fmt") or "unknown")
+    audio_codec = str(audio.get("codec_name") or "none")
+    ext = Path(filepath).suffix.lower()
+    summary = f"container={format_name} ext={ext} video={video_codec}/{pix_fmt} audio={audio_codec}"
+
+    compatible = (
+        ext == ".mp4"
+        and "mp4" in format_name
+        and video_codec == "h264"
+        and pix_fmt == "yuv420p"
+        and (not audio_streams or audio_codec == "aac")
+    )
+    return compatible, summary
+
+
+async def remux_streamable_mp4(src: str, dest: str) -> tuple[bool, str]:
+    cmd = [
+        "ffmpeg", "-y",
+        "-i", src,
+        "-map", "0:v:0",
+        "-map", "0:a?",
+        "-c", "copy",
+        "-sn", "-dn",
+        "-movflags", "+faststart",
+        "-f", "mp4",
+        dest,
+    ]
+    code, out = await run_subprocess(cmd, timeout=FFMPEG_TIMEOUT, nice=True)
+    if code != 0:
+        return False, out
+    return True, ""
+
+
 def ffmpeg_video_args(use_nvenc: bool, use_hevc: bool = False) -> list[str]:
     if use_nvenc:
-        codec = "hevc_nvenc" if use_hevc else "h264_nvenc"
-        return ["-c:v", codec, "-preset", "p5", "-tune", "hq"]
+        return ["-c:v", "h264_nvenc", "-preset", "p5", "-tune", "hq"]
     if use_hevc:
-        return ["-c:v", "libx265", "-preset", "fast"]
+        log.warning("[ffmpeg] HEVC requested but Discord upload output is forced to H.264.")
     return ["-c:v", "libx264", "-preset", "veryfast"]
 
 
-async def compress_to_target(src: str, dest: str, target_mb: float) -> tuple[bool, str]:
-    duration = await get_duration(src)
+async def compress_to_target(
+    src: str, dest: str, target_mb: float, duration: float | None = None,
+) -> tuple[bool, str]:
+    if duration is None:
+        duration = await get_duration(src)
     if not duration or duration <= 0:
         return False, "Could not read video duration."
 
@@ -1231,13 +1334,19 @@ async def compress_to_target(src: str, dest: str, target_mb: float) -> tuple[boo
         if use_nvenc:
             cmd += ["-multipass", "fullres"]
         cmd += [
+            "-map", "0:v:0",
+            "-map", "0:a?",
             "-pix_fmt", "yuv420p",
+            "-profile:v", "high",
+            "-tag:v", "avc1",
             "-b:v", f"{bitrate_kbps}k",
             "-maxrate", f"{int(bitrate_kbps * 1.15)}k",
             "-bufsize", f"{int(bitrate_kbps * 2)}k",
             "-c:a", "aac",
             "-b:a", f"{audio_kbps}k",
+            "-sn", "-dn",
             "-movflags", "+faststart",
+            "-f", "mp4",
             dest,
         ]
         return cmd
@@ -1245,7 +1354,9 @@ async def compress_to_target(src: str, dest: str, target_mb: float) -> tuple[boo
     async with ENCODE_SEMAPHORE:
         encoder_attempts: list[tuple[bool, bool]] = []
         if USE_NVENC:
-            encoder_attempts.append((True, USE_HEVC))
+            if USE_HEVC:
+                log.warning("[ffmpeg] USE_HEVC is ignored for Discord uploads; using H.264.")
+            encoder_attempts.append((True, False))
         encoder_attempts.append((False, False))
 
         encoder_used = "libx264"
@@ -1560,7 +1671,8 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
     _log.append(f"[INFO] Downloaded: {orig_mb:.1f} MB")
     log.info("[cove] Downloaded: %s (%.1f MB)", safe_name, orig_mb)
 
-    duration = await get_duration(src_path)
+    media_info = await get_media_info(src_path)
+    duration = duration_from_media_info(media_info)
     if duration and duration > MAX_DURATION_SECONDS:
         mins = int(duration // 60)
         secs = int(duration % 60)
@@ -1569,15 +1681,29 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
         _log.append(f"[TOOBIG] {mins}m{secs}s")
         return None, "\n".join(_log)
 
+    is_compatible, media_summary = discord_mp4_compatibility(media_info, src_path)
+    log.info("[cove] Download media info: %s", media_summary)
+
     if os.path.getsize(src_path) <= target_size:
-        _log.append(f"[INFO] Under {target_mb}MB — skipping compression.")
-        return src_path, "\n".join(_log)
+        streamable = str(Path(tmp) / "streamable.mp4")
+        if is_compatible:
+            ok, remux_log = await remux_streamable_mp4(src_path, streamable)
+            if ok and os.path.getsize(streamable) <= target_size:
+                _log.append(f"[INFO] Under {target_mb}MB — remuxed for Discord inline playback.")
+                return streamable, "\n".join(_log)
+            log.warning("[ffmpeg] Faststart remux failed or exceeded target: %s", remux_log[-1000:])
+            _log.append(f"[INFO] Under {target_mb}MB but faststart remux failed — re-encoding.")
+        else:
+            _log.append(f"[INFO] Under {target_mb}MB but not Discord-compatible — re-encoding.")
 
     compressed = str(Path(tmp) / "compressed.mp4")
     _log.append(f"[INFO] Compressing to \u2264{target_mb}MB...")
-    ok, result = await compress_to_target(src_path, compressed, target_mb)
+    ok, result = await compress_to_target(src_path, compressed, target_mb, duration=duration)
 
     if ok:
+        final_info = await get_media_info(compressed)
+        _, final_summary = discord_mp4_compatibility(final_info, compressed)
+        log.info("[cove] Compressed media info: %s", final_summary)
         _log.append(f"[OK] Final size: {result}")
         return compressed, "\n".join(_log)
     else:
@@ -1984,7 +2110,7 @@ async def process_url(
     on_too_big=None,
     on_no_video=None,
 ):
-    canonical = url.lower().rstrip("/")
+    canonical = _inflight_key("video", url)
     if canonical in _inflight_urls:
         log.info("[dedup] Skipping already-in-flight URL: %s", url)
         if on_no_video:
@@ -2040,42 +2166,52 @@ async def process_audio_url(
     on_too_big=None,
     on_no_video=None,
 ):
-    async with JOB_SEMAPHORE:
-        try:
-            filepath, log_text = await download_audio(url, guild)
-        except Exception:
-            log.exception("Unhandled exception during process_audio_url")
-            await on_error("Audio download failed.")
-            return
+    canonical = _inflight_key("audio", url)
+    if canonical in _inflight_urls:
+        log.info("[dedup] Skipping already-in-flight audio URL: %s", url)
+        if on_no_video:
+            await on_no_video()
+        return
+    _inflight_urls.add(canonical)
+    try:
+        async with JOB_SEMAPHORE:
+            try:
+                filepath, log_text = await download_audio(url, guild)
+            except Exception:
+                log.exception("Unhandled exception during process_audio_url")
+                await on_error("Audio download failed.")
+                return
 
-        if any(line.strip() == "[NOVIDEO]" for line in log_text.splitlines()):
-            if on_no_video:
-                await on_no_video()
-            return
+            if any(line.strip() == "[NOVIDEO]" for line in log_text.splitlines()):
+                if on_no_video:
+                    await on_no_video()
+                return
 
-        toobig_lines = [line for line in log_text.splitlines() if line.startswith("[TOOBIG]")]
-        if toobig_lines:
-            size_str = toobig_lines[0].replace("[TOOBIG] ", "")
-            if on_too_big:
-                await on_too_big(size_str)
-            else:
-                await on_error(f"Audio too big {NYO_EMOJI} ({size_str})")
-            return
+            toobig_lines = [line for line in log_text.splitlines() if line.startswith("[TOOBIG]")]
+            if toobig_lines:
+                size_str = toobig_lines[0].replace("[TOOBIG] ", "")
+                if on_too_big:
+                    await on_too_big(size_str)
+                else:
+                    await on_error(f"Audio too big {NYO_EMOJI} ({size_str})")
+                return
 
-        if not filepath or not os.path.exists(filepath):
-            error_lines = [line for line in log_text.splitlines() if line.startswith("[ERROR]")]
-            msg = error_lines[0].replace("[ERROR] ", "") if error_lines else "Audio download failed."
-            log.error("Audio download failed. Full log:\n%s", log_text)
-            await on_error(msg)
-            return
+            if not filepath or not os.path.exists(filepath):
+                error_lines = [line for line in log_text.splitlines() if line.startswith("[ERROR]")]
+                msg = error_lines[0].replace("[ERROR] ", "") if error_lines else "Audio download failed."
+                log.error("Audio download failed. Full log:\n%s", log_text)
+                await on_error(msg)
+                return
 
-        try:
-            await on_success(filepath)
-        except Exception:
-            log.exception("Unhandled exception in audio on_success")
-            await on_error("Upload failed.")
-        finally:
-            await cleanup_tmp(filepath)
+            try:
+                await on_success(filepath)
+            except Exception:
+                log.exception("Unhandled exception in audio on_success")
+                await on_error("Upload failed.")
+            finally:
+                await cleanup_tmp(filepath)
+    finally:
+        _inflight_urls.discard(canonical)
 
 
 async def process_clip_url(
@@ -2087,33 +2223,43 @@ async def process_clip_url(
     on_error,
     on_no_video=None,
 ):
-    async with JOB_SEMAPHORE:
-        try:
-            filepath, log_text = await download_and_clip(url, guild, start, end)
-        except Exception as e:
-            log.exception("Unhandled exception during process_clip_url")
-            await on_error(f"Unexpected error: {e}")
-            return
+    canonical = _inflight_key("clip", f"{url}:{start}:{end}")
+    if canonical in _inflight_urls:
+        log.info("[dedup] Skipping already-in-flight clip URL: %s", url)
+        if on_no_video:
+            await on_no_video()
+        return
+    _inflight_urls.add(canonical)
+    try:
+        async with JOB_SEMAPHORE:
+            try:
+                filepath, log_text = await download_and_clip(url, guild, start, end)
+            except Exception as e:
+                log.exception("Unhandled exception during process_clip_url")
+                await on_error(f"Unexpected error: {e}")
+                return
 
-        if any(line.strip() == "[NOVIDEO]" for line in log_text.splitlines()):
-            if on_no_video:
-                await on_no_video()
-            return
+            if any(line.strip() == "[NOVIDEO]" for line in log_text.splitlines()):
+                if on_no_video:
+                    await on_no_video()
+                return
 
-        if not filepath or not os.path.exists(filepath):
-            error_lines = [line for line in log_text.splitlines() if line.startswith("[ERROR]")]
-            msg = error_lines[0].replace("[ERROR] ", "") if error_lines else "Clip failed."
-            log.error("Clip failed. Full log:\n%s", log_text)
-            await on_error(msg)
-            return
+            if not filepath or not os.path.exists(filepath):
+                error_lines = [line for line in log_text.splitlines() if line.startswith("[ERROR]")]
+                msg = error_lines[0].replace("[ERROR] ", "") if error_lines else "Clip failed."
+                log.error("Clip failed. Full log:\n%s", log_text)
+                await on_error(msg)
+                return
 
-        try:
-            await on_success(filepath)
-        except Exception as e:
-            log.exception("Unhandled exception in clip on_success")
-            await on_error(f"Upload failed: {e}")
-        finally:
-            await cleanup_tmp(filepath)
+            try:
+                await on_success(filepath)
+            except Exception as e:
+                log.exception("Unhandled exception in clip on_success")
+                await on_error(f"Upload failed: {e}")
+            finally:
+                await cleanup_tmp(filepath)
+    finally:
+        _inflight_urls.discard(canonical)
 
 
 async def process_gif_url(
@@ -2123,38 +2269,48 @@ async def process_gif_url(
     on_error,
     on_no_video=None,
 ):
-    async with JOB_SEMAPHORE:
-        try:
-            filepath, log_text = await download_and_gif(url, guild)
-        except Exception as e:
-            log.exception("Unhandled exception during process_gif_url")
-            await on_error(f"Unexpected error: {e}")
-            return
+    canonical = _inflight_key("gif", url)
+    if canonical in _inflight_urls:
+        log.info("[dedup] Skipping already-in-flight GIF URL: %s", url)
+        if on_no_video:
+            await on_no_video()
+        return
+    _inflight_urls.add(canonical)
+    try:
+        async with JOB_SEMAPHORE:
+            try:
+                filepath, log_text = await download_and_gif(url, guild)
+            except Exception as e:
+                log.exception("Unhandled exception during process_gif_url")
+                await on_error(f"Unexpected error: {e}")
+                return
 
-        if any(line.strip() == "[NOVIDEO]" for line in log_text.splitlines()):
-            if on_no_video:
-                await on_no_video()
-            return
+            if any(line.strip() == "[NOVIDEO]" for line in log_text.splitlines()):
+                if on_no_video:
+                    await on_no_video()
+                return
 
-        toobig_lines = [line for line in log_text.splitlines() if line.startswith("[TOOBIG]")]
-        if toobig_lines:
-            await on_error(f"Source video too long (max {MAX_DURATION_SECONDS // 60}min)")
-            return
+            toobig_lines = [line for line in log_text.splitlines() if line.startswith("[TOOBIG]")]
+            if toobig_lines:
+                await on_error(f"Source video too long (max {MAX_DURATION_SECONDS // 60}min)")
+                return
 
-        if not filepath or not os.path.exists(filepath):
-            error_lines = [line for line in log_text.splitlines() if line.startswith("[ERROR]")]
-            msg = error_lines[0].replace("[ERROR] ", "") if error_lines else "GIF conversion failed."
-            log.error("GIF failed. Full log:\n%s", log_text)
-            await on_error(msg)
-            return
+            if not filepath or not os.path.exists(filepath):
+                error_lines = [line for line in log_text.splitlines() if line.startswith("[ERROR]")]
+                msg = error_lines[0].replace("[ERROR] ", "") if error_lines else "GIF conversion failed."
+                log.error("GIF failed. Full log:\n%s", log_text)
+                await on_error(msg)
+                return
 
-        try:
-            await on_success(filepath)
-        except Exception as e:
-            log.exception("Unhandled exception in gif on_success")
-            await on_error(f"Upload failed: {e}")
-        finally:
-            await cleanup_tmp(filepath)
+            try:
+                await on_success(filepath)
+            except Exception as e:
+                log.exception("Unhandled exception in gif on_success")
+                await on_error(f"Upload failed: {e}")
+            finally:
+                await cleanup_tmp(filepath)
+    finally:
+        _inflight_urls.discard(canonical)
 
 
 # ── Bot ───────────────────────────────────────────────────────────────────────
@@ -2244,6 +2400,10 @@ class CoveBot(discord.Client):
             if not perms_ok:
                 log.warning("[security] Missing permissions in #%s: %s", message.channel, missing)
                 return
+
+        if not mark_source_message_processing(message.id):
+            log.info("[dedup] Skipping already-processed Discord message: %s", message.id)
+            return
 
         log.info("[Cove] Auto-triggered by %s in #%s: %s", message.author, message.channel, url)
 

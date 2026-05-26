@@ -12,3 +12,4 @@ ffmpeg2pass-*.log.mbtree
 cache.db
 .git/
 .claude/
+AGENTS.md

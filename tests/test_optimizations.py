@@ -6,8 +6,10 @@ from unittest.mock import patch, AsyncMock
 
 from bot import (
     ffmpeg_video_args,
+    duration_from_media_info,
     parse_timestamp,
     _inflight_urls,
+    _inflight_key,
     _init_persistent_cache,
     _persist_cache_entry,
     _reddit_shortlink_cache,
@@ -70,6 +72,11 @@ def test_inflight_url_dedup():
     assert "https://example.com/video" in _inflight_urls
     _inflight_urls.discard("https://example.com/video")
     assert "https://example.com/video" not in _inflight_urls
+
+
+def test_inflight_key_normalizes_url_and_namespaces_kind():
+    assert _inflight_key("video", "HTTPS://Example.com/Video/") == "video:https://example.com/video"
+    assert _inflight_key("audio", "https://example.com/video") != _inflight_key("video", "https://example.com/video")
 
 
 def test_persistent_cache_roundtrip():
@@ -175,6 +182,12 @@ def test_parse_timestamp_invalid():
 
 def test_parse_timestamp_negative_clamps_to_zero():
     assert parse_timestamp("-5") == 0.0
+
+
+def test_duration_from_media_info():
+    assert duration_from_media_info({"format": {"duration": "12.5"}}) == 12.5
+    assert duration_from_media_info({"format": {"duration": "0"}}) is None
+    assert duration_from_media_info(None) is None
 
 
 def test_gif_max_duration():

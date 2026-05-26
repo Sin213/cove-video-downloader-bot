@@ -96,6 +96,7 @@ PROCESS_NICE           = _require_int_env("PROCESS_NICE", default="10")
 FFMPEG_TIMEOUT         = _require_int_env("FFMPEG_TIMEOUT", default="300")
 USE_ARIA2C_ENV         = _env_bool("USE_ARIA2C", "1")
 PERSISTENT_CACHE       = _env_bool("PERSISTENT_CACHE", "1")
+ADMIN_HEALTH_COMMAND   = _env_bool("ADMIN_HEALTH_COMMAND", "1")
 
 JOB_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
 ENCODE_SEMAPHORE = asyncio.Semaphore(NVENC_MAX_SESSIONS)
@@ -247,6 +248,8 @@ HAS_VIDEO_CACHE_TTL = 3600
 CACHE_MAX_ENTRIES = 512
 MAX_HTTP_RESPONSE_BYTES = 1024 * 1024
 MAX_SUBPROCESS_OUTPUT_BYTES = 512 * 1024
+_ytdlp_version_status: tuple[bool, str] = (False, "yt-dlp version has not been checked yet.")
+_ytdlp_admin_warning_sent = False
 
 
 def _cache_get(cache: dict, key: str):
@@ -520,6 +523,18 @@ def reddit_media_image_url_from_text(text: str) -> str | None:
     return reddit_media_url_from_text(text, REDDIT_IMAGE_EXTENSIONS)
 
 
+def _reddit_image_url_from_value(value: str) -> str | None:
+    image_url = reddit_media_image_url_from_text(html_unescape(value))
+    if image_url:
+        return image_url
+    parsed = urlparse(html_unescape(value))
+    if hostname_for(html_unescape(value)) in REDDIT_IMAGE_HOSTS:
+        query = parsed.query.lower()
+        if "format=pjpg" in query or "format=png" in query or "format=jpg" in query:
+            return html_unescape(value)
+    return None
+
+
 def reddit_gif_url_from_log(log_text: str) -> str | None:
     lines = log_text.splitlines()
     for index, line in enumerate(lines):
@@ -563,14 +578,47 @@ def reddit_image_url_from_post(post: dict) -> str | None:
         value = post.get(key)
         if not isinstance(value, str):
             continue
-        image_url = reddit_media_image_url_from_text(value)
+        image_url = _reddit_image_url_from_value(value)
         if image_url:
             return image_url
+
+    crossposts = post.get("crosspost_parent_list")
+    if isinstance(crossposts, list):
+        for crosspost in crossposts:
+            if isinstance(crosspost, dict):
+                image_url = reddit_image_url_from_post(crosspost)
+                if image_url:
+                    return image_url
+
+    preview = post.get("preview")
+    if isinstance(preview, dict):
+        images = preview.get("images")
+        if isinstance(images, list):
+            for image in images:
+                if not isinstance(image, dict):
+                    continue
+                source = image.get("source")
+                if not isinstance(source, dict):
+                    continue
+                value = source.get("url")
+                if isinstance(value, str):
+                    image_url = _reddit_image_url_from_value(value)
+                    if image_url:
+                        return image_url
 
     media_metadata = post.get("media_metadata")
     if not isinstance(media_metadata, dict):
         return None
-    for item in media_metadata.values():
+    gallery_items = post.get("gallery_data", {}).get("items") if isinstance(post.get("gallery_data"), dict) else None
+    if isinstance(gallery_items, list):
+        ordered_items = [
+            media_metadata[item.get("media_id")]
+            for item in gallery_items
+            if isinstance(item, dict) and item.get("media_id") in media_metadata
+        ]
+    else:
+        ordered_items = list(media_metadata.values())
+    for item in ordered_items:
         if not isinstance(item, dict):
             continue
         source = item.get("s")
@@ -579,8 +627,8 @@ def reddit_image_url_from_post(post: dict) -> str | None:
         image_url = source.get("u") or source.get("gif")
         if not isinstance(image_url, str):
             continue
-        image_url = html_unescape(image_url)
-        if reddit_media_image_url_from_text(image_url):
+        image_url = _reddit_image_url_from_value(image_url)
+        if image_url:
             return image_url
     return None
 
@@ -784,6 +832,11 @@ def get_target_mb(guild: discord.Guild | None) -> float:
     return BOOST_TIER_LIMITS_MB.get(guild.premium_tier, 9.5)
 
 
+def is_admin_interaction(interaction: discord.Interaction) -> bool:
+    perms = getattr(interaction.user, "guild_permissions", None)
+    return bool(perms and perms.administrator)
+
+
 def _check_bot_permissions(channel: discord.abc.GuildChannel, bot_member: discord.Member) -> tuple[bool, str]:
     perms = channel.permissions_for(bot_member)
     missing = []
@@ -808,22 +861,35 @@ def clean_env():
 ENV = clean_env()
 
 
-def _check_ytdlp_version():
+def _check_ytdlp_version() -> tuple[bool, str]:
+    global _ytdlp_version_status
     try:
         result = subprocess.run(
             ["yt-dlp", "--version"],
             capture_output=True, text=True, timeout=5, env=ENV,
         )
         version = result.stdout.strip()
+        if result.returncode != 0 or not version:
+            message = "yt-dlp version check failed."
+            _ytdlp_version_status = (False, message)
+            log.warning("[security] %s", message)
+            return _ytdlp_version_status
         if version < YT_DLP_MIN_VERSION:
+            message = f"yt-dlp {version} is older than configured minimum {YT_DLP_MIN_VERSION}."
+            _ytdlp_version_status = (False, message)
             log.warning(
-                "[security] yt-dlp version %s is older than minimum %s",
-                version, YT_DLP_MIN_VERSION,
+                "[security] %s",
+                message,
             )
         else:
+            message = f"yt-dlp {version} meets configured minimum {YT_DLP_MIN_VERSION}."
+            _ytdlp_version_status = (True, message)
             log.info("[Cove] yt-dlp version: %s", version)
     except Exception as e:
-        log.warning("[security] Could not check yt-dlp version: %s", e)
+        message = f"Could not check yt-dlp version: {e}"
+        _ytdlp_version_status = (False, message)
+        log.warning("[security] %s", message)
+    return _ytdlp_version_status
 
 
 _check_ytdlp_version()
@@ -844,6 +910,73 @@ def _check_aria2c() -> bool:
 
 HAS_ARIA2C = _check_aria2c()
 USE_ARIA2C = HAS_ARIA2C and USE_ARIA2C_ENV
+
+
+def _command_version(command: str, args: list[str]) -> tuple[bool, str]:
+    path = shutil.which(command)
+    if not path:
+        return False, "missing"
+    try:
+        result = subprocess.run(
+            [command, *args],
+            capture_output=True,
+            text=True,
+            timeout=5,
+            env=ENV,
+        )
+    except Exception as e:
+        return False, f"error: {e}"
+    if result.returncode != 0:
+        return False, "error"
+    first_line = (result.stdout or result.stderr).strip().splitlines()
+    version = first_line[0] if first_line else "ok"
+    return True, version[:120]
+
+
+def build_health_report() -> str:
+    checks = []
+    ytdlp_ok, ytdlp_message = _check_ytdlp_version()
+    checks.append(("yt-dlp", ytdlp_ok, ytdlp_message))
+    ffmpeg_ok, ffmpeg_message = _command_version("ffmpeg", ["-version"])
+    checks.append(("ffmpeg", ffmpeg_ok, ffmpeg_message))
+    ffprobe_ok, ffprobe_message = _command_version("ffprobe", ["-version"])
+    checks.append(("ffprobe", ffprobe_ok, ffprobe_message))
+
+    if COOKIES_EXIST:
+        try:
+            mode = oct(os.stat(COOKIES_FILE).st_mode & 0o777)
+            cookies_message = f"present ({mode})"
+            cookies_ok = True
+        except OSError as e:
+            cookies_message = f"stat failed: {e}"
+            cookies_ok = False
+    else:
+        cookies_message = "missing"
+        cookies_ok = False
+    checks.append(("cookies.txt", cookies_ok, cookies_message))
+
+    tmp_root = TMP_BASE or tempfile.gettempdir()
+    try:
+        usage = shutil.disk_usage(tmp_root)
+        free_gb = usage.free / (1024 ** 3)
+        total_gb = usage.total / (1024 ** 3)
+        disk_ok = usage.free > 512 * 1024 * 1024
+        disk_message = f"{free_gb:.1f} GB free / {total_gb:.1f} GB total at {tmp_root}"
+    except OSError as e:
+        disk_ok = False
+        disk_message = f"failed: {e}"
+    checks.append(("temp disk", disk_ok, disk_message))
+
+    checks.append(("aria2c", HAS_ARIA2C, "enabled" if USE_ARIA2C else "available but disabled" if HAS_ARIA2C else "missing"))
+    checks.append(("NVENC", USE_NVENC, "enabled" if USE_NVENC else "disabled"))
+    checks.append(("cache", PERSISTENT_CACHE, "persistent cache enabled" if PERSISTENT_CACHE else "persistent cache disabled"))
+
+    lines = ["Cove health:"]
+    for name, ok, message in checks:
+        marker = "OK" if ok else "WARN"
+        lines.append(f"{marker} {name}: {message}")
+    lines.append(f"jobs: max={MAX_CONCURRENT_JOBS}, fragments={YT_DLP_FRAGMENTS}, filesize={MAX_FILESIZE_MB}MB")
+    return "\n".join(lines)
 
 
 def _log_shm_info() -> None:
@@ -881,6 +1014,44 @@ def _sanitize_error_line(raw: str) -> str:
     if cleaned.strip() == "[redacted]" or not cleaned.strip():
         return "Download failed."
     return cleaned
+
+
+def user_facing_download_error(output: str, *, media: str = "video") -> str | None:
+    lowered = output.lower()
+    if "cookies" in lowered and (
+        "expired" in lowered
+        or "invalid" in lowered
+        or "unauthorized" in lowered
+        or "login" in lowered
+    ):
+        return "Login cookies look expired or invalid. Refresh cookies.txt and try again."
+    if "sign in to confirm" in lowered or "confirm you're not a bot" in lowered:
+        return "The site is asking for sign-in or bot verification. Cookies may need to be refreshed."
+    if "private" in lowered or "login required" in lowered or "this post is private" in lowered:
+        return f"That {media} appears to be private or login-only."
+    if "empty media response" in lowered:
+        return "Link is unavailable. The account may be banned, private, or the post may have been deleted."
+    if "http error 403" in lowered:
+        return "Access denied (403). Cookies may be missing, expired, or not allowed to view this post."
+    if "http error 404" in lowered or "not found" in lowered:
+        return f"{media.capitalize()} not found or no longer available."
+    if "unsupported url" in lowered:
+        return "Unsupported, private, or unavailable URL."
+    if "please update" in lowered and "yt-dlp" in lowered:
+        return "yt-dlp looks stale for this site. Update yt-dlp and try again."
+    return None
+
+
+def user_facing_upload_error(error: Exception) -> str:
+    text = str(error)
+    lowered = text.lower()
+    if "413" in lowered or "request entity too large" in lowered or "file" in lowered and "large" in lowered:
+        return "Discord rejected the upload as too large after processing."
+    if "missing access" in lowered or "forbidden" in lowered or "permission" in lowered:
+        return "Discord rejected the upload because the bot is missing channel permissions."
+    if "rate limit" in lowered:
+        return "Discord rate-limited the upload. Try again in a moment."
+    return f"Upload failed: {_sanitize_error_line(text)}"
 
 
 def _sanitize_filename(name: str) -> str:
@@ -1642,6 +1813,8 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
         elif "empty media response" in out.lower():
             log.info("[cove] Instagram empty media response — account banned or post deleted.")
             _log.append("[ERROR] Link is broken (the account may have been banned or the post was deleted).")
+        elif friendly := user_facing_download_error(out, media="video"):
+            _log.append(f"[ERROR] {friendly}")
         elif "Unsupported URL" in out:
             _log.append("[ERROR] Unsupported or private URL.")
         elif "HTTP Error 403" in out:
@@ -1733,8 +1906,6 @@ async def download_and_clip(
 
     is_reddit  = host_matches(hostname_for(url), {"reddit.com", "redd.it"})
     is_twitter = host_matches(hostname_for(url), TWITTER_DOMAINS)
-    is_youtube = host_matches(hostname_for(url), {"youtube.com", "youtu.be"})
-    is_reddit_short = REDDIT_SHORT_RE.search(url) is not None
 
     if is_reddit:
         has_video = await reddit_has_video(url)
@@ -1789,6 +1960,8 @@ async def download_and_clip(
             _log.append("[NOVIDEO]")
         elif "Unsupported URL" in out and is_twitter:
             _log.append("[NOVIDEO]")
+        elif friendly := user_facing_download_error(out, media="video"):
+            _log.append(f"[ERROR] {friendly}")
         elif "Unsupported URL" in out:
             _log.append("[ERROR] Unsupported or private URL.")
         elif "HTTP Error 403" in out:
@@ -1848,8 +2021,6 @@ async def download_and_gif(url: str, guild: discord.Guild | None) -> tuple:
 
     is_reddit  = host_matches(hostname_for(url), {"reddit.com", "redd.it"})
     is_twitter = host_matches(hostname_for(url), TWITTER_DOMAINS)
-    is_youtube = host_matches(hostname_for(url), {"youtube.com", "youtu.be"})
-    is_reddit_short = REDDIT_SHORT_RE.search(url) is not None
 
     if is_reddit:
         has_video = await reddit_has_video(url)
@@ -1910,6 +2081,8 @@ async def download_and_gif(url: str, guild: discord.Guild | None) -> tuple:
             _log.append("[NOVIDEO]")
         elif "Unsupported URL" in out and is_twitter:
             _log.append("[NOVIDEO]")
+        elif friendly := user_facing_download_error(out, media="video"):
+            _log.append(f"[ERROR] {friendly}")
         elif "Unsupported URL" in out:
             _log.append("[ERROR] Unsupported or private URL.")
         elif "HTTP Error 403" in out:
@@ -2040,6 +2213,8 @@ async def download_audio(url: str, guild: discord.Guild | None) -> tuple:
             elif "Unsupported URL" in out and is_twitter:
                 log.info("[cove] X/Twitter post has no downloadable audio — ignoring silently.")
                 _log.append("[NOVIDEO]")
+            elif friendly := user_facing_download_error(out, media="audio"):
+                _log.append(f"[ERROR] {friendly}")
             elif is_youtube and (
                 "Sign in to confirm" in out
                 or "confirm you're not a bot" in out.lower()
@@ -2151,7 +2326,7 @@ async def process_url(
                 await on_success(filepath)
             except Exception as e:
                 log.exception("Unhandled exception in on_success")
-                await on_error(f"Upload failed: {e}")
+                await on_error(user_facing_upload_error(e))
             finally:
                 await cleanup_tmp(filepath)
     finally:
@@ -2205,9 +2380,9 @@ async def process_audio_url(
 
             try:
                 await on_success(filepath)
-            except Exception:
+            except Exception as e:
                 log.exception("Unhandled exception in audio on_success")
-                await on_error("Upload failed.")
+                await on_error(user_facing_upload_error(e))
             finally:
                 await cleanup_tmp(filepath)
     finally:
@@ -2255,7 +2430,7 @@ async def process_clip_url(
                 await on_success(filepath)
             except Exception as e:
                 log.exception("Unhandled exception in clip on_success")
-                await on_error(f"Upload failed: {e}")
+                await on_error(user_facing_upload_error(e))
             finally:
                 await cleanup_tmp(filepath)
     finally:
@@ -2306,7 +2481,7 @@ async def process_gif_url(
                 await on_success(filepath)
             except Exception as e:
                 log.exception("Unhandled exception in gif on_success")
-                await on_error(f"Upload failed: {e}")
+                await on_error(user_facing_upload_error(e))
             finally:
                 await cleanup_tmp(filepath)
     finally:
@@ -2335,6 +2510,7 @@ class CoveBot(discord.Client):
             log.info("[Cove] Friend slash commands synced to guild %d", FRIEND_GUILD_ID)
 
     async def on_ready(self):
+        global _ytdlp_admin_warning_sent
         log.info("[Cove] Logged in as %s (ID: %d)", self.user, self.user.id)
         _get_http_session()
         await self.change_presence(
@@ -2343,6 +2519,21 @@ class CoveBot(discord.Client):
                 name="for links & /download",
             )
         )
+        ytdlp_ok, ytdlp_message = _ytdlp_version_status
+        if not ytdlp_ok and not _ytdlp_admin_warning_sent:
+            guild = self.get_guild(GUILD_ID)
+            owner = guild.owner if guild and guild.owner else None
+            if owner is None and guild and guild.owner_id:
+                try:
+                    owner = await guild.fetch_member(guild.owner_id)
+                except discord.HTTPException:
+                    owner = None
+            if owner is not None:
+                try:
+                    await owner.send(f"Cove warning: {ytdlp_message}")
+                    _ytdlp_admin_warning_sent = True
+                except discord.HTTPException as e:
+                    log.warning("[Cove] Could not DM yt-dlp warning to guild owner: %s", e)
 
     async def close(self):
         await _close_http_session()
@@ -2427,7 +2618,7 @@ class CoveBot(discord.Client):
                 sent = await message.channel.send(
                     content=friend_post_content(display_name, extra_mentions),
                     file=discord.File(filepath),
-                    allowed_mentions=discord.AllowedMentions(users=True, everyone=False, roles=False),
+                    allowed_mentions=discord.AllowedMentions(users=False, everyone=False, roles=False),
                 )
                 prune_friend_posts()
                 _friend_posts[sent.id] = (author_id, monotonic() + FRIEND_POST_TTL_SECONDS)
@@ -2819,6 +3010,35 @@ async def gif_cmd(interaction: discord.Interaction, url: str):
         on_error,
         on_no_video=on_no_video,
     )
+
+
+@client.tree.command(
+    name="health",
+    description="Run an admin-only self-check for Cove dependencies and runtime state",
+)
+@app_commands.default_permissions(administrator=True)
+@app_commands.check(is_admin_interaction)
+async def health_cmd(interaction: discord.Interaction):
+    if not ADMIN_HEALTH_COMMAND:
+        await interaction.response.send_message("\u274c Health checks are disabled.", ephemeral=True)
+        return
+    try:
+        await interaction.response.defer(ephemeral=True, thinking=True)
+    except (discord.errors.NotFound, discord.errors.HTTPException):
+        return
+    report = await asyncio.to_thread(build_health_report)
+    await interaction.followup.send(f"```text\n{report[:1800]}\n```", ephemeral=True)
+
+
+@health_cmd.error
+async def health_cmd_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.CheckFailure):
+        try:
+            await interaction.response.send_message("\u274c Admins only.", ephemeral=True)
+        except (discord.errors.NotFound, discord.errors.HTTPException):
+            pass
+        return
+    raise error
 
 
 if FRIEND_GUILD_ID != 0:

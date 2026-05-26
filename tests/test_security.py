@@ -16,6 +16,8 @@ from bot import (
     send_reddit_image_repost,
     send_reddit_gif_repost,
     send_instagram_image_rewrite,
+    user_facing_download_error,
+    user_facing_upload_error,
     _instagram_entry_has_video,
     _is_instagram_image_entry,
     INSTAGRAM_IMAGE_MARKER,
@@ -332,6 +334,45 @@ def test_reddit_image_url_from_gallery_post():
     )
 
 
+def test_reddit_image_url_from_gallery_uses_gallery_order():
+    assert (
+        reddit_image_url_from_post(
+            {
+                "gallery_data": {"items": [{"media_id": "second"}, {"media_id": "first"}]},
+                "media_metadata": {
+                    "first": {"s": {"u": "https://preview.redd.it/first.jpg?width=960&amp;format=pjpg"}},
+                    "second": {"s": {"u": "https://preview.redd.it/second.jpg?width=960&amp;format=pjpg"}},
+                },
+            }
+        )
+        == "https://preview.redd.it/second.jpg?width=960&format=pjpg"
+    )
+
+
+def test_reddit_image_url_from_preview_source():
+    assert (
+        reddit_image_url_from_post(
+            {
+                "preview": {
+                    "images": [
+                        {"source": {"url": "https://preview.redd.it/example.png?width=960&amp;format=png"}}
+                    ]
+                }
+            }
+        )
+        == "https://preview.redd.it/example.png?width=960&format=png"
+    )
+
+
+def test_user_facing_download_error_cookie_and_private_cases():
+    assert "expired" in user_facing_download_error("ERROR: cookies expired, login required").lower()
+    assert "private" in user_facing_download_error("ERROR: this post is private").lower()
+
+
+def test_user_facing_upload_error_large_file():
+    assert "too large" in user_facing_upload_error(Exception("413 Request Entity Too Large")).lower()
+
+
 def test_process_url_reddit_unsupported_direct_gif_sends_repost(monkeypatch):
     url = "https://old.reddit.com/r/Transmogrification/comments/1nwzkfx/flameforged_gnomie"
     sent = []
@@ -625,11 +666,20 @@ def test_process_url_instagram_video_success_sends_no_rewrite(monkeypatch):
         if rewritten:
             sent.append(("send", rewritten))
 
+    async def fake_compress_to_target(src, dest, target_mb, duration=None):
+        Path(dest).write_bytes(b"video")
+        return True, "0.01 MB"
+
     monkeypatch.setattr("bot.run_subprocess", fake_run_subprocess)
     monkeypatch.setattr("bot.get_duration", lambda filepath: asyncio.sleep(0, result=12.3))
+    monkeypatch.setattr(
+        "bot.get_media_info",
+        lambda filepath: asyncio.sleep(0, result={"format": {"duration": "12.3"}, "streams": []}),
+    )
+    monkeypatch.setattr("bot.compress_to_target", fake_compress_to_target)
     monkeypatch.setattr("bot.cleanup_tmp", lambda filepath: asyncio.sleep(0))
 
     asyncio.run(process_url(url, None, on_success, fail_error, fail_too_big, on_no_video))
 
-    assert succeeded == ["clip.mp4"]
+    assert succeeded == ["compressed.mp4"]
     assert sent == []

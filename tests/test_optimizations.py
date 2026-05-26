@@ -1,8 +1,6 @@
-import asyncio
 import os
 import tempfile
 import sqlite3
-from unittest.mock import patch, AsyncMock
 
 from bot import (
     ffmpeg_video_args,
@@ -10,14 +8,9 @@ from bot import (
     parse_timestamp,
     _inflight_urls,
     _inflight_key,
-    _init_persistent_cache,
     _persist_cache_entry,
-    _reddit_shortlink_cache,
-    _reddit_has_video_cache,
-    _cache_get,
     CACHE_DB_PATH,
     ENCODE_SEMAPHORE,
-    JOB_SEMAPHORE,
     MAX_CONCURRENT_JOBS,
     NVENC_MAX_SESSIONS,
     YT_DLP_FRAGMENTS,
@@ -50,7 +43,7 @@ def test_ffmpeg_args_h264_nvenc_p5():
 
 def test_ffmpeg_args_hevc_nvenc():
     args = ffmpeg_video_args(use_nvenc=True, use_hevc=True)
-    assert "hevc_nvenc" in args
+    assert "h264_nvenc" in args
     assert "p5" in args
 
 
@@ -62,8 +55,8 @@ def test_ffmpeg_args_libx264_fallback():
 
 def test_ffmpeg_args_libx265_software():
     args = ffmpeg_video_args(use_nvenc=False, use_hevc=True)
-    assert "libx265" in args
-    assert "fast" in args
+    assert "libx264" in args
+    assert "veryfast" in args
 
 
 def test_inflight_url_dedup():

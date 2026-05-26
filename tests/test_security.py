@@ -19,6 +19,7 @@ from bot import (
     send_instagram_image_rewrite,
     user_facing_download_error,
     user_facing_upload_error,
+    clean_env,
     _instagram_entry_has_video,
     _is_instagram_image_entry,
     INSTAGRAM_IMAGE_MARKER,
@@ -113,6 +114,20 @@ def test_sanitize_strips_error_prefix():
     raw = "ERROR: Something went wrong"
     result = _sanitize_error_line(raw)
     assert result == "Something went wrong"
+
+
+def test_clean_env_strips_injection_hooks(monkeypatch):
+    monkeypatch.setenv("PYTHONPATH", "/tmp/evil")
+    monkeypatch.setenv("PYTHONHOME", "/tmp/evil")
+    monkeypatch.setenv("LD_PRELOAD", "/tmp/evil.so")
+    monkeypatch.setenv("SSLKEYLOGFILE", "/tmp/keys.log")
+    monkeypatch.setenv("PATH", "/usr/bin")
+    env = clean_env()
+    assert "PYTHONPATH" not in env
+    assert "PYTHONHOME" not in env
+    assert "LD_PRELOAD" not in env
+    assert "SSLKEYLOGFILE" not in env
+    assert env["PATH"] == "/usr/bin"
 
 
 def test_filename_strips_path_traversal():
@@ -325,7 +340,7 @@ def test_reddit_media_url_extracts_direct_image():
 def test_reddit_api_url_normalizes_old_reddit_to_www():
     assert (
         reddit_api_url("https://old.reddit.com/r/aliens/comments/1tnlhwb/title/?share_id=abc")
-        == "https://www.reddit.com/r/aliens/comments/1tnlhwb/title.json?limit=1"
+        == "https://www.reddit.com/r/aliens/comments/1tnlhwb/title/.json?limit=1"
     )
 
 

@@ -20,7 +20,7 @@ from pathlib import Path
 from time import monotonic, time
 from urllib.parse import unquote, urlparse, urlunparse
 from dotenv import load_dotenv
-from cove_attribution import friend_post_content
+from cove_attribution import friend_post_content, friend_target_post_content
 
 load_dotenv()
 
@@ -853,9 +853,23 @@ def _check_bot_permissions(channel: discord.abc.GuildChannel, bot_member: discor
 
 
 def clean_env():
-    env = os.environ.copy()
-    env.pop("PYTHONHOME", None)
-    env.pop("PYTHONPATH", None)
+    blocked_prefixes = (
+        "LD_",
+        "PYTHON",
+        "SSLKEYLOGFILE",
+        "GIT_",
+    )
+    blocked_names = {
+        "DYLD_LIBRARY_PATH",
+        "DYLD_INSERT_LIBRARIES",
+        "FFREPORT",
+        "AV_LOG_FORCE_COLOR",
+    }
+    env = {
+        key: value
+        for key, value in os.environ.items()
+        if key not in blocked_names and not any(key.startswith(prefix) for prefix in blocked_prefixes)
+    }
     return env
 
 
@@ -1086,7 +1100,11 @@ async def run_subprocess(
         stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
         proc.kill()
-        stdout, _ = await proc.communicate()
+        try:
+            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+        except asyncio.TimeoutError:
+            output = ""
+            return 124, output + "\n[ERROR] Subprocess timed out and did not exit cleanly."
         output = stdout[:MAX_SUBPROCESS_OUTPUT_BYTES].decode(errors="replace")
         return 124, output + "\n[ERROR] Subprocess timed out."
     return proc.returncode, stdout[:MAX_SUBPROCESS_OUTPUT_BYTES].decode(errors="replace")
@@ -1207,6 +1225,7 @@ async def instagram_post_probe(url: str) -> tuple[bool, int | None]:
 
     cmd = [
         "yt-dlp",
+        "--no-config",
         "--dump-single-json",
         "--ignore-no-formats",
         "--skip-download",
@@ -1288,7 +1307,7 @@ async def _reddit_shortlink_location(url: str) -> str | None:
 
 def reddit_api_url(url: str) -> str:
     parsed = urlparse(url.rstrip("/").split("?")[0])
-    path = parsed.path.rstrip("/") + ".json"
+    path = parsed.path.rstrip("/") + "/.json"
     return urlunparse(("https", "www.reddit.com", path, "", "limit=1", ""))
 
 
@@ -1718,7 +1737,7 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
     else:
         fmt = FORMAT_FAST if FAST_SOURCE_MODE else FORMAT_DEFAULT
 
-    cmd = ["yt-dlp"]
+    cmd = ["yt-dlp", "--no-config"]
 
     if not is_reddit:
         cmd += ["--user-agent", YT_DLP_UA]
@@ -1930,7 +1949,7 @@ async def download_and_clip(
     else:
         fmt = FORMAT_FAST if FAST_SOURCE_MODE else FORMAT_DEFAULT
 
-    cmd = ["yt-dlp"]
+    cmd = ["yt-dlp", "--no-config"]
     if not is_reddit:
         cmd += ["--user-agent", YT_DLP_UA]
 
@@ -2045,7 +2064,7 @@ async def download_and_gif(url: str, guild: discord.Guild | None) -> tuple:
     else:
         fmt = FORMAT_FAST if FAST_SOURCE_MODE else FORMAT_DEFAULT
 
-    cmd = ["yt-dlp"]
+    cmd = ["yt-dlp", "--no-config"]
     if not is_reddit:
         cmd += ["--user-agent", YT_DLP_UA]
 
@@ -2160,7 +2179,7 @@ async def download_audio(url: str, guild: discord.Guild | None) -> tuple:
     try:
         output_template = str(Path(tmp) / "%(title)s.%(ext)s")
 
-        cmd = ["yt-dlp"]
+        cmd = ["yt-dlp", "--no-config"]
 
         if not is_reddit:
             cmd += ["--user-agent", YT_DLP_UA]
@@ -2615,6 +2634,7 @@ class CoveBot(discord.Client):
         author_id      = message.author.id
         friend_mode    = is_friend_server(message.guild)
         extra_mentions = extract_extra_mentions(message.content)
+        mention_names  = {user.id: user.display_name for user in message.mentions}
 
         async def on_success(filepath: str):
             try:
@@ -2623,8 +2643,11 @@ class CoveBot(discord.Client):
                 pass
 
             if friend_mode:
+                content = friend_target_post_content(extra_mentions, mention_names)
+                if not content:
+                    content = friend_post_content(display_name, extra_mentions)
                 sent = await message.channel.send(
-                    content=friend_post_content(display_name, extra_mentions),
+                    content=content,
                     file=discord.File(filepath),
                     allowed_mentions=discord.AllowedMentions(users=False, everyone=False, roles=False),
                 )

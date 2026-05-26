@@ -7,6 +7,7 @@ from bot import (
     extract_supported_url,
     instagram_is_image_post,
     process_url,
+    reddit_api_url,
     reddit_gif_url_from_log,
     reddit_image_url_from_log,
     reddit_image_url_from_post,
@@ -124,6 +125,10 @@ def test_filename_strips_null_bytes():
 
 def test_filename_preserves_normal_name():
     assert _sanitize_filename("My Cool Video.mp4") == "My Cool Video.mp4"
+
+
+def test_filename_preserves_extension_when_stem_ends_with_dot():
+    assert _sanitize_filename("What Are You..mp4") == "What Are You_.mp4"
 
 
 def test_filename_limits_length():
@@ -314,6 +319,13 @@ def test_reddit_media_url_extracts_direct_image():
             "https://www.reddit.com/media?url=https%3A%2F%2Fi.redd.it%2Fexample.jpg"
         )
         == "https://i.redd.it/example.jpg"
+    )
+
+
+def test_reddit_api_url_normalizes_old_reddit_to_www():
+    assert (
+        reddit_api_url("https://old.reddit.com/r/aliens/comments/1tnlhwb/title/?share_id=abc")
+        == "https://www.reddit.com/r/aliens/comments/1tnlhwb/title.json?limit=1"
     )
 
 

@@ -97,6 +97,7 @@ FFMPEG_TIMEOUT         = _require_int_env("FFMPEG_TIMEOUT", default="300")
 USE_ARIA2C_ENV         = _env_bool("USE_ARIA2C", "1")
 PERSISTENT_CACHE       = _env_bool("PERSISTENT_CACHE", "1")
 ADMIN_HEALTH_COMMAND   = _env_bool("ADMIN_HEALTH_COMMAND", "1")
+REDDIT_PRECHECK_TIMEOUT = _require_int_env("REDDIT_PRECHECK_TIMEOUT", allow_zero=False, default="3")
 
 JOB_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
 ENCODE_SEMAPHORE = asyncio.Semaphore(NVENC_MAX_SESSIONS)
@@ -636,13 +637,13 @@ def reddit_image_url_from_post(post: dict) -> str | None:
 async def reddit_image_url(url: str) -> str | None:
     if not REDDIT_POST_RE.search(url):
         return None
-    api_url = url.rstrip("/").split("?")[0] + ".json?limit=1"
+    api_url = reddit_api_url(url)
     try:
         session = _get_http_session()
         async with session.get(
             api_url,
             headers={"User-Agent": REDDIT_UA, "Accept": "application/json"},
-            timeout=aiohttp.ClientTimeout(total=8),
+            timeout=aiohttp.ClientTimeout(total=REDDIT_PRECHECK_TIMEOUT),
         ) as resp:
             content_type = resp.headers.get("Content-Type", "")
             if "json" not in content_type and "text" not in content_type:
@@ -1058,10 +1059,11 @@ def _sanitize_filename(name: str) -> str:
     if not name or not name.strip():
         return "video"
     name = name.replace("\x00", "").replace("/", "_").replace("\\", "_")
-    name = name.replace("..", "_")
     parts = name.rsplit(".", 1)
-    stem = parts[0][:190]
-    ext = parts[1] if len(parts) > 1 else ""
+    stem = parts[0].replace("..", "_")[:190]
+    if stem.endswith("."):
+        stem = f"{stem.rstrip('.')}_"[:190]
+    ext = parts[1].replace("..", "_") if len(parts) > 1 else ""
     if ext:
         return f"{stem}.{ext[:10]}"
     return stem if stem else "video"
@@ -1284,6 +1286,12 @@ async def _reddit_shortlink_location(url: str) -> str | None:
     return None
 
 
+def reddit_api_url(url: str) -> str:
+    parsed = urlparse(url.rstrip("/").split("?")[0])
+    path = parsed.path.rstrip("/") + ".json"
+    return urlunparse(("https", "www.reddit.com", path, "", "limit=1", ""))
+
+
 async def resolve_reddit_shortlink(url: str) -> str:
     """Resolve a Reddit /s/ share shortlink to the real /comments/ URL."""
     if not REDDIT_SHORT_RE.search(url):
@@ -1309,7 +1317,7 @@ async def resolve_reddit_shortlink(url: str) -> str:
 async def reddit_has_video(url: str) -> bool:
     if not REDDIT_POST_RE.search(url):
         return True
-    api_url = url.rstrip("/").split("?")[0] + ".json?limit=1"
+    api_url = reddit_api_url(url)
     cached = _cache_get(_reddit_has_video_cache, api_url)
     if cached is not None:
         log.info("[reddit-check] Cache hit for %s", api_url)
@@ -1319,7 +1327,7 @@ async def reddit_has_video(url: str) -> bool:
         async with session.get(
             api_url,
             headers={"User-Agent": REDDIT_UA, "Accept": "application/json"},
-            timeout=aiohttp.ClientTimeout(total=8),
+            timeout=aiohttp.ClientTimeout(total=REDDIT_PRECHECK_TIMEOUT),
         ) as resp:
             content_type = resp.headers.get("Content-Type", "")
             if "json" not in content_type and "text" not in content_type:

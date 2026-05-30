@@ -796,25 +796,24 @@ async def download_reddit_image(url: str, guild: discord.Guild | None) -> str | 
             shutil.rmtree(tmp, ignore_errors=True)
 
 
-async def send_reddit_image_repost(message: discord.Message, url: str) -> bool:
+async def send_reddit_image_repost(
+    message: discord.Message, url: str, content: str | None = None
+) -> "discord.Message | None":
     filepath = await download_reddit_image(url, message.guild)
     if not filepath:
-        return False
+        return None
     try:
         try:
-            await message.channel.send(file=discord.File(filepath))
+            sent = await message.channel.send(
+                content=content,
+                file=discord.File(filepath),
+                allowed_mentions=discord.AllowedMentions(users=False, everyone=False, roles=False),
+            )
         except discord.HTTPException as e:
             log.warning("[cove] Failed to repost Reddit image file: %s", e)
-            return False
+            return None
         log.info("[cove] Reposted Reddit image file for Discord upload: %s", url)
-        try:
-            await message.delete()
-            log.info("[cove] Deleted original Reddit image message after repost.")
-        except discord.Forbidden as e:
-            log.info("[cove] Could not delete original Reddit image message: %s", e)
-        except discord.HTTPException as e:
-            log.warning("[cove] Failed to delete original Reddit image message: %s", e)
-        return True
+        return sent
     finally:
         shutil.rmtree(str(Path(filepath).parent), ignore_errors=True)
 
@@ -2789,7 +2788,35 @@ class CoveBot(discord.Client):
                 return
             reddit_image_url_from_output = reddit_image_url_from_log(log_text)
             if reddit_image_url_from_output:
-                await send_reddit_image_repost(message, reddit_image_url_from_output)
+                if friend_mode:
+                    img_content = friend_target_post_content(extra_mentions, mention_names)
+                    if not img_content:
+                        img_content = friend_post_content(display_name, extra_mentions)
+                else:
+                    img_content = f"<@{author_id}> posted:"
+                    if extra_mentions:
+                        img_content += f" {extra_mentions}"
+                sent = await send_reddit_image_repost(message, reddit_image_url_from_output, img_content)
+                if sent is not None:
+                    if friend_mode:
+                        prune_friend_posts()
+                        _friend_posts[sent.id] = (author_id, monotonic() + FRIEND_POST_TTL_SECONDS)
+                        try:
+                            await message.delete()
+                        except discord.HTTPException:
+                            pass
+                    else:
+                        prune_deletable()
+                        _deletable[sent.id] = (author_id, monotonic() + DELETE_TTL_SECONDS)
+                        try:
+                            await sent.add_reaction("❌")
+                        except discord.HTTPException:
+                            pass
+                        if author_id in WHITELIST_IDS:
+                            try:
+                                await message.delete()
+                            except discord.HTTPException:
+                                pass
 
         async def on_too_big(duration_str: str):
             try:

@@ -1814,12 +1814,12 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
     output_template = str(Path(tmp) / "%(title)s.%(ext)s")
 
     if FAST_SOURCE_MODE:
-        log.info("[cove] Fast source mode enabled; preferring <=720p sources.")
+        log.info("[cove] Fast source mode enabled; applying site-specific fast selectors.")
 
     if is_reddit:
         fmt = FORMAT_REDDIT_FAST if FAST_SOURCE_MODE else FORMAT_REDDIT
     else:
-        fmt = FORMAT_FAST if FAST_SOURCE_MODE else FORMAT_DEFAULT
+        fmt = FORMAT_DEFAULT
         yt_fmt = youtube_quality_format(url)
         if yt_fmt is not None:
             fmt = yt_fmt
@@ -2034,7 +2034,7 @@ async def download_and_clip(
     if is_reddit:
         fmt = FORMAT_REDDIT_FAST if FAST_SOURCE_MODE else FORMAT_REDDIT
     else:
-        fmt = FORMAT_FAST if FAST_SOURCE_MODE else FORMAT_DEFAULT
+        fmt = FORMAT_DEFAULT
         yt_fmt = youtube_quality_format(url)
         if yt_fmt is not None:
             fmt = yt_fmt
@@ -2152,7 +2152,7 @@ async def download_and_gif(url: str, guild: discord.Guild | None) -> tuple:
     if is_reddit:
         fmt = FORMAT_REDDIT_FAST if FAST_SOURCE_MODE else FORMAT_REDDIT
     else:
-        fmt = FORMAT_FAST if FAST_SOURCE_MODE else FORMAT_DEFAULT
+        fmt = FORMAT_DEFAULT
         yt_fmt = youtube_quality_format(url)
         if yt_fmt is not None:
             fmt = yt_fmt

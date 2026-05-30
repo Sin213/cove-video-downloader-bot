@@ -36,6 +36,16 @@ unreliable in unattended runs). It's still available via `/download <youtube-url
 
 ---
 
+## YouTube download quality
+
+YouTube throttles its separate audio stream to about 30 KB/s for downloaders, so a high-resolution YouTube `/download` can take ~30s+ even for a short clip — the video stream is fine, the audio track is the bottleneck. This is a YouTube-side limit; more parallel connections cannot bypass it.
+
+Admins can pick the YouTube resolution at runtime with the **`/quality`** slash command (choices: 360p, 480p, 720p, 1080p). The choice is saved and survives restarts — no need to edit any file. Run `/quality` with no option to see the current setting.
+
+**360p is the fast one:** it uses a single progressive stream with no separate (throttled) audio track, so it downloads in a couple of seconds. 480p/720p/1080p are sharper but slower, because they pull the throttled audio stream. Pick whichever tradeoff you prefer.
+
+The starting quality on a fresh install is **1080p**; set the `YOUTUBE_QUALITY` env var (`360`, `480`, `720`, or `1080`) to change that default. It only affects YouTube video downloads; other sites and `/audio` are unaffected. No extra dependencies or services are required.
+
 ## Upload Limits
 
 Automatically adjusts based on your server's Nitro boost tier:

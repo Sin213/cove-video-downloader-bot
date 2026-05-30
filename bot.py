@@ -231,6 +231,30 @@ FORMAT_REDDIT_FAST = (
     "/best[protocol!=m3u8][protocol!=m3u8_native]"
 )
 
+# YouTube download quality. Controlled at runtime by the /quality admin command
+# (persisted to runtime_settings.json) and seeded on first run by the
+# YOUTUBE_QUALITY env var. 360p is a single progressive stream (itag 18) and is
+# fast; 480p/720p/1080p use separate video+audio streams which are sharper but
+# slower, because YouTube throttles its standalone audio stream (~30 KiB/s).
+# Applies to YouTube video downloads only; non-YouTube sites and /audio are
+# unaffected.
+YOUTUBE_DEFAULT_QUALITY = "1080"
+YOUTUBE_QUALITY_FORMATS = {
+    "360": "18/best[ext=mp4][height<=360]/best[height<=360]/best",
+    "480": (
+        "bestvideo[height<=480][ext=mp4]+bestaudio[ext=m4a]"
+        "/bestvideo[height<=480]+bestaudio/best[height<=480][ext=mp4]/best[height<=480]/best"
+    ),
+    "720": (
+        "bestvideo[height<=720][ext=mp4]+bestaudio[ext=m4a]"
+        "/bestvideo[height<=720]+bestaudio/best[height<=720][ext=mp4]/best[height<=720]/best"
+    ),
+    "1080": (
+        "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]"
+        "/bestvideo[height<=1080]+bestaudio/best[height<=1080]/best"
+    ),
+}
+
 _deletable: dict[int, tuple[int, float]] = {}
 _friend_posts: dict[int, tuple[int, float]] = {}
 _friend_neet_skip_users: dict[int, float] = {}
@@ -454,6 +478,66 @@ def hostname_for(url: str) -> str:
 
 def host_matches(host: str, domains: set[str]) -> bool:
     return host in domains or any(host.endswith(f".{d}") for d in domains)
+
+
+RUNTIME_SETTINGS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "runtime_settings.json")
+
+
+def _load_runtime_settings() -> dict:
+    try:
+        with open(RUNTIME_SETTINGS_PATH, encoding="utf-8") as f:
+            data = json.load(f)
+        return data if isinstance(data, dict) else {}
+    except (OSError, ValueError):
+        return {}
+
+
+def _save_runtime_settings(data: dict) -> None:
+    try:
+        tmp_path = RUNTIME_SETTINGS_PATH + ".tmp"
+        with open(tmp_path, "w", encoding="utf-8") as f:
+            json.dump(data, f)
+        os.replace(tmp_path, RUNTIME_SETTINGS_PATH)
+    except OSError as e:
+        log.warning("[cove] Could not persist runtime settings: %s", e)
+
+
+def _initial_youtube_quality() -> str:
+    env_q = os.getenv("YOUTUBE_QUALITY", "").strip()
+    if env_q in YOUTUBE_QUALITY_FORMATS:
+        return env_q
+    if _env_bool("YOUTUBE_FAST_360", "0"):  # backward compat with the old toggle
+        return "360"
+    return YOUTUBE_DEFAULT_QUALITY
+
+
+_youtube_quality = _load_runtime_settings().get("youtube_quality")
+if _youtube_quality not in YOUTUBE_QUALITY_FORMATS:
+    _youtube_quality = _initial_youtube_quality()
+
+
+def get_youtube_quality() -> str:
+    return _youtube_quality
+
+
+def set_youtube_quality(quality: str) -> None:
+    global _youtube_quality
+    if quality not in YOUTUBE_QUALITY_FORMATS:
+        raise ValueError(f"invalid YouTube quality: {quality!r}")
+    _youtube_quality = quality
+    settings = _load_runtime_settings()
+    settings["youtube_quality"] = quality
+    _save_runtime_settings(settings)
+
+
+def youtube_quality_format(url: str) -> str | None:
+    """Format selector for the current /quality setting, if url is a YouTube link.
+
+    Returns None for non-YouTube URLs so other sites keep their normal selection.
+    """
+    if not host_matches(hostname_for(url), {"youtube.com", "youtu.be"}):
+        return None
+    return YOUTUBE_QUALITY_FORMATS[get_youtube_quality()]
 
 
 def replace_hostname(url: str, new_host: str) -> str:
@@ -1736,6 +1820,9 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
         fmt = FORMAT_REDDIT_FAST if FAST_SOURCE_MODE else FORMAT_REDDIT
     else:
         fmt = FORMAT_FAST if FAST_SOURCE_MODE else FORMAT_DEFAULT
+        yt_fmt = youtube_quality_format(url)
+        if yt_fmt is not None:
+            fmt = yt_fmt
 
     cmd = ["yt-dlp", "--no-config"]
 
@@ -1948,6 +2035,9 @@ async def download_and_clip(
         fmt = FORMAT_REDDIT_FAST if FAST_SOURCE_MODE else FORMAT_REDDIT
     else:
         fmt = FORMAT_FAST if FAST_SOURCE_MODE else FORMAT_DEFAULT
+        yt_fmt = youtube_quality_format(url)
+        if yt_fmt is not None:
+            fmt = yt_fmt
 
     cmd = ["yt-dlp", "--no-config"]
     if not is_reddit:
@@ -2063,6 +2153,9 @@ async def download_and_gif(url: str, guild: discord.Guild | None) -> tuple:
         fmt = FORMAT_REDDIT_FAST if FAST_SOURCE_MODE else FORMAT_REDDIT
     else:
         fmt = FORMAT_FAST if FAST_SOURCE_MODE else FORMAT_DEFAULT
+        yt_fmt = youtube_quality_format(url)
+        if yt_fmt is not None:
+            fmt = yt_fmt
 
     cmd = ["yt-dlp", "--no-config"]
     if not is_reddit:
@@ -3063,6 +3156,45 @@ async def health_cmd(interaction: discord.Interaction):
 
 @health_cmd.error
 async def health_cmd_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    if isinstance(error, app_commands.CheckFailure):
+        try:
+            await interaction.response.send_message("\u274c Admins only.", ephemeral=True)
+        except (discord.errors.NotFound, discord.errors.HTTPException):
+            pass
+        return
+    raise error
+
+
+@client.tree.command(
+    name="quality",
+    description="Set the YouTube download quality (360p-1080p)",
+)
+@app_commands.default_permissions(administrator=True)
+@app_commands.check(is_admin_interaction)
+@app_commands.describe(resolution="Resolution to use, or leave empty to see the current setting")
+@app_commands.choices(resolution=[
+    app_commands.Choice(name="360p", value="360"),
+    app_commands.Choice(name="480p", value="480"),
+    app_commands.Choice(name="720p", value="720"),
+    app_commands.Choice(name="1080p", value="1080"),
+])
+async def quality_cmd(
+    interaction: discord.Interaction,
+    resolution: app_commands.Choice[str] | None = None,
+):
+    if resolution is None:
+        await interaction.response.send_message(
+            f"\U0001f3ac Current YouTube quality: **{get_youtube_quality()}p**.", ephemeral=True
+        )
+        return
+    await asyncio.to_thread(set_youtube_quality, resolution.value)
+    await interaction.response.send_message(
+        f"\u2705 YouTube quality set to **{resolution.name}**.", ephemeral=True
+    )
+
+
+@quality_cmd.error
+async def quality_cmd_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
     if isinstance(error, app_commands.CheckFailure):
         try:
             await interaction.response.send_message("\u274c Admins only.", ephemeral=True)

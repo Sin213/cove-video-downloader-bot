@@ -13,3 +13,4 @@ cache.db
 .git/
 .claude/
 AGENTS.md
+runtime_settings.json

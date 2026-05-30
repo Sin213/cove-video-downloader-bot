@@ -2,7 +2,9 @@ import os
 import tempfile
 import sqlite3
 
+import bot
 from bot import (
+    canonical_url_for_key,
     ffmpeg_video_args,
     duration_from_media_info,
     parse_timestamp,
@@ -18,11 +20,21 @@ from bot import (
     FFMPEG_TIMEOUT,
     GIF_MAX_DURATION,
     BOOST_TIER_LIMITS_MB,
+    MAX_QUEUED_JOBS,
+    PipelineTimer,
+    _job_queue_status,
+    _release_job_slot,
+    _try_reserve_job_slot,
+    should_use_aria2c,
 )
 
 
 def test_concurrent_jobs_at_least_old_default():
     assert MAX_CONCURRENT_JOBS >= 3
+
+
+def test_queued_jobs_default_positive():
+    assert MAX_QUEUED_JOBS >= 1
 
 
 def test_fragments_at_least_old_default():
@@ -70,6 +82,43 @@ def test_inflight_url_dedup():
 def test_inflight_key_normalizes_url_and_namespaces_kind():
     assert _inflight_key("video", "HTTPS://Example.com/Video/") == "video:https://example.com/video"
     assert _inflight_key("audio", "https://example.com/video") != _inflight_key("video", "https://example.com/video")
+
+
+def test_canonical_url_removes_tracking_params():
+    assert (
+        canonical_url_for_key("https://www.youtube.com/watch?v=abc&utm_source=x&si=share&t=10")
+        == "https://youtube.com/watch?v=abc&t=10"
+    )
+
+
+def test_canonical_url_normalizes_reddit_hosts():
+    assert (
+        canonical_url_for_key("https://old.reddit.com/r/Test/comments/ABC/?share_id=123")
+        == "https://reddit.com/r/test/comments/abc"
+    )
+
+
+def test_should_use_aria2c_is_site_aware(monkeypatch):
+    monkeypatch.setattr(bot, "USE_ARIA2C", True)
+    assert should_use_aria2c("https://youtube.com/watch?v=abc") is True
+    assert should_use_aria2c("https://www.instagram.com/p/abc/") is False
+    assert should_use_aria2c("https://old.reddit.com/r/test/comments/abc/title/") is False
+
+
+def test_job_queue_slot_helpers_release_cleanly():
+    while _try_reserve_job_slot():
+        pass
+    running, waiting = _job_queue_status()
+    assert running >= 0
+    assert waiting >= 0
+    _release_job_slot()
+    assert _try_reserve_job_slot() is True
+    for _ in range(MAX_CONCURRENT_JOBS + MAX_QUEUED_JOBS):
+        _release_job_slot()
+
+
+def test_pipeline_timer_mark_does_not_crash():
+    PipelineTimer("test").mark("phase")
 
 
 def test_persistent_cache_roundtrip():

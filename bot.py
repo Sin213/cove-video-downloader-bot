@@ -18,7 +18,7 @@ import sqlite3
 from html import unescape as html_unescape
 from pathlib import Path
 from time import monotonic, time
-from urllib.parse import unquote, urlparse, urlunparse
+from urllib.parse import parse_qsl, urlencode, unquote, urlparse, urlunparse
 from dotenv import load_dotenv
 from cove_attribution import friend_post_content, friend_target_post_content
 
@@ -77,6 +77,7 @@ MAX_DURATION_SECONDS = 600
 NYO_EMOJI            = "<:NYO:1312902725750624316>"
 
 MAX_CONCURRENT_JOBS    = _require_int_env("MAX_CONCURRENT_JOBS", default="8")
+MAX_QUEUED_JOBS        = _require_int_env("MAX_QUEUED_JOBS", default="16")
 SUBPROCESS_TIMEOUT     = _require_int_env("SUBPROCESS_TIMEOUT", default="900")
 DELETE_TTL_SECONDS     = _require_int_env("DELETE_TTL_SECONDS", default="21600")
 FRIEND_POST_TTL_SECONDS = _require_int_env("FRIEND_POST_TTL_SECONDS", default="86400")
@@ -268,13 +269,16 @@ _http_session: aiohttp.ClientSession | None = None
 # if a post is edited, so it gets a shorter TTL.
 _reddit_shortlink_cache: dict[str, tuple[str, float]] = {}
 _reddit_has_video_cache: dict[str, tuple[bool, float]] = {}
+_instagram_probe_cache: dict[str, tuple[tuple[bool, int | None], float]] = {}
 SHORTLINK_CACHE_TTL = 24 * 3600
 HAS_VIDEO_CACHE_TTL = 3600
+INSTAGRAM_PROBE_CACHE_TTL = 10 * 60
 CACHE_MAX_ENTRIES = 512
 MAX_HTTP_RESPONSE_BYTES = 1024 * 1024
 MAX_SUBPROCESS_OUTPUT_BYTES = 512 * 1024
 _ytdlp_version_status: tuple[bool, str] = (False, "yt-dlp version has not been checked yet.")
 _ytdlp_admin_warning_sent = False
+_queued_jobs = 0
 
 
 def _cache_get(cache: dict, key: str):
@@ -299,8 +303,39 @@ _inflight_urls: set[str] = set()
 SOURCE_MESSAGE_DEDUP_TTL_SECONDS = max(DELETE_TTL_SECONDS, FRIEND_POST_TTL_SECONDS)
 
 
+def canonical_url_for_key(url: str) -> str:
+    parsed = urlparse(url.strip())
+    scheme = parsed.scheme.lower() or "https"
+    host = (parsed.hostname or "").lower()
+    if host.startswith("www."):
+        host = host[4:]
+    if host == "old.reddit.com":
+        host = "reddit.com"
+    if host == "youtu.be":
+        path_parts = [part for part in parsed.path.split("/") if part]
+        if path_parts:
+            keep = [("v", path_parts[0])]
+        else:
+            keep = []
+        query = urlencode(keep)
+        return urlunparse(("https", "youtube.com", "/watch", "", query, ""))
+
+    path = re.sub(r"/+", "/", parsed.path).rstrip("/").lower()
+    query_items = []
+    allowed_query_keys = {"v", "list", "t", "start"}
+    for key, value in parse_qsl(parsed.query, keep_blank_values=False):
+        lowered = key.lower()
+        if lowered.startswith("utm_") or lowered in {"fbclid", "igsh", "si", "share_id"}:
+            continue
+        if host_matches(host, {"youtube.com"}) and lowered not in allowed_query_keys:
+            continue
+        query_items.append((lowered, value))
+    query = urlencode(query_items)
+    return urlunparse((scheme, host, path, "", query, ""))
+
+
 def _inflight_key(kind: str, url: str) -> str:
-    return f"{kind}:{url.lower().rstrip('/')}"
+    return f"{kind}:{canonical_url_for_key(url)}"
 
 CACHE_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache.db")
 
@@ -396,6 +431,43 @@ def spawn_tracked(coro) -> asyncio.Task:
     _active_tasks.add(task)
     task.add_done_callback(_on_task_done)
     return task
+
+
+class PipelineTimer:
+    def __init__(self, label: str):
+        self.label = label
+        self.started_at = monotonic()
+        self.last_at = self.started_at
+
+    def mark(self, phase: str) -> None:
+        now = monotonic()
+        log.info(
+            "[timing] %s phase=%s elapsed=%.2fs total=%.2fs",
+            self.label,
+            phase,
+            now - self.last_at,
+            now - self.started_at,
+        )
+        self.last_at = now
+
+
+def _try_reserve_job_slot() -> bool:
+    global _queued_jobs
+    if _queued_jobs >= MAX_CONCURRENT_JOBS + MAX_QUEUED_JOBS:
+        return False
+    _queued_jobs += 1
+    return True
+
+
+def _release_job_slot() -> None:
+    global _queued_jobs
+    _queued_jobs = max(0, _queued_jobs - 1)
+
+
+def _job_queue_status() -> tuple[int, int]:
+    running = max(0, min(MAX_CONCURRENT_JOBS, MAX_CONCURRENT_JOBS - JOB_SEMAPHORE._value))
+    waiting = max(0, _queued_jobs - running)
+    return running, waiting
 
 
 def prune_deletable() -> None:
@@ -813,6 +885,10 @@ async def send_reddit_image_repost(
             log.warning("[cove] Failed to repost Reddit image file: %s", e)
             return None
         log.info("[cove] Reposted Reddit image file for Discord upload: %s", url)
+        try:
+            await message.delete()
+        except discord.HTTPException:
+            pass
         return sent
     finally:
         shutil.rmtree(str(Path(filepath).parent), ignore_errors=True)
@@ -1010,6 +1086,15 @@ HAS_ARIA2C = _check_aria2c()
 USE_ARIA2C = HAS_ARIA2C and USE_ARIA2C_ENV
 
 
+def should_use_aria2c(url: str) -> bool:
+    if not USE_ARIA2C:
+        return False
+    host = hostname_for(url)
+    if host_matches(host, {"instagram.com", "reddit.com", "redd.it"}):
+        return False
+    return True
+
+
 def _command_version(command: str, args: list[str]) -> tuple[bool, str]:
     path = shutil.which(command)
     if not path:
@@ -1065,15 +1150,21 @@ def build_health_report() -> str:
         disk_message = f"failed: {e}"
     checks.append(("temp disk", disk_ok, disk_message))
 
-    checks.append(("aria2c", HAS_ARIA2C, "enabled" if USE_ARIA2C else "available but disabled" if HAS_ARIA2C else "missing"))
+    checks.append(("aria2c", HAS_ARIA2C, "enabled site-aware" if USE_ARIA2C else "available but disabled" if HAS_ARIA2C else "missing"))
     checks.append(("NVENC", USE_NVENC, "enabled" if USE_NVENC else "disabled"))
     checks.append(("cache", PERSISTENT_CACHE, "persistent cache enabled" if PERSISTENT_CACHE else "persistent cache disabled"))
+    running, waiting = _job_queue_status()
 
     lines = ["Cove health:"]
     for name, ok, message in checks:
         marker = "OK" if ok else "WARN"
         lines.append(f"{marker} {name}: {message}")
-    lines.append(f"jobs: max={MAX_CONCURRENT_JOBS}, fragments={YT_DLP_FRAGMENTS}, filesize={MAX_FILESIZE_MB}MB")
+    lines.append(
+        f"jobs: running={running}, waiting={waiting}, max={MAX_CONCURRENT_JOBS}, queued_max={MAX_QUEUED_JOBS}"
+    )
+    lines.append(
+        f"download: fragments={YT_DLP_FRAGMENTS}, filesize={MAX_FILESIZE_MB}MB, youtube_quality={get_youtube_quality()}"
+    )
     return "\n".join(lines)
 
 
@@ -1305,6 +1396,11 @@ def _load_ytdlp_json(output: str) -> dict | None:
 async def instagram_post_probe(url: str) -> tuple[bool, int | None]:
     if not _is_supported_instagram_post_url(url):
         return False, None
+    cache_key = canonical_url_for_key(url)
+    cached = _cache_get(_instagram_probe_cache, cache_key)
+    if cached is not None:
+        log.info("[instagram-probe] Cache hit for %s", cache_key)
+        return cached
 
     cmd = [
         "yt-dlp",
@@ -1329,12 +1425,18 @@ async def instagram_post_probe(url: str) -> tuple[bool, int | None]:
 
     playlist_index = _instagram_video_playlist_index(metadata)
     if playlist_index is not None or _instagram_entry_has_video(metadata):
-        return False, playlist_index
+        result = (False, playlist_index)
+        _cache_set(_instagram_probe_cache, cache_key, result, INSTAGRAM_PROBE_CACHE_TTL)
+        return result
 
     if _is_instagram_image_entry(metadata):
-        return True, None
+        result = (True, None)
+        _cache_set(_instagram_probe_cache, cache_key, result, INSTAGRAM_PROBE_CACHE_TTL)
+        return result
 
-    return False, None
+    result = (False, None)
+    _cache_set(_instagram_probe_cache, cache_key, result, INSTAGRAM_PROBE_CACHE_TTL)
+    return result
 
 
 async def instagram_is_image_post(url: str) -> bool:
@@ -1772,6 +1874,7 @@ async def convert_to_gif(
 
 async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
     _log = []
+    timer = PipelineTimer("video")
     target_mb   = get_target_mb(guild)
     target_size = int(target_mb * 1024 * 1024)
 
@@ -1781,6 +1884,7 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
     url = await resolve_arazu(url)
     url = await resolve_reddit_shortlink(url)
     _log.append(f"[INFO] URL: {url}")
+    timer.mark("resolve")
 
     is_reddit  = host_matches(hostname_for(url), {"reddit.com", "redd.it"})
     is_twitter = host_matches(hostname_for(url), TWITTER_DOMAINS)
@@ -1791,6 +1895,7 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
 
     if is_instagram:
         instagram_image_only, instagram_playlist_item = await instagram_post_probe(url)
+        timer.mark("instagram_probe")
         if instagram_image_only:
             log.info("[cove] Instagram image/text post detected, sending kkinstagram rewrite.")
             _log.append(INSTAGRAM_IMAGE_MARKER)
@@ -1799,8 +1904,10 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
 
     if is_reddit:
         has_video = await reddit_has_video(url)
+        timer.mark("reddit_probe")
         if not has_video:
             image_url = await reddit_image_url(url)
+            timer.mark("reddit_image_probe")
             if image_url:
                 log.info("[cove] Reddit post resolved to direct image, sending file repost.")
                 _log.append(REDDIT_IMAGE_MARKER)
@@ -1845,7 +1952,7 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
     else:
         cmd.append("--no-playlist")
 
-    if USE_ARIA2C:
+    if should_use_aria2c(url):
         cmd += ["--downloader", "aria2c", "--downloader-args", "aria2c:-x16 -s16 -k1M"]
 
     if COOKIES_EXIST:
@@ -1860,6 +1967,7 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
     _log.append("[INFO] Downloading...")
 
     code, out = await run_subprocess(cmd)
+    timer.mark("download")
 
     log.info("[yt-dlp] Exit code: %d", code)
     log.debug("[yt-dlp] Output:\n%s", out)
@@ -1958,6 +2066,7 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
     log.info("[cove] Downloaded: %s (%.1f MB)", safe_name, orig_mb)
 
     media_info = await get_media_info(src_path)
+    timer.mark("ffprobe")
     duration = duration_from_media_info(media_info)
     if duration and duration > MAX_DURATION_SECONDS:
         mins = int(duration // 60)
@@ -1974,6 +2083,7 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
         streamable = str(Path(tmp) / "streamable.mp4")
         if is_compatible:
             ok, remux_log = await remux_streamable_mp4(src_path, streamable)
+            timer.mark("remux")
             if ok and os.path.getsize(streamable) <= target_size:
                 _log.append(f"[INFO] Under {target_mb}MB — remuxed for Discord inline playback.")
                 return streamable, "\n".join(_log)
@@ -1985,9 +2095,11 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
     compressed = str(Path(tmp) / "compressed.mp4")
     _log.append(f"[INFO] Compressing to \u2264{target_mb}MB...")
     ok, result = await compress_to_target(src_path, compressed, target_mb, duration=duration)
+    timer.mark("compress")
 
     if ok:
         final_info = await get_media_info(compressed)
+        timer.mark("final_ffprobe")
         _, final_summary = discord_mp4_compatibility(final_info, compressed)
         log.info("[cove] Compressed media info: %s", final_summary)
         _log.append(f"[OK] Final size: {result}")
@@ -2006,6 +2118,7 @@ async def download_and_clip(
     url: str, guild: discord.Guild | None, start: float, end: float,
 ) -> tuple:
     _log = []
+    timer = PipelineTimer("clip")
     target_mb   = get_target_mb(guild)
     target_size = int(target_mb * 1024 * 1024)
     clip_duration = end - start
@@ -2016,12 +2129,14 @@ async def download_and_clip(
     url = await resolve_arazu(url)
     url = await resolve_reddit_shortlink(url)
     _log.append(f"[INFO] URL: {url}")
+    timer.mark("resolve")
 
     is_reddit  = host_matches(hostname_for(url), {"reddit.com", "redd.it"})
     is_twitter = host_matches(hostname_for(url), TWITTER_DOMAINS)
 
     if is_reddit:
         has_video = await reddit_has_video(url)
+        timer.mark("reddit_probe")
         if not has_video:
             _log.append("[NOVIDEO]")
             return None, "\n".join(_log)
@@ -2054,7 +2169,7 @@ async def download_and_clip(
         "-o", output_template,
     ]
 
-    if USE_ARIA2C:
+    if should_use_aria2c(url):
         cmd += ["--downloader", "aria2c", "--downloader-args", "aria2c:-x16 -s16 -k1M"]
 
     if COOKIES_EXIST:
@@ -2066,6 +2181,7 @@ async def download_and_clip(
     _log.append("[INFO] Downloading clip...")
 
     code, out = await run_subprocess(cmd)
+    timer.mark("download")
     log.info("[yt-dlp clip] Exit code: %d", code)
     _log.append(out.strip())
 
@@ -2111,7 +2227,8 @@ async def download_and_clip(
 
     compressed = str(Path(tmp) / "compressed.mp4")
     _log.append(f"[INFO] Compressing to ≤{target_mb:.0f}MB...")
-    ok, result = await compress_to_target(src_path, compressed, target_mb)
+    ok, result = await compress_to_target(src_path, compressed, target_mb, duration=clip_duration)
+    timer.mark("compress")
 
     if ok:
         _log.append(f"[OK] Final size: {result}")
@@ -2128,18 +2245,21 @@ async def download_and_clip(
 
 async def download_and_gif(url: str, guild: discord.Guild | None) -> tuple:
     _log = []
+    timer = PipelineTimer("gif")
     target_mb = get_target_mb(guild)
 
     url = resolve_fixup_url(url)
     url = await resolve_arazu(url)
     url = await resolve_reddit_shortlink(url)
     _log.append(f"[INFO] URL: {url}")
+    timer.mark("resolve")
 
     is_reddit  = host_matches(hostname_for(url), {"reddit.com", "redd.it"})
     is_twitter = host_matches(hostname_for(url), TWITTER_DOMAINS)
 
     if is_reddit:
         has_video = await reddit_has_video(url)
+        timer.mark("reddit_probe")
         if not has_video:
             _log.append("[NOVIDEO]")
             return None, "\n".join(_log)
@@ -2173,7 +2293,7 @@ async def download_and_gif(url: str, guild: discord.Guild | None) -> tuple:
         "-o", output_template,
     ]
 
-    if USE_ARIA2C:
+    if should_use_aria2c(url):
         cmd += ["--downloader", "aria2c", "--downloader-args", "aria2c:-x16 -s16 -k1M"]
 
     if COOKIES_EXIST:
@@ -2185,6 +2305,7 @@ async def download_and_gif(url: str, guild: discord.Guild | None) -> tuple:
     _log.append("[INFO] Downloading for GIF...")
 
     code, out = await run_subprocess(cmd)
+    timer.mark("download")
     log.info("[yt-dlp gif] Exit code: %d", code)
     _log.append(out.strip())
 
@@ -2232,6 +2353,7 @@ async def download_and_gif(url: str, guild: discord.Guild | None) -> tuple:
 
     _log.append("[INFO] Converting to GIF...")
     ok, result = await convert_to_gif(src_path, gif_path, target_mb)
+    timer.mark("convert")
 
     if ok:
         _log.append(f"[OK] GIF: {result}")
@@ -2244,6 +2366,7 @@ async def download_and_gif(url: str, guild: discord.Guild | None) -> tuple:
 
 async def download_audio(url: str, guild: discord.Guild | None) -> tuple:
     _log = []
+    timer = PipelineTimer("audio")
     target_mb = get_target_mb(guild)
     target_size = int(target_mb * 1024 * 1024)
 
@@ -2253,6 +2376,7 @@ async def download_audio(url: str, guild: discord.Guild | None) -> tuple:
     url = await resolve_arazu(url)
     url = await resolve_reddit_shortlink(url)
     _log.append(f"[INFO] URL: {url}")
+    timer.mark("resolve")
 
     is_reddit  = host_matches(hostname_for(url), {"reddit.com", "redd.it"})
     is_twitter = host_matches(hostname_for(url), TWITTER_DOMAINS)
@@ -2261,6 +2385,7 @@ async def download_audio(url: str, guild: discord.Guild | None) -> tuple:
 
     if is_reddit:
         has_video = await reddit_has_video(url)
+        timer.mark("reddit_probe")
         if not has_video:
             _log.append("[NOVIDEO]")
             return None, "\n".join(_log)
@@ -2290,7 +2415,7 @@ async def download_audio(url: str, guild: discord.Guild | None) -> tuple:
             "-o", output_template,
         ]
 
-        if USE_ARIA2C:
+        if should_use_aria2c(url):
             cmd += ["--downloader", "aria2c", "--downloader-args", "aria2c:-x16 -s16 -k1M"]
 
         if COOKIES_EXIST:
@@ -2305,6 +2430,7 @@ async def download_audio(url: str, guild: discord.Guild | None) -> tuple:
         _log.append("[INFO] Downloading audio...")
 
         code, out = await run_subprocess(cmd)
+        timer.mark("download")
 
         log.info("[yt-dlp audio] Exit code: %d", code)
         log.debug("[yt-dlp audio] Output:\n%s", out)
@@ -2396,6 +2522,9 @@ async def cleanup_tmp(filepath: str):
     await loop.run_in_executor(None, _cleanup_tmp_sync, filepath)
 
 
+BUSY_MESSAGE = "Cove is busy processing other downloads. Try again in a moment."
+
+
 async def process_url(
     url: str,
     guild: discord.Guild | None,
@@ -2411,7 +2540,14 @@ async def process_url(
             await on_no_video("")
         return
     _inflight_urls.add(canonical)
+    reserved_slot = False
     try:
+        if not _try_reserve_job_slot():
+            await on_error(BUSY_MESSAGE)
+            return
+        reserved_slot = True
+        running, waiting = _job_queue_status()
+        log.info("[queue] Accepted video job running=%d waiting=%d", running, waiting)
         async with JOB_SEMAPHORE:
             try:
                 filepath, log_text = await download_and_compress(url, guild)
@@ -2449,6 +2585,8 @@ async def process_url(
             finally:
                 await cleanup_tmp(filepath)
     finally:
+        if reserved_slot:
+            _release_job_slot()
         _inflight_urls.discard(canonical)
 
 
@@ -2467,7 +2605,14 @@ async def process_audio_url(
             await on_no_video()
         return
     _inflight_urls.add(canonical)
+    reserved_slot = False
     try:
+        if not _try_reserve_job_slot():
+            await on_error(BUSY_MESSAGE)
+            return
+        reserved_slot = True
+        running, waiting = _job_queue_status()
+        log.info("[queue] Accepted audio job running=%d waiting=%d", running, waiting)
         async with JOB_SEMAPHORE:
             try:
                 filepath, log_text = await download_audio(url, guild)
@@ -2505,6 +2650,8 @@ async def process_audio_url(
             finally:
                 await cleanup_tmp(filepath)
     finally:
+        if reserved_slot:
+            _release_job_slot()
         _inflight_urls.discard(canonical)
 
 
@@ -2524,7 +2671,14 @@ async def process_clip_url(
             await on_no_video()
         return
     _inflight_urls.add(canonical)
+    reserved_slot = False
     try:
+        if not _try_reserve_job_slot():
+            await on_error(BUSY_MESSAGE)
+            return
+        reserved_slot = True
+        running, waiting = _job_queue_status()
+        log.info("[queue] Accepted clip job running=%d waiting=%d", running, waiting)
         async with JOB_SEMAPHORE:
             try:
                 filepath, log_text = await download_and_clip(url, guild, start, end)
@@ -2553,6 +2707,8 @@ async def process_clip_url(
             finally:
                 await cleanup_tmp(filepath)
     finally:
+        if reserved_slot:
+            _release_job_slot()
         _inflight_urls.discard(canonical)
 
 
@@ -2570,7 +2726,14 @@ async def process_gif_url(
             await on_no_video()
         return
     _inflight_urls.add(canonical)
+    reserved_slot = False
     try:
+        if not _try_reserve_job_slot():
+            await on_error(BUSY_MESSAGE)
+            return
+        reserved_slot = True
+        running, waiting = _job_queue_status()
+        log.info("[queue] Accepted gif job running=%d waiting=%d", running, waiting)
         async with JOB_SEMAPHORE:
             try:
                 filepath, log_text = await download_and_gif(url, guild)
@@ -2604,6 +2767,8 @@ async def process_gif_url(
             finally:
                 await cleanup_tmp(filepath)
     finally:
+        if reserved_slot:
+            _release_job_slot()
         _inflight_urls.discard(canonical)
 
 
@@ -2801,10 +2966,6 @@ class CoveBot(discord.Client):
                     if friend_mode:
                         prune_friend_posts()
                         _friend_posts[sent.id] = (author_id, monotonic() + FRIEND_POST_TTL_SECONDS)
-                        try:
-                            await message.delete()
-                        except discord.HTTPException:
-                            pass
                     else:
                         prune_deletable()
                         _deletable[sent.id] = (author_id, monotonic() + DELETE_TTL_SECONDS)

@@ -39,7 +39,7 @@ class FakeChannel:
     async def send(self, content=None, **kwargs):
         if "file" in kwargs:
             self.events.append(("send_file", Path(kwargs["file"].fp.name).name))
-            return
+            return True
         self.events.append(("send", content))
         if self.send_error:
             raise self.send_error

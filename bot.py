@@ -125,6 +125,9 @@ AUTO_DOWNLOAD_DOMAINS = {
     "redd.it",
     "tiktok.com",
     "instagram.com",
+    "streamable.com",
+    "threads.net",
+    "vimeo.com",
     "arazu.io",
     "fixupx.com",
     "fxtwitter.com",
@@ -253,6 +256,14 @@ YOUTUBE_QUALITY_FORMATS = {
     "1080": (
         "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]"
         "/bestvideo[height<=1080]+bestaudio/best[height<=1080]/best"
+    ),
+    "1440": (
+        "bestvideo[height<=1440][ext=mp4]+bestaudio[ext=m4a]"
+        "/bestvideo[height<=1440]+bestaudio/best[height<=1440]/best"
+    ),
+    "2160": (
+        "bestvideo[height<=2160][ext=mp4]+bestaudio[ext=m4a]"
+        "/bestvideo[height<=2160]+bestaudio/best[height<=2160]/best"
     ),
 }
 
@@ -602,14 +613,15 @@ def set_youtube_quality(quality: str) -> None:
     _save_runtime_settings(settings)
 
 
-def youtube_quality_format(url: str) -> str | None:
-    """Format selector for the current /quality setting, if url is a YouTube link.
+def youtube_quality_format(url: str, quality: str | None = None) -> str | None:
+    """Format selector for the selected quality, if url is a YouTube link.
 
     Returns None for non-YouTube URLs so other sites keep their normal selection.
     """
     if not host_matches(hostname_for(url), {"youtube.com", "youtu.be"}):
         return None
-    return YOUTUBE_QUALITY_FORMATS[get_youtube_quality()]
+    selected_quality = quality or get_youtube_quality()
+    return YOUTUBE_QUALITY_FORMATS[selected_quality]
 
 
 def replace_hostname(url: str, new_host: str) -> str:
@@ -1872,7 +1884,11 @@ async def convert_to_gif(
 
 # ── Download pipeline ─────────────────────────────────────────────────────────
 
-async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
+async def download_and_compress(
+    url: str,
+    guild: discord.Guild | None,
+    youtube_quality: str | None = None,
+) -> tuple:
     _log = []
     timer = PipelineTimer("video")
     target_mb   = get_target_mb(guild)
@@ -1926,9 +1942,11 @@ async def download_and_compress(url: str, guild: discord.Guild | None) -> tuple:
         fmt = FORMAT_REDDIT_FAST if FAST_SOURCE_MODE else FORMAT_REDDIT
     else:
         fmt = FORMAT_DEFAULT
-        yt_fmt = youtube_quality_format(url)
+        yt_fmt = youtube_quality_format(url, youtube_quality)
         if yt_fmt is not None:
             fmt = yt_fmt
+            if youtube_quality is not None:
+                _log.append(f"[INFO] YouTube resolution override: {youtube_quality}p")
 
     cmd = ["yt-dlp", "--no-config"]
 
@@ -2525,6 +2543,14 @@ async def cleanup_tmp(filepath: str):
 BUSY_MESSAGE = "Cove is busy processing other downloads. Try again in a moment."
 
 
+def busy_message() -> str:
+    running, waiting = _job_queue_status()
+    return (
+        f"{BUSY_MESSAGE} "
+        f"Queue: {running}/{MAX_CONCURRENT_JOBS} running, {waiting}/{MAX_QUEUED_JOBS} waiting."
+    )
+
+
 async def process_url(
     url: str,
     guild: discord.Guild | None,
@@ -2532,6 +2558,7 @@ async def process_url(
     on_error,
     on_too_big=None,
     on_no_video=None,
+    youtube_quality: str | None = None,
 ):
     canonical = _inflight_key("video", url)
     if canonical in _inflight_urls:
@@ -2543,14 +2570,14 @@ async def process_url(
     reserved_slot = False
     try:
         if not _try_reserve_job_slot():
-            await on_error(BUSY_MESSAGE)
+            await on_error(busy_message())
             return
         reserved_slot = True
         running, waiting = _job_queue_status()
         log.info("[queue] Accepted video job running=%d waiting=%d", running, waiting)
         async with JOB_SEMAPHORE:
             try:
-                filepath, log_text = await download_and_compress(url, guild)
+                filepath, log_text = await download_and_compress(url, guild, youtube_quality)
             except Exception as e:
                 log.exception("Unhandled exception during process_url")
                 await on_error(f"Unexpected error: {e}")
@@ -3046,8 +3073,23 @@ client = CoveBot()
     name="download",
     description="Download and compress a video from any supported site",
 )
-@app_commands.describe(url="The video URL to download")
-async def download_cmd(interaction: discord.Interaction, url: str):
+@app_commands.describe(
+    url="The video URL to download",
+    resolution="YouTube resolution for this download only",
+)
+@app_commands.choices(resolution=[
+    app_commands.Choice(name="360p", value="360"),
+    app_commands.Choice(name="480p", value="480"),
+    app_commands.Choice(name="720p", value="720"),
+    app_commands.Choice(name="1080p", value="1080"),
+    app_commands.Choice(name="1440p", value="1440"),
+    app_commands.Choice(name="2160p", value="2160"),
+])
+async def download_cmd(
+    interaction: discord.Interaction,
+    url: str,
+    resolution: app_commands.Choice[str] | None = None,
+):
     ok, err = await validate_manual_url(url)
     if not ok:
         try:
@@ -3103,6 +3145,7 @@ async def download_cmd(interaction: discord.Interaction, url: str):
         on_error,
         on_too_big=on_too_big,
         on_no_video=on_no_video,
+        youtube_quality=resolution.value if resolution else None,
     )
 
 
@@ -3322,6 +3365,40 @@ async def gif_cmd(interaction: discord.Interaction, url: str):
         on_error,
         on_no_video=on_no_video,
     )
+
+
+@client.tree.command(
+    name="status",
+    description="Show Cove queue status",
+)
+async def status_cmd(interaction: discord.Interaction):
+    running, waiting = _job_queue_status()
+    await interaction.response.send_message(
+        (
+            f"Running: **{running}/{MAX_CONCURRENT_JOBS}**\n"
+            f"Waiting: **{waiting}/{MAX_QUEUED_JOBS}**"
+        ),
+        ephemeral=True,
+    )
+
+
+@client.tree.command(
+    name="help",
+    description="Show Cove commands",
+)
+async def help_cmd(interaction: discord.Interaction):
+    commands = [
+        "`/download url [resolution]` - download and compress a video",
+        "`/audio url` - extract MP3 audio",
+        "`/clip url start end` - download a clip",
+        "`/gif url` - convert a short video to GIF",
+        "`/status` - show queue status",
+        "`/quality [resolution]` - admin YouTube default quality",
+        "`/health` - admin runtime self-check",
+    ]
+    if FRIEND_GUILD_ID != 0 and is_friend_server(interaction.guild):
+        commands.append("`/neet` - friend-server cooldown")
+    await interaction.response.send_message("\n".join(commands), ephemeral=True)
 
 
 @client.tree.command(

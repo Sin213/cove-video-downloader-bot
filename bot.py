@@ -1102,7 +1102,7 @@ def should_use_aria2c(url: str) -> bool:
     if not USE_ARIA2C:
         return False
     host = hostname_for(url)
-    if host_matches(host, {"instagram.com", "reddit.com", "redd.it"}):
+    if host_matches(host, {"instagram.com", "reddit.com", "redd.it", "youtube.com", "youtu.be"}):
         return False
     return True
 
@@ -2106,9 +2106,8 @@ async def download_and_compress(
                 _log.append(f"[INFO] Under {target_mb}MB — remuxed for Discord inline playback.")
                 return streamable, "\n".join(_log)
             log.warning("[ffmpeg] Faststart remux failed or exceeded target: %s", remux_log[-1000:])
-            _log.append(f"[INFO] Under {target_mb}MB but faststart remux failed — re-encoding.")
-        else:
-            _log.append(f"[INFO] Under {target_mb}MB but not Discord-compatible — re-encoding.")
+        _log.append(f"[INFO] Under {target_mb}MB — uploading as-is.")
+        return src_path, "\n".join(_log)
 
     compressed = str(Path(tmp) / "compressed.mp4")
     _log.append(f"[INFO] Compressing to \u2264{target_mb}MB...")

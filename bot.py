@@ -15,6 +15,7 @@ import sys
 import tempfile
 import json
 import sqlite3
+from http.cookiejar import MozillaCookieJar
 from html import unescape as html_unescape
 from pathlib import Path
 from time import monotonic, time
@@ -79,6 +80,7 @@ NYO_EMOJI            = "<:NYO:1312902725750624316>"
 MAX_CONCURRENT_JOBS    = _require_int_env("MAX_CONCURRENT_JOBS", default="8")
 MAX_QUEUED_JOBS        = _require_int_env("MAX_QUEUED_JOBS", default="16")
 SUBPROCESS_TIMEOUT     = _require_int_env("SUBPROCESS_TIMEOUT", default="900")
+REDDIT_YTDLP_TIMEOUT   = _require_int_env("REDDIT_YTDLP_TIMEOUT", allow_zero=False, default="45")
 DELETE_TTL_SECONDS     = _require_int_env("DELETE_TTL_SECONDS", default="21600")
 FRIEND_POST_TTL_SECONDS = _require_int_env("FRIEND_POST_TTL_SECONDS", default="86400")
 YT_DLP_FRAGMENTS       = _require_int_env("YT_DLP_FRAGMENTS", default="16")
@@ -187,6 +189,7 @@ NO_VIDEO_PHRASES = (
 INSTAGRAM_IMAGE_MARKER = "[INSTAGRAM_IMAGE]"
 REDDIT_GIF_MARKER = "[REDDIT_GIF]"
 REDDIT_IMAGE_MARKER = "[REDDIT_IMAGE]"
+TWITTER_IMAGE_MARKER = "[TWITTER_IMAGE]"
 INSTAGRAM_IMAGE_EXTENSIONS = {"jpg", "jpeg", "png", "webp", "heic"}
 INSTAGRAM_VIDEO_EXTENSIONS = {"mp4", "m4v", "mov", "webm"}
 REDDIT_IMAGE_EXTENSIONS = {"jpg", "jpeg", "png", "webp"}
@@ -274,6 +277,7 @@ _processed_source_messages: dict[int, float] = {}
 _user_request_times: dict[int, list[float]] = {}
 _active_tasks: set[asyncio.Task] = set()
 _http_session: aiohttp.ClientSession | None = None
+_reddit_cookie_header_cache: tuple[float, str | None] | None = None
 
 # (value, expires_at_monotonic) — TTL caches for Reddit pre-checks.
 # Shortlinks resolve deterministically and never change; has_video can shift
@@ -281,9 +285,12 @@ _http_session: aiohttp.ClientSession | None = None
 _reddit_shortlink_cache: dict[str, tuple[str, float]] = {}
 _reddit_has_video_cache: dict[str, tuple[bool, float]] = {}
 _instagram_probe_cache: dict[str, tuple[tuple[bool, int | None], float]] = {}
+_twitter_probe_cache: dict[str, tuple[bool, float]] = {}
 SHORTLINK_CACHE_TTL = 24 * 3600
 HAS_VIDEO_CACHE_TTL = 3600
 INSTAGRAM_PROBE_CACHE_TTL = 10 * 60
+TWITTER_PROBE_CACHE_TTL = 10 * 60
+FXTWITTER_API_TIMEOUT = 8
 CACHE_MAX_ENTRIES = 512
 MAX_HTTP_RESPONSE_BYTES = 1024 * 1024
 MAX_SUBPROCESS_OUTPUT_BYTES = 512 * 1024
@@ -419,6 +426,52 @@ def _get_http_session() -> aiohttp.ClientSession:
             connector=aiohttp.TCPConnector(limit=30, limit_per_host=10),
         )
     return _http_session
+
+
+def reddit_cookie_header() -> str | None:
+    global _reddit_cookie_header_cache
+    if not COOKIES_EXIST:
+        return None
+    try:
+        mtime = os.path.getmtime(COOKIES_FILE)
+        if _reddit_cookie_header_cache and _reddit_cookie_header_cache[0] == mtime:
+            return _reddit_cookie_header_cache[1]
+
+        jar = MozillaCookieJar(COOKIES_FILE)
+        jar.load(ignore_discard=True, ignore_expires=True)
+        values = []
+        for cookie in jar:
+            domain = cookie.domain.lower().lstrip(".")
+            if domain.startswith("#httponly_"):
+                domain = domain[len("#httponly_"):]
+            if domain == "reddit.com" or domain.endswith(".reddit.com"):
+                values.append(f"{cookie.name}={cookie.value}")
+        header = "; ".join(values) or None
+        _reddit_cookie_header_cache = (mtime, header)
+        return header
+    except Exception as e:
+        log.warning("[reddit] Could not load cookies.txt for API request: %s", e)
+        _reddit_cookie_header_cache = None
+        return None
+
+
+def reddit_json_headers() -> dict[str, str]:
+    headers = {"User-Agent": REDDIT_UA, "Accept": "application/json"}
+    cookie_header = reddit_cookie_header()
+    if cookie_header:
+        headers["Cookie"] = cookie_header
+    return headers
+
+
+async def read_limited_response(resp: aiohttp.ClientResponse, limit: int) -> bytes:
+    chunks = []
+    total = 0
+    async for chunk in resp.content.iter_chunked(64 * 1024):
+        total += len(chunk)
+        if total > limit:
+            raise ValueError(f"response exceeded {limit} bytes")
+        chunks.append(chunk)
+    return b"".join(chunks)
 
 
 async def _close_http_session() -> None:
@@ -665,6 +718,14 @@ async def send_instagram_image_rewrite(message: discord.Message, url: str, log_t
     return True
 
 
+def twitter_fxtwitter_url_from_log(log_text: str) -> str | None:
+    lines = log_text.splitlines()
+    for i, line in enumerate(lines):
+        if line.strip() == TWITTER_IMAGE_MARKER and i + 1 < len(lines):
+            return lines[i + 1].strip()
+    return None
+
+
 def reddit_media_url_from_text(text: str, extensions: set[str]) -> str | None:
     for match in URL_RE.finditer(unquote(text)):
         url = match.group(0).rstrip(").,>")
@@ -810,14 +871,14 @@ async def reddit_image_url(url: str) -> str | None:
         session = _get_http_session()
         async with session.get(
             api_url,
-            headers={"User-Agent": REDDIT_UA, "Accept": "application/json"},
+            headers=reddit_json_headers(),
             timeout=aiohttp.ClientTimeout(total=REDDIT_PRECHECK_TIMEOUT),
         ) as resp:
             content_type = resp.headers.get("Content-Type", "")
             if "json" not in content_type and "text" not in content_type:
                 log.warning("[security] Reddit image API returned unexpected Content-Type: %s", content_type)
                 return None
-            body = await resp.content.read(MAX_HTTP_RESPONSE_BYTES)
+            body = await read_limited_response(resp, MAX_HTTP_RESPONSE_BYTES)
             raw = body.decode(errors="replace")
         data = json.loads(raw)
         post = data[0]["data"]["children"][0]["data"]
@@ -1296,6 +1357,15 @@ async def run_subprocess(
     return proc.returncode, stdout[:MAX_SUBPROCESS_OUTPUT_BYTES].decode(errors="replace")
 
 
+async def run_subprocess_timeout(cmd: list[str], timeout: int) -> tuple[int, str]:
+    try:
+        return await run_subprocess(cmd, timeout)
+    except TypeError as e:
+        if "positional argument" not in str(e) and "unexpected keyword" not in str(e):
+            raise
+        return await run_subprocess(cmd)
+
+
 # ── Instagram helpers ────────────────────────────────────────────────────────
 
 def _is_instagram_image_entry(entry: dict) -> bool:
@@ -1456,6 +1526,45 @@ async def instagram_is_image_post(url: str) -> bool:
     return image_only
 
 
+# ── Twitter/X helpers ────────────────────────────────────────────────────────
+
+_TWITTER_STATUS_RE = re.compile(r"(?:twitter\.com|x\.com)/[^/]+/status/(\d+)")
+
+
+async def twitter_has_video(url: str) -> bool:
+    m = _TWITTER_STATUS_RE.search(url)
+    if not m:
+        return True
+    tweet_id = m.group(1)
+    cached = _cache_get(_twitter_probe_cache, tweet_id)
+    if cached is not None:
+        log.info("[twitter-probe] Cache hit for %s", tweet_id)
+        return cached
+    try:
+        session = _get_http_session()
+        api_url = f"https://api.fxtwitter.com/status/{tweet_id}"
+        async with session.get(
+            api_url,
+            timeout=aiohttp.ClientTimeout(total=FXTWITTER_API_TIMEOUT),
+        ) as resp:
+            if resp.status != 200:
+                log.warning("[twitter-probe] fxtwitter API returned %d for %s", resp.status, tweet_id)
+                return True
+            body = await read_limited_response(resp, MAX_HTTP_RESPONSE_BYTES)
+            data = json.loads(body.decode(errors="replace"))
+        tweet = data.get("tweet")
+        if not tweet:
+            return True
+        media = tweet.get("media") or {}
+        has_vid = bool(media.get("videos"))
+        log.info("[twitter-probe] tweet %s has_video=%s", tweet_id, has_vid)
+        _cache_set(_twitter_probe_cache, tweet_id, has_vid, TWITTER_PROBE_CACHE_TTL)
+        return has_vid
+    except Exception as e:
+        log.warning("[twitter-probe] Probe failed (%s) — letting yt-dlp try anyway.", e)
+        return True
+
+
 # ── Reddit helpers ────────────────────────────────────────────────────────────
 
 async def _reddit_shortlink_location(url: str) -> str | None:
@@ -1542,14 +1651,14 @@ async def reddit_has_video(url: str) -> bool:
         session = _get_http_session()
         async with session.get(
             api_url,
-            headers={"User-Agent": REDDIT_UA, "Accept": "application/json"},
+            headers=reddit_json_headers(),
             timeout=aiohttp.ClientTimeout(total=REDDIT_PRECHECK_TIMEOUT),
         ) as resp:
             content_type = resp.headers.get("Content-Type", "")
             if "json" not in content_type and "text" not in content_type:
                 log.warning("[security] Reddit API returned unexpected Content-Type: %s", content_type)
                 return True
-            body = await resp.content.read(MAX_HTTP_RESPONSE_BYTES)
+            body = await read_limited_response(resp, MAX_HTTP_RESPONSE_BYTES)
             raw = body.decode(errors="replace")
         data = json.loads(raw)
         post = data[0]["data"]["children"][0]["data"]
@@ -1931,6 +2040,17 @@ async def download_and_compress(
             _log.append("[NOVIDEO]")
             return None, "\n".join(_log)
 
+    if is_twitter:
+        has_vid = await twitter_has_video(url)
+        timer.mark("twitter_probe")
+        if not has_vid:
+            fx_url = replace_hostname(url, "fxtwitter.com")
+            log.info("[cove] Twitter image-only post detected, sending fxtwitter rewrite.")
+            _log.append(TWITTER_IMAGE_MARKER)
+            _log.append(fx_url)
+            _log.append("[NOVIDEO]")
+            return None, "\n".join(_log)
+
     tmp = tempfile.mkdtemp(prefix="cove_", dir=TMP_BASE)
     os.chmod(tmp, 0o700)
     output_template = str(Path(tmp) / "%(title)s.%(ext)s")
@@ -1948,10 +2068,7 @@ async def download_and_compress(
             if youtube_quality is not None:
                 _log.append(f"[INFO] YouTube resolution override: {youtube_quality}p")
 
-    cmd = ["yt-dlp", "--no-config"]
-
-    if not is_reddit:
-        cmd += ["--user-agent", YT_DLP_UA]
+    cmd = ["yt-dlp", "--no-config", "--user-agent", YT_DLP_UA]
 
     cmd += [
         "-f", fmt,
@@ -1972,6 +2089,8 @@ async def download_and_compress(
 
     if should_use_aria2c(url):
         cmd += ["--downloader", "aria2c", "--downloader-args", "aria2c:-x16 -s16 -k1M"]
+    elif is_reddit:
+        cmd += ["--http-chunk-size", "10M"]
 
     if COOKIES_EXIST:
         cmd.extend(["--cookies", COOKIES_FILE])
@@ -1984,7 +2103,7 @@ async def download_and_compress(
     log.info("[yt-dlp] Running: %s", ' '.join(cmd))
     _log.append("[INFO] Downloading...")
 
-    code, out = await run_subprocess(cmd)
+    code, out = await run_subprocess_timeout(cmd, REDDIT_YTDLP_TIMEOUT if is_reddit else SUBPROCESS_TIMEOUT)
     timer.mark("download")
 
     log.info("[yt-dlp] Exit code: %d", code)
@@ -2170,9 +2289,7 @@ async def download_and_clip(
         if yt_fmt is not None:
             fmt = yt_fmt
 
-    cmd = ["yt-dlp", "--no-config"]
-    if not is_reddit:
-        cmd += ["--user-agent", YT_DLP_UA]
+    cmd = ["yt-dlp", "--no-config", "--user-agent", YT_DLP_UA]
 
     cmd += [
         "-f", fmt,
@@ -2293,9 +2410,7 @@ async def download_and_gif(url: str, guild: discord.Guild | None) -> tuple:
         if yt_fmt is not None:
             fmt = yt_fmt
 
-    cmd = ["yt-dlp", "--no-config"]
-    if not is_reddit:
-        cmd += ["--user-agent", YT_DLP_UA]
+    cmd = ["yt-dlp", "--no-config", "--user-agent", YT_DLP_UA]
 
     cmd += [
         "-f", fmt,
@@ -2413,10 +2528,7 @@ async def download_audio(url: str, guild: discord.Guild | None) -> tuple:
     try:
         output_template = str(Path(tmp) / "%(title)s.%(ext)s")
 
-        cmd = ["yt-dlp", "--no-config"]
-
-        if not is_reddit:
-            cmd += ["--user-agent", YT_DLP_UA]
+        cmd = ["yt-dlp", "--no-config", "--user-agent", YT_DLP_UA]
 
         cmd += [
             "-f", "bestaudio/best",
@@ -2808,16 +2920,23 @@ class CoveBot(discord.Client):
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
 
+    async def _sync_tree_with_timeout(self, guild: discord.Object, label: str) -> None:
+        try:
+            await asyncio.wait_for(self.tree.sync(guild=guild), timeout=15)
+            log.info("[Cove] %s slash commands synced to guild %d", label, guild.id)
+        except TimeoutError:
+            log.warning("[Cove] %s slash command sync timed out; continuing startup.", label)
+        except Exception as e:
+            log.warning("[Cove] %s slash command sync failed; continuing startup: %s", label, e)
+
     async def setup_hook(self):
         await asyncio.get_running_loop().run_in_executor(None, _sweep_orphaned_tmpdirs)
         guild = discord.Object(id=GUILD_ID)
         self.tree.copy_global_to(guild=guild)
-        await self.tree.sync(guild=guild)
-        log.info("[Cove] Slash commands synced to guild %d", GUILD_ID)
+        await self._sync_tree_with_timeout(guild, "Primary")
         if FRIEND_GUILD_ID != 0:
             friend_guild = discord.Object(id=FRIEND_GUILD_ID)
-            await self.tree.sync(guild=friend_guild)
-            log.info("[Cove] Friend slash commands synced to guild %d", FRIEND_GUILD_ID)
+            await self._sync_tree_with_timeout(friend_guild, "Friend")
 
     async def on_ready(self):
         global _ytdlp_admin_warning_sent
@@ -2972,6 +3091,18 @@ class CoveBot(discord.Client):
             except discord.HTTPException:
                 pass
             if await send_instagram_image_rewrite(message, url, log_text):
+                return
+            fx_url = twitter_fxtwitter_url_from_log(log_text)
+            if fx_url:
+                try:
+                    await message.channel.send(fx_url)
+                except discord.HTTPException as e:
+                    log.warning("[cove] Failed to send fxtwitter rewrite: %s", e)
+                else:
+                    try:
+                        await message.delete()
+                    except discord.HTTPException:
+                        pass
                 return
             reddit_gif_url = reddit_gif_url_from_log(log_text)
             if reddit_gif_url:
@@ -3130,6 +3261,10 @@ async def download_cmd(
         await interaction.followup.send(f"\u274c {msg}")
 
     async def on_no_video(log_text: str = ""):
+        fx_url = twitter_fxtwitter_url_from_log(log_text)
+        if fx_url:
+            await interaction.followup.send(fx_url)
+            return
         await interaction.followup.send("\u274c No video found at that link.")
 
     async def on_too_big(duration_str: str):

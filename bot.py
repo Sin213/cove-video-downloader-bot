@@ -190,6 +190,7 @@ INSTAGRAM_IMAGE_MARKER = "[INSTAGRAM_IMAGE]"
 REDDIT_GIF_MARKER = "[REDDIT_GIF]"
 REDDIT_IMAGE_MARKER = "[REDDIT_IMAGE]"
 TWITTER_IMAGE_MARKER = "[TWITTER_IMAGE]"
+REDDIT_VXREDDIT_MARKER = "[REDDIT_VXREDDIT]"
 INSTAGRAM_IMAGE_EXTENSIONS = {"jpg", "jpeg", "png", "webp", "heic"}
 INSTAGRAM_VIDEO_EXTENSIONS = {"mp4", "m4v", "mov", "webm"}
 REDDIT_IMAGE_EXTENSIONS = {"jpg", "jpeg", "png", "webp"}
@@ -722,6 +723,14 @@ def twitter_fxtwitter_url_from_log(log_text: str) -> str | None:
     lines = log_text.splitlines()
     for i, line in enumerate(lines):
         if line.strip() == TWITTER_IMAGE_MARKER and i + 1 < len(lines):
+            return lines[i + 1].strip()
+    return None
+
+
+def reddit_vxreddit_url_from_log(log_text: str) -> str | None:
+    lines = log_text.splitlines()
+    for i, line in enumerate(lines):
+        if line.strip() == REDDIT_VXREDDIT_MARKER and i + 1 < len(lines):
             return lines[i + 1].strip()
     return None
 
@@ -2028,15 +2037,20 @@ async def download_and_compress(
             return None, "\n".join(_log)
 
     if is_reddit:
+        if is_reddit_short:
+            vx_url = replace_hostname(url, "vxreddit.com")
+            log.info("[cove] Reddit shortlink unresolved, sending vxreddit rewrite: %s", vx_url)
+            _log.append(REDDIT_VXREDDIT_MARKER)
+            _log.append(vx_url)
+            _log.append("[NOVIDEO]")
+            return None, "\n".join(_log)
         has_video = await reddit_has_video(url)
         timer.mark("reddit_probe")
         if not has_video:
-            image_url = await reddit_image_url(url)
-            timer.mark("reddit_image_probe")
-            if image_url:
-                log.info("[cove] Reddit post resolved to direct image, sending file repost.")
-                _log.append(REDDIT_IMAGE_MARKER)
-                _log.append(image_url)
+            vx_url = replace_hostname(url, "vxreddit.com")
+            log.info("[cove] Reddit non-video post detected, sending vxreddit rewrite: %s", vx_url)
+            _log.append(REDDIT_VXREDDIT_MARKER)
+            _log.append(vx_url)
             _log.append("[NOVIDEO]")
             return None, "\n".join(_log)
 
@@ -3104,6 +3118,18 @@ class CoveBot(discord.Client):
                     except discord.HTTPException:
                         pass
                 return
+            vx_url = reddit_vxreddit_url_from_log(log_text)
+            if vx_url:
+                try:
+                    await message.channel.send(vx_url)
+                except discord.HTTPException as e:
+                    log.warning("[cove] Failed to send vxreddit rewrite: %s", e)
+                else:
+                    try:
+                        await message.delete()
+                    except discord.HTTPException:
+                        pass
+                return
             reddit_gif_url = reddit_gif_url_from_log(log_text)
             if reddit_gif_url:
                 await send_reddit_gif_repost(message, reddit_gif_url)
@@ -3264,6 +3290,10 @@ async def download_cmd(
         fx_url = twitter_fxtwitter_url_from_log(log_text)
         if fx_url:
             await interaction.followup.send(fx_url)
+            return
+        vx_url = reddit_vxreddit_url_from_log(log_text)
+        if vx_url:
+            await interaction.followup.send(vx_url)
             return
         await interaction.followup.send("\u274c No video found at that link.")
 

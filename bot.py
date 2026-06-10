@@ -186,6 +186,36 @@ NO_VIDEO_PHRASES = (
     "Unable to download webpage",
 )
 
+INSTAGRAM_UNAVAILABLE_PHRASES = (
+    "empty media response",
+    "this content isn't available",
+    "content is not available",
+    "content unavailable",
+    "not available",
+    "unavailable",
+    "private",
+    "login required",
+    "you need to log in",
+    "sign in",
+    "restricted",
+    "age-restricted",
+    "under 13",
+    "has set limits",
+    "was deleted",
+    "has been deleted",
+    "post may have been deleted",
+    "account may have been banned",
+    "HTTP Error 403",
+    "HTTP Error 404",
+)
+
+INSTAGRAM_IMAGE_NO_VIDEO_PHRASES = (
+    "no video formats found",
+    "no video could be found",
+    "is not a video",
+    "does not have a video",
+)
+
 INSTAGRAM_IMAGE_MARKER = "[INSTAGRAM_IMAGE]"
 REDDIT_GIF_MARKER = "[REDDIT_GIF]"
 REDDIT_IMAGE_MARKER = "[REDDIT_IMAGE]"
@@ -285,13 +315,15 @@ _reddit_cookie_header_cache: tuple[float, str | None] | None = None
 # if a post is edited, so it gets a shorter TTL.
 _reddit_shortlink_cache: dict[str, tuple[str, float]] = {}
 _reddit_has_video_cache: dict[str, tuple[bool, float]] = {}
-_instagram_probe_cache: dict[str, tuple[tuple[bool, int | None], float]] = {}
+_instagram_probe_cache: dict[str, tuple[tuple[bool, int | None, str | None], float]] = {}
 _twitter_probe_cache: dict[str, tuple[bool, float]] = {}
 SHORTLINK_CACHE_TTL = 24 * 3600
 HAS_VIDEO_CACHE_TTL = 3600
 INSTAGRAM_PROBE_CACHE_TTL = 10 * 60
 TWITTER_PROBE_CACHE_TTL = 10 * 60
 FXTWITTER_API_TIMEOUT = 8
+KKINSTAGRAM_PROBE_TIMEOUT = 8
+KKINSTAGRAM_DISCORD_UA = "Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)"
 CACHE_MAX_ENTRIES = 512
 MAX_HTTP_RESPONSE_BYTES = 1024 * 1024
 MAX_SUBPROCESS_OUTPUT_BYTES = 512 * 1024
@@ -693,6 +725,8 @@ def resolve_fixup_url(url: str) -> str:
 
 
 def rewrite_instagram_image_url(url: str, log_text: str) -> str | None:
+    # Only rewrite posts that the probe explicitly classified as image/text.
+    # If the post could not be embedded, leave it untouched.
     if (
         INSTAGRAM_IMAGE_MARKER in log_text.splitlines()
         and _is_supported_instagram_post_url(url)
@@ -1301,7 +1335,7 @@ def user_facing_download_error(output: str, *, media: str = "video") -> str | No
     if "private" in lowered or "login required" in lowered or "this post is private" in lowered:
         return f"That {media} appears to be private or login-only."
     if "empty media response" in lowered:
-        return "Link is unavailable. The account may be banned, private, or the post may have been deleted."
+        return "Link is unavailable. The account may be banned, private, restricted, or the post may have been deleted or hidden."
     if "http error 403" in lowered:
         return "Access denied (403). Cookies may be missing, expired, or not allowed to view this post."
     if "http error 404" in lowered or "not found" in lowered:
@@ -1401,22 +1435,6 @@ def _is_instagram_image_entry(entry: dict) -> bool:
     if any(path.endswith(f".{ext}") for ext in INSTAGRAM_IMAGE_EXTENSIONS):
         return True
 
-    formats = entry.get("formats")
-    if isinstance(formats, list) and not formats:
-        return any(
-            entry.get(key) not in (None, "")
-            for key in (
-                "description",
-                "title",
-                "uploader",
-                "channel",
-                "timestamp",
-                "upload_date",
-                "like_count",
-                "comment_count",
-            )
-        )
-
     return False
 
 
@@ -1484,9 +1502,10 @@ def _load_ytdlp_json(output: str) -> dict | None:
     return metadata if isinstance(metadata, dict) else None
 
 
-async def instagram_post_probe(url: str) -> tuple[bool, int | None]:
+async def instagram_post_probe(url: str) -> tuple[bool, int | None, str | None]:
+    """Returns (is_image_only, playlist_index, unavailable_reason)."""
     if not _is_supported_instagram_post_url(url):
-        return False, None
+        return False, None, None
     cache_key = canonical_url_for_key(url)
     cached = _cache_get(_instagram_probe_cache, cache_key)
     if cached is not None:
@@ -1512,26 +1531,69 @@ async def instagram_post_probe(url: str) -> tuple[bool, int | None]:
 
     metadata = _load_ytdlp_json(out)
     if metadata is None:
-        return False, None
+        out_lower = out.lower()
+        if any(phrase.lower() in out_lower for phrase in INSTAGRAM_UNAVAILABLE_PHRASES):
+            reason = (
+                "This post is unavailable. The account may be banned, private, "
+                "restricted, or the post may have been deleted or hidden."
+            )
+            log.info("[instagram-probe] Post unavailable: %s", cache_key)
+            result = (False, None, reason)
+            _cache_set(_instagram_probe_cache, cache_key, result, INSTAGRAM_PROBE_CACHE_TTL)
+            return result
+        return False, None, None
 
     playlist_index = _instagram_video_playlist_index(metadata)
     if playlist_index is not None or _instagram_entry_has_video(metadata):
-        result = (False, playlist_index)
+        result = (False, playlist_index, None)
         _cache_set(_instagram_probe_cache, cache_key, result, INSTAGRAM_PROBE_CACHE_TTL)
         return result
 
     if _is_instagram_image_entry(metadata):
-        result = (True, None)
+        result = (True, None, None)
         _cache_set(_instagram_probe_cache, cache_key, result, INSTAGRAM_PROBE_CACHE_TTL)
         return result
 
-    result = (False, None)
+    embeddable = await _kkinstagram_is_embeddable(url)
+    if embeddable:
+        log.info("[instagram-probe] kkinstagram confirms embeddable image post: %s", cache_key)
+        result = (True, None, None)
+        _cache_set(_instagram_probe_cache, cache_key, result, INSTAGRAM_PROBE_CACHE_TTL)
+        return result
+
+    reason = (
+        "This post is unavailable. The account may be banned, private, "
+        "restricted, or the post may have been deleted or hidden."
+    )
+    log.info("[instagram-probe] Not embeddable, treating as unavailable: %s", cache_key)
+    result = (False, None, reason)
     _cache_set(_instagram_probe_cache, cache_key, result, INSTAGRAM_PROBE_CACHE_TTL)
     return result
 
 
+async def _kkinstagram_is_embeddable(url: str) -> bool:
+    kk_url = replace_hostname(url, "www.kkinstagram.com")
+    try:
+        session = _get_http_session()
+        async with session.get(
+            kk_url,
+            timeout=aiohttp.ClientTimeout(total=KKINSTAGRAM_PROBE_TIMEOUT),
+            headers={"User-Agent": KKINSTAGRAM_DISCORD_UA},
+            allow_redirects=True,
+        ) as resp:
+            content_type = (resp.content_type or "").lower()
+            if "image" in content_type or "video" in content_type:
+                log.info("[kkinstagram-probe] Media response (%s) for %s", content_type, url)
+                return True
+            log.info("[kkinstagram-probe] Non-media response (%s, %d) for %s", content_type, resp.status, url)
+            return False
+    except Exception as e:
+        log.warning("[kkinstagram-probe] Probe failed (%s) for %s, assuming embeddable.", e, url)
+        return True
+
+
 async def instagram_is_image_post(url: str) -> bool:
-    image_only, _ = await instagram_post_probe(url)
+    image_only, _, _ = await instagram_post_probe(url)
     return image_only
 
 
@@ -2028,8 +2090,12 @@ async def download_and_compress(
     instagram_playlist_item = None
 
     if is_instagram:
-        instagram_image_only, instagram_playlist_item = await instagram_post_probe(url)
+        instagram_image_only, instagram_playlist_item, instagram_unavailable = await instagram_post_probe(url)
         timer.mark("instagram_probe")
+        if instagram_unavailable:
+            log.info("[cove] Instagram post unavailable: %s", url)
+            _log.append(f"[ERROR] {instagram_unavailable}")
+            return None, "\n".join(_log)
         if instagram_image_only:
             log.info("[cove] Instagram image/text post detected, sending kkinstagram rewrite.")
             _log.append(INSTAGRAM_IMAGE_MARKER)
@@ -2138,10 +2204,14 @@ async def download_and_compress(
     if code != 0:
         if any(phrase.lower() in out.lower() for phrase in NO_VIDEO_PHRASES):
             if is_instagram:
-                log.info("[cove] Instagram no-video response did not classify as image/text, ignoring without rewrite.")
+                log.info("[cove] Instagram no-video response was unavailable, replying without rewrite.")
+                _log.append(
+                    "[ERROR] Link is unavailable. The account may be banned, private, restricted, "
+                    "or the post may have been deleted or hidden."
+                )
             else:
                 log.info("[cove] No video / network issue — ignoring silently.")
-            _log.append("[NOVIDEO]")
+                _log.append("[NOVIDEO]")
         elif is_reddit and "[generic]" in out and not is_reddit_short:
             reddit_gif_url = reddit_media_gif_url_from_text(out)
             if reddit_gif_url:
@@ -2184,7 +2254,7 @@ async def download_and_compress(
             _log.append("[ERROR] YouTube bot detection triggered.")
         elif "empty media response" in out.lower():
             log.info("[cove] Instagram empty media response — account banned or post deleted.")
-            _log.append("[ERROR] Link is broken (the account may have been banned or the post was deleted).")
+            _log.append("[ERROR] Instagram post is unavailable (private, restricted, deleted, or the account may be banned).")
         elif friendly := user_facing_download_error(out, media="video"):
             _log.append(f"[ERROR] {friendly}")
         elif "Unsupported URL" in out:
@@ -2610,7 +2680,7 @@ async def download_audio(url: str, guild: discord.Guild | None) -> tuple:
                 _log.append("[ERROR] YouTube bot detection triggered.")
             elif "empty media response" in out.lower():
                 log.info("[cove] Instagram empty media response — account banned or post deleted.")
-                _log.append("[ERROR] Link is broken (the account may have been banned or the post was deleted).")
+                _log.append("[ERROR] Instagram post is unavailable (private, restricted, deleted, or the account may be banned).")
             elif "Unsupported URL" in out:
                 _log.append("[ERROR] Unsupported or private URL.")
             elif "HTTP Error 403" in out:

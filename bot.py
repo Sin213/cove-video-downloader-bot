@@ -94,7 +94,7 @@ USER_RATE_WINDOW       = _require_int_env("USER_RATE_WINDOW", default="60")
 YT_DLP_MIN_VERSION     = os.getenv("YT_DLP_MIN_VERSION", "2024.01.01")
 USE_HEVC               = _env_bool("USE_HEVC", "0")
 USE_HWACCEL            = _env_bool("USE_HWACCEL", "1")
-NVENC_MAX_SESSIONS     = _require_int_env("NVENC_MAX_SESSIONS", default="3")
+NVENC_MAX_SESSIONS     = _require_int_env("NVENC_MAX_SESSIONS", default="5")
 PROCESS_NICE           = _require_int_env("PROCESS_NICE", default="10")
 FFMPEG_TIMEOUT         = _require_int_env("FFMPEG_TIMEOUT", default="300")
 USE_ARIA2C_ENV         = _env_bool("USE_ARIA2C", "1")
@@ -308,7 +308,7 @@ _processed_source_messages: dict[int, float] = {}
 _user_request_times: dict[int, list[float]] = {}
 _active_tasks: set[asyncio.Task] = set()
 _http_session: aiohttp.ClientSession | None = None
-_reddit_cookie_header_cache: tuple[float, str | None] | None = None
+_reddit_cookie_header_cache: tuple[float, str | None, float] | None = None
 
 # (value, expires_at_monotonic) — TTL caches for Reddit pre-checks.
 # Shortlinks resolve deterministically and never change; has_video can shift
@@ -323,6 +323,7 @@ INSTAGRAM_PROBE_CACHE_TTL = 10 * 60
 TWITTER_PROBE_CACHE_TTL = 10 * 60
 FXTWITTER_API_TIMEOUT = 8
 KKINSTAGRAM_PROBE_TIMEOUT = 8
+PROBE_FAILURE_CACHE_TTL = 2 * 60
 KKINSTAGRAM_DISCORD_UA = "Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)"
 CACHE_MAX_ENTRIES = 512
 MAX_HTTP_RESPONSE_BYTES = 1024 * 1024
@@ -345,13 +346,35 @@ def _cache_get(cache: dict, key: str):
 
 def _cache_set(cache: dict, key: str, value, ttl: float) -> None:
     if len(cache) >= CACHE_MAX_ENTRIES:
-        for stale_key in sorted(cache, key=lambda k: cache[k][1])[: CACHE_MAX_ENTRIES // 4]:
-            cache.pop(stale_key, None)
+        now = monotonic()
+        expired = [k for k, (_, exp) in cache.items() if exp <= now]
+        for k in expired:
+            del cache[k]
+        if len(cache) >= CACHE_MAX_ENTRIES:
+            to_drop = len(cache) - CACHE_MAX_ENTRIES * 3 // 4
+            it = iter(cache)
+            for _ in range(to_drop):
+                cache.pop(next(it), None)
     cache[key] = (value, monotonic() + ttl)
 
 
 _inflight_urls: set[str] = set()
 SOURCE_MESSAGE_DEDUP_TTL_SECONDS = max(DELETE_TTL_SECONDS, FRIEND_POST_TTL_SECONDS)
+
+
+def _parse_log_markers(log_text: str) -> tuple[bool, str | None, str | None]:
+    novideo = False
+    toobig = None
+    error = None
+    for line in log_text.splitlines():
+        stripped = line.strip()
+        if stripped == "[NOVIDEO]":
+            novideo = True
+        elif not toobig and stripped.startswith("[TOOBIG]"):
+            toobig = stripped.replace("[TOOBIG] ", "")
+        elif not error and stripped.startswith("[ERROR]"):
+            error = stripped.replace("[ERROR] ", "")
+    return novideo, toobig, error
 
 
 def canonical_url_for_key(url: str) -> str:
@@ -389,13 +412,31 @@ def _inflight_key(kind: str, url: str) -> str:
     return f"{kind}:{canonical_url_for_key(url)}"
 
 CACHE_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache.db")
+_cache_db_conn: sqlite3.Connection | None = None
+
+
+def _get_cache_db() -> sqlite3.Connection | None:
+    global _cache_db_conn
+    if _cache_db_conn is not None:
+        return _cache_db_conn
+    if not PERSISTENT_CACHE:
+        return None
+    try:
+        conn = sqlite3.connect(CACHE_DB_PATH, check_same_thread=False)
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA synchronous=NORMAL")
+        _cache_db_conn = conn
+        return conn
+    except Exception as e:
+        log.warning("[cache] Could not open DB: %s", e)
+        return None
 
 
 def _init_persistent_cache() -> None:
-    if not PERSISTENT_CACHE:
+    conn = _get_cache_db()
+    if conn is None:
         return
     try:
-        conn = sqlite3.connect(CACHE_DB_PATH)
         conn.execute("""CREATE TABLE IF NOT EXISTS url_cache (
             key TEXT PRIMARY KEY,
             value TEXT NOT NULL,
@@ -416,7 +457,6 @@ def _init_persistent_cache() -> None:
             elif cache_type == "has_video":
                 _reddit_has_video_cache[key] = (value == "1", mono_expires)
         conn.commit()
-        conn.close()
         log.info(
             "[Cove] Loaded %d shortlink + %d has_video entries from persistent cache",
             len(_reddit_shortlink_cache), len(_reddit_has_video_cache),
@@ -426,17 +466,16 @@ def _init_persistent_cache() -> None:
 
 
 def _persist_cache_entry(key: str, value, cache_type: str, ttl: float) -> None:
-    if not PERSISTENT_CACHE:
+    conn = _get_cache_db()
+    if conn is None:
         return
     str_value = str(int(value)) if isinstance(value, bool) else str(value)
     try:
-        conn = sqlite3.connect(CACHE_DB_PATH)
         conn.execute(
             "INSERT OR REPLACE INTO url_cache (key, value, cache_type, expires_at) VALUES (?, ?, ?, ?)",
             (key, str_value, cache_type, time() + ttl),
         )
         conn.commit()
-        conn.close()
     except Exception as e:
         log.warning("[cache] Failed to persist: %s", e)
 
@@ -461,13 +500,23 @@ def _get_http_session() -> aiohttp.ClientSession:
     return _http_session
 
 
+_COOKIE_HEADER_TTL = 60
+
+
 def reddit_cookie_header() -> str | None:
     global _reddit_cookie_header_cache
     if not COOKIES_EXIST:
         return None
     try:
+        now = monotonic()
+        if _reddit_cookie_header_cache:
+            cached_mtime, cached_header, cached_at = _reddit_cookie_header_cache
+            if now - cached_at < _COOKIE_HEADER_TTL:
+                return cached_header
+
         mtime = os.path.getmtime(COOKIES_FILE)
         if _reddit_cookie_header_cache and _reddit_cookie_header_cache[0] == mtime:
+            _reddit_cookie_header_cache = (mtime, _reddit_cookie_header_cache[1], now)
             return _reddit_cookie_header_cache[1]
 
         jar = MozillaCookieJar(COOKIES_FILE)
@@ -480,7 +529,7 @@ def reddit_cookie_header() -> str | None:
             if domain == "reddit.com" or domain.endswith(".reddit.com"):
                 values.append(f"{cookie.name}={cookie.value}")
         header = "; ".join(values) or None
-        _reddit_cookie_header_cache = (mtime, header)
+        _reddit_cookie_header_cache = (mtime, header, now)
         return header
     except Exception as e:
         log.warning("[reddit] Could not load cookies.txt for API request: %s", e)
@@ -547,6 +596,15 @@ class PipelineTimer:
         )
         self.last_at = now
 
+    def elapsed(self) -> float:
+        return monotonic() - self.started_at
+
+    def elapsed_str(self) -> str:
+        secs = self.elapsed()
+        if secs < 60:
+            return f"{secs:.1f}s"
+        return f"{int(secs // 60)}m{int(secs % 60)}s"
+
 
 def _try_reserve_job_slot() -> bool:
     global _queued_jobs
@@ -603,8 +661,18 @@ def mark_source_message_processing(message_id: int) -> bool:
     return True
 
 
+_user_rate_last_sweep: float = 0
+
+
 def _check_user_rate_limit(user_id: int) -> bool:
+    global _user_rate_last_sweep
     now = monotonic()
+    if now - _user_rate_last_sweep > 300:
+        cutoff = now - USER_RATE_WINDOW
+        stale = [uid for uid, ts in _user_request_times.items() if not ts or ts[-1] < cutoff]
+        for uid in stale:
+            del _user_request_times[uid]
+        _user_rate_last_sweep = now
     times = _user_request_times.get(user_id, [])
     times = [t for t in times if now - t < USER_RATE_WINDOW]
     if len(times) >= USER_RATE_LIMIT:
@@ -1342,6 +1410,8 @@ def user_facing_download_error(output: str, *, media: str = "video") -> str | No
         return f"{media.capitalize()} not found or no longer available."
     if "unsupported url" in lowered:
         return "Unsupported, private, or unavailable URL."
+    if "bad guest token" in lowered or ("querying api" in lowered and "twitter" in lowered):
+        return "Twitter/X download failed (API error). Try again in a moment."
     if "please update" in lowered and "yt-dlp" in lowered:
         return "yt-dlp looks stale for this site. Update yt-dlp and try again."
     return None
@@ -1620,11 +1690,13 @@ async def twitter_has_video(url: str) -> bool:
         ) as resp:
             if resp.status != 200:
                 log.warning("[twitter-probe] fxtwitter API returned %d for %s", resp.status, tweet_id)
+                _cache_set(_twitter_probe_cache, tweet_id, True, PROBE_FAILURE_CACHE_TTL)
                 return True
             body = await read_limited_response(resp, MAX_HTTP_RESPONSE_BYTES)
             data = json.loads(body.decode(errors="replace"))
         tweet = data.get("tweet")
         if not tweet:
+            _cache_set(_twitter_probe_cache, tweet_id, True, PROBE_FAILURE_CACHE_TTL)
             return True
         media = tweet.get("media") or {}
         has_vid = bool(media.get("videos"))
@@ -1633,6 +1705,7 @@ async def twitter_has_video(url: str) -> bool:
         return has_vid
     except Exception as e:
         log.warning("[twitter-probe] Probe failed (%s) — letting yt-dlp try anyway.", e)
+        _cache_set(_twitter_probe_cache, tweet_id, True, PROBE_FAILURE_CACHE_TTL)
         return True
 
 
@@ -2155,6 +2228,7 @@ async def download_and_compress(
         "--merge-output-format", "mp4",
         "-N", str(YT_DLP_FRAGMENTS),
         "--no-part",
+        "--trim-filenames", "150",
         "--extractor-retries", "0",
         "--max-filesize", f"{MAX_FILESIZE_MB}M",
         "--match-filter", "!duration",
@@ -2185,6 +2259,15 @@ async def download_and_compress(
 
     code, out = await run_subprocess_timeout(cmd, REDDIT_YTDLP_TIMEOUT if is_reddit else SUBPROCESS_TIMEOUT)
     timer.mark("download")
+
+    if code != 0 and is_youtube and (
+        "Sign in to confirm" in out or "confirm you're not a bot" in out.lower()
+    ):
+        log.info("[yt-dlp] YouTube bot detection - retrying in 8s...")
+        _log.append("[INFO] YouTube bot check - retrying...")
+        await asyncio.sleep(8)
+        code, out = await run_subprocess_timeout(cmd, SUBPROCESS_TIMEOUT)
+        timer.mark("download_retry")
 
     log.info("[yt-dlp] Exit code: %d", code)
     log.debug("[yt-dlp] Output:\n%s", out)
@@ -2306,10 +2389,10 @@ async def download_and_compress(
             ok, remux_log = await remux_streamable_mp4(src_path, streamable)
             timer.mark("remux")
             if ok and os.path.getsize(streamable) <= target_size:
-                _log.append(f"[INFO] Under {target_mb}MB — remuxed for Discord inline playback.")
+                _log.append(f"[INFO] Under {target_mb}MB — remuxed for Discord inline playback. ({timer.elapsed_str()})")
                 return streamable, "\n".join(_log)
             log.warning("[ffmpeg] Faststart remux failed or exceeded target: %s", remux_log[-1000:])
-        _log.append(f"[INFO] Under {target_mb}MB — uploading as-is.")
+        _log.append(f"[INFO] Under {target_mb}MB — uploading as-is. ({timer.elapsed_str()})")
         return src_path, "\n".join(_log)
 
     compressed = str(Path(tmp) / "compressed.mp4")
@@ -2322,7 +2405,7 @@ async def download_and_compress(
         timer.mark("final_ffprobe")
         _, final_summary = discord_mp4_compatibility(final_info, compressed)
         log.info("[cove] Compressed media info: %s", final_summary)
-        _log.append(f"[OK] Final size: {result}")
+        _log.append(f"[OK] Final size: {result} ({timer.elapsed_str()})")
         return compressed, "\n".join(_log)
     else:
         if orig_mb > target_mb:
@@ -2330,7 +2413,7 @@ async def download_and_compress(
             shutil.rmtree(tmp, ignore_errors=True)
             return None, "\n".join(_log)
 
-        _log.append("[WARN] Compression failed, but original fits. Using original.")
+        _log.append(f"[WARN] Compression failed, but original fits. Using original. ({timer.elapsed_str()})")
         return src_path, "\n".join(_log)
 
 
@@ -2380,6 +2463,7 @@ async def download_and_clip(
         "--merge-output-format", "mp4",
         "-N", str(YT_DLP_FRAGMENTS),
         "--no-part",
+        "--trim-filenames", "150",
         "--no-playlist",
         "--extractor-retries", "0",
         "--max-filesize", f"{MAX_FILESIZE_MB}M",
@@ -2440,7 +2524,7 @@ async def download_and_clip(
     _log.append(f"[INFO] Clip downloaded: {orig_mb:.1f} MB")
 
     if os.path.getsize(src_path) <= target_size:
-        _log.append(f"[INFO] Under {target_mb:.0f}MB — skipping compression.")
+        _log.append(f"[INFO] Under {target_mb:.0f}MB — skipping compression. ({timer.elapsed_str()})")
         return src_path, "\n".join(_log)
 
     compressed = str(Path(tmp) / "compressed.mp4")
@@ -2449,7 +2533,7 @@ async def download_and_clip(
     timer.mark("compress")
 
     if ok:
-        _log.append(f"[OK] Final size: {result}")
+        _log.append(f"[OK] Final size: {result} ({timer.elapsed_str()})")
         return compressed, "\n".join(_log)
 
     if orig_mb > target_mb:
@@ -2457,7 +2541,7 @@ async def download_and_clip(
         shutil.rmtree(tmp, ignore_errors=True)
         return None, "\n".join(_log)
 
-    _log.append("[WARN] Compression failed, but original fits. Using original.")
+    _log.append(f"[WARN] Compression failed, but original fits. Using original. ({timer.elapsed_str()})")
     return src_path, "\n".join(_log)
 
 
@@ -2501,6 +2585,7 @@ async def download_and_gif(url: str, guild: discord.Guild | None) -> tuple:
         "--merge-output-format", "mp4",
         "-N", str(YT_DLP_FRAGMENTS),
         "--no-part",
+        "--trim-filenames", "150",
         "--no-playlist",
         "--extractor-retries", "0",
         "--max-filesize", f"{MAX_FILESIZE_MB}M",
@@ -2572,7 +2657,7 @@ async def download_and_gif(url: str, guild: discord.Guild | None) -> tuple:
     timer.mark("convert")
 
     if ok:
-        _log.append(f"[OK] GIF: {result}")
+        _log.append(f"[OK] GIF: {result} ({timer.elapsed_str()})")
         return gif_path, "\n".join(_log)
 
     _log.append(f"[ERROR] {result}")
@@ -2620,6 +2705,7 @@ async def download_audio(url: str, guild: discord.Guild | None) -> tuple:
             "--audio-format", "mp3",
             "-N", str(YT_DLP_FRAGMENTS),
             "--no-part",
+            "--trim-filenames", "150",
             "--no-playlist",
             "--extractor-retries", "0",
             "--max-filesize", f"{MAX_FILESIZE_MB}M",
@@ -2705,7 +2791,7 @@ async def download_audio(url: str, guild: discord.Guild | None) -> tuple:
             os.rename(audio_path, safe_path)
             audio_path = safe_path
         audio_mb = os.path.getsize(audio_path) / (1024 * 1024)
-        _log.append(f"[INFO] Downloaded audio: {audio_mb:.1f} MB")
+        _log.append(f"[INFO] Downloaded audio: {audio_mb:.1f} MB ({timer.elapsed_str()})")
         log.info("[cove] Downloaded audio: %s (%.1f MB)", safe_name, audio_mb)
 
         if os.path.getsize(audio_path) > target_size:
@@ -2778,23 +2864,22 @@ async def process_url(
                 await on_error(f"Unexpected error: {e}")
                 return
 
-            if any(line.strip() == "[NOVIDEO]" for line in log_text.splitlines()):
+            novideo, toobig_str, error_str = _parse_log_markers(log_text)
+
+            if novideo:
                 if on_no_video:
                     await on_no_video(log_text)
                 return
 
-            toobig_lines = [line for line in log_text.splitlines() if line.startswith("[TOOBIG]")]
-            if toobig_lines:
-                duration_str = toobig_lines[0].replace("[TOOBIG] ", "")
+            if toobig_str:
                 if on_too_big:
-                    await on_too_big(duration_str)
+                    await on_too_big(toobig_str)
                 else:
-                    await on_error(f"Video too big {NYO_EMOJI} ({duration_str}, max {MAX_DURATION_SECONDS // 60}min)")
+                    await on_error(f"Video too big {NYO_EMOJI} ({toobig_str}, max {MAX_DURATION_SECONDS // 60}min)")
                 return
 
             if not filepath or not os.path.exists(filepath):
-                error_lines = [line for line in log_text.splitlines() if line.startswith("[ERROR]")]
-                msg = error_lines[0].replace("[ERROR] ", "") if error_lines else "Download failed."
+                msg = error_str or "Download failed."
                 log.error("Download failed. Full log:\n%s", log_text)
                 await on_error(msg)
                 return
@@ -2843,23 +2928,22 @@ async def process_audio_url(
                 await on_error("Audio download failed.")
                 return
 
-            if any(line.strip() == "[NOVIDEO]" for line in log_text.splitlines()):
+            novideo, toobig_str, error_str = _parse_log_markers(log_text)
+
+            if novideo:
                 if on_no_video:
                     await on_no_video()
                 return
 
-            toobig_lines = [line for line in log_text.splitlines() if line.startswith("[TOOBIG]")]
-            if toobig_lines:
-                size_str = toobig_lines[0].replace("[TOOBIG] ", "")
+            if toobig_str:
                 if on_too_big:
-                    await on_too_big(size_str)
+                    await on_too_big(toobig_str)
                 else:
-                    await on_error(f"Audio too big {NYO_EMOJI} ({size_str})")
+                    await on_error(f"Audio too big {NYO_EMOJI} ({toobig_str})")
                 return
 
             if not filepath or not os.path.exists(filepath):
-                error_lines = [line for line in log_text.splitlines() if line.startswith("[ERROR]")]
-                msg = error_lines[0].replace("[ERROR] ", "") if error_lines else "Audio download failed."
+                msg = error_str or "Audio download failed."
                 log.error("Audio download failed. Full log:\n%s", log_text)
                 await on_error(msg)
                 return
@@ -2909,14 +2993,15 @@ async def process_clip_url(
                 await on_error(f"Unexpected error: {e}")
                 return
 
-            if any(line.strip() == "[NOVIDEO]" for line in log_text.splitlines()):
+            novideo, _, error_str = _parse_log_markers(log_text)
+
+            if novideo:
                 if on_no_video:
                     await on_no_video()
                 return
 
             if not filepath or not os.path.exists(filepath):
-                error_lines = [line for line in log_text.splitlines() if line.startswith("[ERROR]")]
-                msg = error_lines[0].replace("[ERROR] ", "") if error_lines else "Clip failed."
+                msg = error_str or "Clip failed."
                 log.error("Clip failed. Full log:\n%s", log_text)
                 await on_error(msg)
                 return
@@ -2964,19 +3049,19 @@ async def process_gif_url(
                 await on_error(f"Unexpected error: {e}")
                 return
 
-            if any(line.strip() == "[NOVIDEO]" for line in log_text.splitlines()):
+            novideo, toobig_str, error_str = _parse_log_markers(log_text)
+
+            if novideo:
                 if on_no_video:
                     await on_no_video()
                 return
 
-            toobig_lines = [line for line in log_text.splitlines() if line.startswith("[TOOBIG]")]
-            if toobig_lines:
+            if toobig_str:
                 await on_error(f"Source video too long (max {MAX_DURATION_SECONDS // 60}min)")
                 return
 
             if not filepath or not os.path.exists(filepath):
-                error_lines = [line for line in log_text.splitlines() if line.startswith("[ERROR]")]
-                msg = error_lines[0].replace("[ERROR] ", "") if error_lines else "GIF conversion failed."
+                msg = error_str or "GIF conversion failed."
                 log.error("GIF failed. Full log:\n%s", log_text)
                 await on_error(msg)
                 return
@@ -3013,8 +3098,17 @@ class CoveBot(discord.Client):
         except Exception as e:
             log.warning("[Cove] %s slash command sync failed; continuing startup: %s", label, e)
 
+    async def _periodic_temp_sweep(self):
+        while not self.is_closed():
+            await asyncio.sleep(300)
+            try:
+                await asyncio.get_running_loop().run_in_executor(None, _sweep_orphaned_tmpdirs)
+            except Exception as e:
+                log.warning("[Cove] Periodic temp sweep failed: %s", e)
+
     async def setup_hook(self):
         await asyncio.get_running_loop().run_in_executor(None, _sweep_orphaned_tmpdirs)
+        asyncio.create_task(self._periodic_temp_sweep())
         guild = discord.Object(id=GUILD_ID)
         self.tree.copy_global_to(guild=guild)
         await self._sync_tree_with_timeout(guild, "Primary")

@@ -330,6 +330,8 @@ MAX_HTTP_RESPONSE_BYTES = 1024 * 1024
 MAX_SUBPROCESS_OUTPUT_BYTES = 512 * 1024
 _ytdlp_version_status: tuple[bool, str] = (False, "yt-dlp version has not been checked yet.")
 _ytdlp_admin_warning_sent = False
+_cookie_warning_sent_at: float = 0
+COOKIE_WARNING_COOLDOWN = 6 * 3600
 _queued_jobs = 0
 
 
@@ -2881,6 +2883,8 @@ async def process_url(
             if not filepath or not os.path.exists(filepath):
                 msg = error_str or "Download failed."
                 log.error("Download failed. Full log:\n%s", log_text)
+                if error_str and "cookies" in error_str.lower():
+                    spawn_tracked(_maybe_send_cookie_warning(client))
                 await on_error(msg)
                 return
 
@@ -2945,6 +2949,8 @@ async def process_audio_url(
             if not filepath or not os.path.exists(filepath):
                 msg = error_str or "Audio download failed."
                 log.error("Audio download failed. Full log:\n%s", log_text)
+                if error_str and "cookies" in error_str.lower():
+                    spawn_tracked(_maybe_send_cookie_warning(client))
                 await on_error(msg)
                 return
 
@@ -3003,6 +3009,8 @@ async def process_clip_url(
             if not filepath or not os.path.exists(filepath):
                 msg = error_str or "Clip failed."
                 log.error("Clip failed. Full log:\n%s", log_text)
+                if error_str and "cookies" in error_str.lower():
+                    spawn_tracked(_maybe_send_cookie_warning(client))
                 await on_error(msg)
                 return
 
@@ -3063,6 +3071,8 @@ async def process_gif_url(
             if not filepath or not os.path.exists(filepath):
                 msg = error_str or "GIF conversion failed."
                 log.error("GIF failed. Full log:\n%s", log_text)
+                if error_str and "cookies" in error_str.lower():
+                    spawn_tracked(_maybe_send_cookie_warning(client))
                 await on_error(msg)
                 return
 
@@ -3077,6 +3087,34 @@ async def process_gif_url(
         if reserved_slot:
             _release_job_slot()
         _inflight_urls.discard(canonical)
+
+
+async def _maybe_send_cookie_warning(bot_client: discord.Client) -> None:
+    global _cookie_warning_sent_at
+    now = monotonic()
+    if now - _cookie_warning_sent_at < COOKIE_WARNING_COOLDOWN:
+        return
+    _cookie_warning_sent_at = now
+    guild = bot_client.get_guild(GUILD_ID)
+    if not guild:
+        return
+    owner = guild.owner if guild.owner else None
+    if owner is None and guild.owner_id:
+        try:
+            owner = await guild.fetch_member(guild.owner_id)
+        except discord.HTTPException:
+            owner = None
+    if owner is None:
+        return
+    try:
+        await owner.send(
+            "Cove warning: cookies.txt appears expired or invalid. "
+            "Downloads requiring authentication (Instagram, Reddit, etc.) "
+            "will fail until cookies are refreshed."
+        )
+        log.info("[Cove] Sent cookie expiry warning DM to guild owner.")
+    except discord.HTTPException as e:
+        log.warning("[Cove] Could not DM cookie warning to guild owner: %s", e)
 
 
 # ── Bot ───────────────────────────────────────────────────────────────────────

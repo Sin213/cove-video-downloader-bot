@@ -2379,6 +2379,47 @@ async def download_and_compress(
     _log.append(f"[INFO] Downloaded: {orig_mb:.1f} MB")
     log.info("[cove] Downloaded: %s (%.1f MB)", safe_name, orig_mb)
 
+    fmt_is_above_720 = is_youtube and not any(
+        h in fmt for h in ["[height<=720]", "[height<=480]", "[height<=360]", "18/"]
+    )
+    if fmt_is_above_720 and orig_mb > target_mb:
+        log.info("[cove] %.1f MB > %.1f MB target — re-downloading at 720p", orig_mb, target_mb)
+        _log.append(f"[INFO] {orig_mb:.0f}MB over limit — re-downloading at 720p...")
+        tmp2 = tempfile.mkdtemp(prefix="cove_", dir=TMP_BASE)
+        os.chmod(tmp2, 0o700)
+        cmd_720 = [
+            "yt-dlp", "--no-config", "--user-agent", YT_DLP_UA,
+            "-f", YOUTUBE_QUALITY_FORMATS["720"],
+            "--merge-output-format", "mp4",
+            "-N", str(YT_DLP_FRAGMENTS),
+            "--no-part", "--trim-filenames", "150",
+            "--extractor-retries", "3",
+            "--max-filesize", f"{MAX_FILESIZE_MB}M",
+            "--no-playlist",
+            "-o", str(Path(tmp2) / "%(title)s.%(ext)s"),
+            url,
+        ]
+        code2, out2 = await run_subprocess_timeout(cmd_720, SUBPROCESS_TIMEOUT)
+        timer.mark("download_720")
+        _log.append(out2.strip())
+        mp4_files2 = list(Path(tmp2).glob("*.mp4"))
+        if code2 == 0 and mp4_files2 and "HTTP Error 403" not in out2:
+            shutil.rmtree(tmp, ignore_errors=True)
+            tmp = tmp2
+            src_path = str(mp4_files2[0])
+            safe_name2 = _sanitize_filename(mp4_files2[0].name)
+            if mp4_files2[0].name != safe_name2:
+                safe_path2 = str(mp4_files2[0].parent / safe_name2)
+                os.rename(src_path, safe_path2)
+                src_path = safe_path2
+            orig_mb = os.path.getsize(src_path) / (1024 * 1024)
+            _log.append(f"[INFO] 720p: {orig_mb:.1f} MB")
+            log.info("[cove] 720p download: %.1f MB", orig_mb)
+        else:
+            shutil.rmtree(tmp2, ignore_errors=True)
+            log.warning("[cove] 720p re-download failed — compressing original")
+            _log.append("[INFO] 720p re-download failed — compressing original...")
+
     media_info = await get_media_info(src_path)
     timer.mark("ffprobe")
     duration = duration_from_media_info(media_info)

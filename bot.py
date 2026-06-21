@@ -2233,7 +2233,7 @@ async def download_and_compress(
         "-N", str(YT_DLP_FRAGMENTS),
         "--no-part",
         "--trim-filenames", "150",
-        "--extractor-retries", "0",
+        "--extractor-retries", "3" if is_youtube else "0",
         "--max-filesize", f"{MAX_FILESIZE_MB}M",
         "--match-filter", "!duration",
         "--match-filter", f"duration <= {MAX_DURATION_SECONDS}",
@@ -2250,10 +2250,10 @@ async def download_and_compress(
     elif is_reddit:
         cmd += ["--http-chunk-size", "10M"]
 
-    if COOKIES_EXIST:
+    if COOKIES_EXIST and not is_youtube:
         cmd.extend(["--cookies", COOKIES_FILE])
         _log.append("[INFO] Using cookies.")
-    else:
+    elif not is_youtube:
         _log.append("[WARN] No cookies.txt — some sites may fail.")
 
     if is_reddit:
@@ -2289,6 +2289,11 @@ async def download_and_compress(
         log.info("[cove] Rejected by max-filesize (>%dMB)", MAX_FILESIZE_MB)
         shutil.rmtree(tmp, ignore_errors=True)
         _log.append(f"[TOOBIG] >{MAX_FILESIZE_MB}MB")
+        return None, "\n".join(_log)
+    if code == 0 and "HTTP Error 403" in out:
+        log.warning("[cove] yt-dlp exited 0 but reported 403 — partial download, treating as failure.")
+        shutil.rmtree(tmp, ignore_errors=True)
+        _log.append("[ERROR] Access denied (403). Cookies may be needed or expired.")
         return None, "\n".join(_log)
 
     if code != 0:

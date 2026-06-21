@@ -1956,7 +1956,7 @@ async def compress_to_target(
         return False, "Could not read video duration."
 
     audio_kbps = 96 if duration < 30 else AUDIO_KBPS
-    target_kbits = target_mb * 8 * 1024 * 0.97
+    target_kbits = target_mb * 8 * 1024 * 0.90
     audio_kbits  = audio_kbps * duration
     video_kbps   = max(250, int((target_kbits - audio_kbits) / duration))
     target_size  = int(target_mb * 1024 * 1024)

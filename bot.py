@@ -334,6 +334,10 @@ _cookie_warning_sent_at: float = 0
 COOKIE_WARNING_COOLDOWN = 6 * 3600
 _queued_jobs = 0
 
+# yt-dlp info.json cache: keyed by canonical URL, TTL in seconds.
+_ytdlp_info_cache: dict[str, tuple[dict, float]] = {}
+YT_DLP_INFO_CACHE_TTL = 300
+
 
 def _cache_get(cache: dict, key: str):
     entry = cache.get(key)
@@ -358,6 +362,75 @@ def _cache_set(cache: dict, key: str, value, ttl: float) -> None:
             for _ in range(to_drop):
                 cache.pop(next(it), None)
     cache[key] = (value, monotonic() + ttl)
+
+
+def _get_cached_ytdlp_info(url: str) -> dict | None:
+    key = canonical_url_for_key(url)
+    entry = _ytdlp_info_cache.get(key)
+    if entry is None:
+        return None
+    info, expires = entry
+    if monotonic() >= expires:
+        _ytdlp_info_cache.pop(key, None)
+        return None
+    return info
+
+
+def _set_cached_ytdlp_info(url: str, info: dict) -> None:
+    _cache_set(_ytdlp_info_cache, canonical_url_for_key(url), info, YT_DLP_INFO_CACHE_TTL)
+
+
+def _read_info_json_from_tmp(tmp: str) -> dict | None:
+    info_files = list(Path(tmp).glob("*.info.json"))
+    if not info_files:
+        return None
+    try:
+        with open(info_files[0], "r", encoding="utf-8") as f:
+            return json.load(f)
+    except (json.JSONDecodeError, OSError):
+        return None
+
+
+async def _run_ytdlp_with_info_cache(
+    url: str,
+    cmd: list[str],
+    tmp: str,
+    timeout: int,
+    *,
+    kind: str = "video",
+    use_cache: bool = True,
+) -> tuple[int, str]:
+    """Run yt-dlp, using cached info.json when available.
+
+    If a cached info.json produces a 403, it is invalidated and yt-dlp is retried
+    with a fresh extraction. Successful fresh downloads cache their info.json.
+    """
+    if use_cache:
+        cached_info = _get_cached_ytdlp_info(url)
+        if cached_info is not None:
+            try:
+                cached_path = str(Path(tmp) / "cached_info.json")
+                with open(cached_path, "w", encoding="utf-8") as f:
+                    json.dump(cached_info, f)
+                cached_cmd = cmd + ["--load-info-json", cached_path]
+                log.info("[yt-dlp %s] Using cached info.json", kind)
+                code, out = await run_subprocess_timeout(cached_cmd, timeout)
+                if code == 0:
+                    return code, out
+                if "HTTP Error 403" not in out:
+                    return code, out
+                log.warning("[yt-dlp %s] Cached info.json produced 403; retrying fresh extraction", kind)
+                _ytdlp_info_cache.pop(canonical_url_for_key(url), None)
+            except Exception:
+                log.exception("[yt-dlp %s] Failed to use cached info.json", kind)
+
+    fresh_cmd = cmd + ["--write-info-json"]
+    code, out = await run_subprocess_timeout(fresh_cmd, timeout)
+    if code == 0:
+        info = _read_info_json_from_tmp(tmp)
+        if info is not None:
+            _set_cached_ytdlp_info(url, info)
+    return code, out
 
 
 _inflight_urls: set[str] = set()
@@ -778,6 +851,57 @@ def youtube_quality_format(url: str, quality: str | None = None) -> str | None:
         return None
     selected_quality = quality or get_youtube_quality()
     return YOUTUBE_QUALITY_FORMATS[selected_quality]
+
+
+async def _probe_youtube_quality(url: str, requested_quality: str, target_size: int) -> str:
+    """Estimate YouTube download size and step down if it likely exceeds target.
+
+    Returns the (possibly lower) quality to use. Populates _ytdlp_info_cache.
+    """
+    step_down = {"2160": "1440", "1440": "1080", "1080": "720"}
+    if requested_quality not in step_down:
+        return requested_quality
+
+    fmt = YOUTUBE_QUALITY_FORMATS.get(requested_quality)
+    if not fmt:
+        return requested_quality
+
+    cached = _get_cached_ytdlp_info(url)
+    if cached is not None:
+        info = cached
+    else:
+        cmd = [
+            "yt-dlp", "--no-config", "--user-agent", YT_DLP_UA,
+            "--no-download",
+            "--dump-json",
+            "-f", fmt,
+            url,
+        ]
+        code, out = await run_subprocess(cmd, timeout=SUBPROCESS_TIMEOUT)
+        if code != 0:
+            return requested_quality
+        info = _load_ytdlp_json(out)
+        if not info:
+            return requested_quality
+        _set_cached_ytdlp_info(url, info)
+
+    filesize = info.get("filesize") or info.get("filesize_approx")
+    if not filesize or not isinstance(filesize, (int, float)):
+        return requested_quality
+
+    threshold = target_size * 0.90
+    if filesize <= threshold:
+        return requested_quality
+
+    new_quality = step_down[requested_quality]
+    log.info(
+        "[cove] YouTube %sp estimated %.1fMB > %.1fMB threshold; using %sp",
+        requested_quality,
+        filesize / (1024 * 1024),
+        threshold / (1024 * 1024),
+        new_quality,
+    )
+    return new_quality
 
 
 def replace_hostname(url: str, new_host: str) -> str:
@@ -1431,6 +1555,46 @@ def user_facing_upload_error(error: Exception) -> str:
     if "rate limit" in lowered:
         return "Discord rate-limited the upload. Try again in a moment."
     return f"Upload failed: {_sanitize_error_line(text)}"
+
+
+async def send_file_with_retry(
+    send_method,
+    file_path: str,
+    *,
+    send_kwargs: dict | None = None,
+    max_attempts: int = 3,
+    backoff_seconds: tuple[float, ...] = (1.0, 3.0, 5.0),
+):
+    """Send a file via ``send_method(file=discord.File(file_path), **send_kwargs)`` with retries.
+
+    Retries on Discord 5xx or asyncio.TimeoutError. Does not retry 4xx.
+    The discord.File handle is closed after each attempt to avoid fd leaks.
+    """
+    kwargs = send_kwargs or {}
+    last_error: Exception | None = None
+    for attempt in range(max_attempts):
+        file = discord.File(file_path)
+        try:
+            return await send_method(file=file, **kwargs)
+        except (discord.HTTPException, asyncio.TimeoutError) as e:
+            last_error = e
+            status = getattr(e, "status", None)
+            if status is not None and 400 <= status < 500:
+                raise
+            if attempt < max_attempts - 1:
+                delay = backoff_seconds[min(attempt, len(backoff_seconds) - 1)]
+                log.warning(
+                    "[upload] Attempt %d failed (status=%s), retrying in %.1fs",
+                    attempt + 1,
+                    status,
+                    delay,
+                )
+                await asyncio.sleep(delay)
+            else:
+                log.error("[upload] All %d attempts failed: %s", max_attempts, e)
+        finally:
+            file.close()
+    raise last_error
 
 
 def _sanitize_filename(name: str) -> str:
@@ -2219,9 +2383,15 @@ async def download_and_compress(
         fmt = FORMAT_DEFAULT
         yt_fmt = youtube_quality_format(url, youtube_quality)
         if yt_fmt is not None:
-            fmt = yt_fmt
+            chosen_quality = youtube_quality or get_youtube_quality()
+            fitted_quality = await _probe_youtube_quality(url, chosen_quality, target_size)
+            fmt = YOUTUBE_QUALITY_FORMATS[fitted_quality]
+            if fitted_quality != chosen_quality:
+                _log.append(
+                    f"[INFO] Pre-emptive quality: {chosen_quality}p estimated too large, using {fitted_quality}p"
+                )
             if youtube_quality is not None:
-                _log.append(f"[INFO] YouTube resolution override: {youtube_quality}p")
+                _log.append(f"[INFO] YouTube resolution override: {fitted_quality}p")
 
     cmd = ["yt-dlp", "--no-config", "--user-agent", YT_DLP_UA]
 
@@ -2262,7 +2432,13 @@ async def download_and_compress(
     log.info("[yt-dlp] Running: %s", ' '.join(cmd))
     _log.append("[INFO] Downloading...")
 
-    code, out = await run_subprocess_timeout(cmd, REDDIT_YTDLP_TIMEOUT if is_reddit else SUBPROCESS_TIMEOUT)
+    code, out = await _run_ytdlp_with_info_cache(
+        url,
+        cmd,
+        tmp,
+        REDDIT_YTDLP_TIMEOUT if is_reddit else SUBPROCESS_TIMEOUT,
+        kind="video",
+    )
     timer.mark("download")
 
     if code != 0 and is_youtube and (
@@ -2271,7 +2447,14 @@ async def download_and_compress(
         log.info("[yt-dlp] YouTube bot detection - retrying in 8s...")
         _log.append("[INFO] YouTube bot check - retrying...")
         await asyncio.sleep(8)
-        code, out = await run_subprocess_timeout(cmd, SUBPROCESS_TIMEOUT)
+        code, out = await _run_ytdlp_with_info_cache(
+            url,
+            cmd,
+            tmp,
+            SUBPROCESS_TIMEOUT,
+            kind="video",
+            use_cache=False,
+        )
         timer.mark("download_retry")
 
     log.info("[yt-dlp] Exit code: %d", code)
@@ -2536,7 +2719,7 @@ async def download_and_clip(
     log.info("[yt-dlp clip] Running: %s", ' '.join(cmd))
     _log.append("[INFO] Downloading clip...")
 
-    code, out = await run_subprocess(cmd)
+    code, out = await _run_ytdlp_with_info_cache(url, cmd, tmp, SUBPROCESS_TIMEOUT, kind="clip")
     timer.mark("download")
     log.info("[yt-dlp clip] Exit code: %d", code)
     _log.append(out.strip())
@@ -2662,7 +2845,7 @@ async def download_and_gif(url: str, guild: discord.Guild | None) -> tuple:
     log.info("[yt-dlp gif] Running: %s", ' '.join(cmd))
     _log.append("[INFO] Downloading for GIF...")
 
-    code, out = await run_subprocess(cmd)
+    code, out = await _run_ytdlp_with_info_cache(url, cmd, tmp, SUBPROCESS_TIMEOUT, kind="gif")
     timer.mark("download")
     log.info("[yt-dlp gif] Exit code: %d", code)
     _log.append(out.strip())
@@ -2788,7 +2971,7 @@ async def download_audio(url: str, guild: discord.Guild | None) -> tuple:
         log.info("[yt-dlp audio] Running: %s", ' '.join(cmd))
         _log.append("[INFO] Downloading audio...")
 
-        code, out = await run_subprocess(cmd)
+        code, out = await _run_ytdlp_with_info_cache(url, cmd, tmp, SUBPROCESS_TIMEOUT, kind="audio")
         timer.mark("download")
 
         log.info("[yt-dlp audio] Exit code: %d", code)
@@ -2892,6 +3075,58 @@ def busy_message() -> str:
     )
 
 
+async def _run_download_phase(
+    download_coro,
+    on_error,
+    on_no_video,
+    *,
+    on_too_big=None,
+    too_big_msg: str | None = None,
+    no_file_msg: str = "Download failed.",
+    kind: str = "video",
+) -> tuple[str, str] | None:
+    """Run a download coroutine under JOB_SEMAPHORE and release it before returning.
+
+    Returns (filepath, log_text) on success, or None if an error/no-video callback
+    handled the result.
+    """
+    async with JOB_SEMAPHORE:
+        try:
+            filepath, log_text = await download_coro
+        except Exception as e:
+            log.exception("Unhandled exception during %s", kind)
+            await on_error(f"Unexpected error: {e}")
+            return None
+
+        novideo, toobig_str, error_str = _parse_log_markers(log_text)
+
+        if novideo:
+            if on_no_video:
+                await on_no_video(log_text)
+            return None
+
+        if toobig_str:
+            if on_too_big:
+                await on_too_big(toobig_str)
+                return None
+            if too_big_msg:
+                await on_error(
+                    too_big_msg.format(toobig_str=toobig_str, max_min=MAX_DURATION_SECONDS // 60)
+                )
+                return None
+            # otherwise fall through, matching legacy clip behavior
+
+        if not filepath or not os.path.exists(filepath):
+            msg = error_str or no_file_msg
+            log.error("%s failed. Full log:\n%s", kind.capitalize(), log_text)
+            if error_str and "cookies" in error_str.lower():
+                spawn_tracked(_maybe_send_cookie_warning(client))
+            await on_error(msg)
+            return None
+
+        return filepath, log_text
+
+
 async def process_url(
     url: str,
     guild: discord.Guild | None,
@@ -2916,43 +3151,28 @@ async def process_url(
         reserved_slot = True
         running, waiting = _job_queue_status()
         log.info("[queue] Accepted video job running=%d waiting=%d", running, waiting)
-        async with JOB_SEMAPHORE:
-            try:
-                filepath, log_text = await download_and_compress(url, guild, youtube_quality)
-            except Exception as e:
-                log.exception("Unhandled exception during process_url")
-                await on_error(f"Unexpected error: {e}")
-                return
 
-            novideo, toobig_str, error_str = _parse_log_markers(log_text)
+        result = await _run_download_phase(
+            download_and_compress(url, guild, youtube_quality),
+            on_error,
+            on_no_video,
+            on_too_big=on_too_big,
+            too_big_msg=f"Video too big {NYO_EMOJI} ({{toobig_str}}, max {{max_min}}min)",
+            no_file_msg="Download failed.",
+            kind="video",
+        )
+        if result is None:
+            return
+        filepath, log_text = result
 
-            if novideo:
-                if on_no_video:
-                    await on_no_video(log_text)
-                return
-
-            if toobig_str:
-                if on_too_big:
-                    await on_too_big(toobig_str)
-                else:
-                    await on_error(f"Video too big {NYO_EMOJI} ({toobig_str}, max {MAX_DURATION_SECONDS // 60}min)")
-                return
-
-            if not filepath or not os.path.exists(filepath):
-                msg = error_str or "Download failed."
-                log.error("Download failed. Full log:\n%s", log_text)
-                if error_str and "cookies" in error_str.lower():
-                    spawn_tracked(_maybe_send_cookie_warning(client))
-                await on_error(msg)
-                return
-
-            try:
-                await on_success(filepath)
-            except Exception as e:
-                log.exception("Unhandled exception in on_success")
-                await on_error(user_facing_upload_error(e))
-            finally:
-                await cleanup_tmp(filepath)
+        # JOB_SEMAPHORE is released; upload can overlap with new downloads.
+        try:
+            await on_success(filepath)
+        except Exception as e:
+            log.exception("Unhandled exception in on_success")
+            await on_error(user_facing_upload_error(e))
+        finally:
+            await cleanup_tmp(filepath)
     finally:
         if reserved_slot:
             _release_job_slot()
@@ -2982,43 +3202,27 @@ async def process_audio_url(
         reserved_slot = True
         running, waiting = _job_queue_status()
         log.info("[queue] Accepted audio job running=%d waiting=%d", running, waiting)
-        async with JOB_SEMAPHORE:
-            try:
-                filepath, log_text = await download_audio(url, guild)
-            except Exception:
-                log.exception("Unhandled exception during process_audio_url")
-                await on_error("Audio download failed.")
-                return
 
-            novideo, toobig_str, error_str = _parse_log_markers(log_text)
+        result = await _run_download_phase(
+            download_audio(url, guild),
+            on_error,
+            on_no_video,
+            on_too_big=on_too_big,
+            too_big_msg=f"Audio too big {NYO_EMOJI} ({{toobig_str}})",
+            no_file_msg="Audio download failed.",
+            kind="audio",
+        )
+        if result is None:
+            return
+        filepath, log_text = result
 
-            if novideo:
-                if on_no_video:
-                    await on_no_video()
-                return
-
-            if toobig_str:
-                if on_too_big:
-                    await on_too_big(toobig_str)
-                else:
-                    await on_error(f"Audio too big {NYO_EMOJI} ({toobig_str})")
-                return
-
-            if not filepath or not os.path.exists(filepath):
-                msg = error_str or "Audio download failed."
-                log.error("Audio download failed. Full log:\n%s", log_text)
-                if error_str and "cookies" in error_str.lower():
-                    spawn_tracked(_maybe_send_cookie_warning(client))
-                await on_error(msg)
-                return
-
-            try:
-                await on_success(filepath)
-            except Exception as e:
-                log.exception("Unhandled exception in audio on_success")
-                await on_error(user_facing_upload_error(e))
-            finally:
-                await cleanup_tmp(filepath)
+        try:
+            await on_success(filepath)
+        except Exception as e:
+            log.exception("Unhandled exception in audio on_success")
+            await on_error(user_facing_upload_error(e))
+        finally:
+            await cleanup_tmp(filepath)
     finally:
         if reserved_slot:
             _release_job_slot()
@@ -3049,36 +3253,25 @@ async def process_clip_url(
         reserved_slot = True
         running, waiting = _job_queue_status()
         log.info("[queue] Accepted clip job running=%d waiting=%d", running, waiting)
-        async with JOB_SEMAPHORE:
-            try:
-                filepath, log_text = await download_and_clip(url, guild, start, end)
-            except Exception as e:
-                log.exception("Unhandled exception during process_clip_url")
-                await on_error(f"Unexpected error: {e}")
-                return
 
-            novideo, _, error_str = _parse_log_markers(log_text)
+        result = await _run_download_phase(
+            download_and_clip(url, guild, start, end),
+            on_error,
+            on_no_video,
+            no_file_msg="Clip failed.",
+            kind="clip",
+        )
+        if result is None:
+            return
+        filepath, log_text = result
 
-            if novideo:
-                if on_no_video:
-                    await on_no_video()
-                return
-
-            if not filepath or not os.path.exists(filepath):
-                msg = error_str or "Clip failed."
-                log.error("Clip failed. Full log:\n%s", log_text)
-                if error_str and "cookies" in error_str.lower():
-                    spawn_tracked(_maybe_send_cookie_warning(client))
-                await on_error(msg)
-                return
-
-            try:
-                await on_success(filepath)
-            except Exception as e:
-                log.exception("Unhandled exception in clip on_success")
-                await on_error(user_facing_upload_error(e))
-            finally:
-                await cleanup_tmp(filepath)
+        try:
+            await on_success(filepath)
+        except Exception as e:
+            log.exception("Unhandled exception in clip on_success")
+            await on_error(user_facing_upload_error(e))
+        finally:
+            await cleanup_tmp(filepath)
     finally:
         if reserved_slot:
             _release_job_slot()
@@ -3107,40 +3300,26 @@ async def process_gif_url(
         reserved_slot = True
         running, waiting = _job_queue_status()
         log.info("[queue] Accepted gif job running=%d waiting=%d", running, waiting)
-        async with JOB_SEMAPHORE:
-            try:
-                filepath, log_text = await download_and_gif(url, guild)
-            except Exception as e:
-                log.exception("Unhandled exception during process_gif_url")
-                await on_error(f"Unexpected error: {e}")
-                return
 
-            novideo, toobig_str, error_str = _parse_log_markers(log_text)
+        result = await _run_download_phase(
+            download_and_gif(url, guild),
+            on_error,
+            on_no_video,
+            too_big_msg="Source video too long (max {max_min}min)",
+            no_file_msg="GIF conversion failed.",
+            kind="gif",
+        )
+        if result is None:
+            return
+        filepath, log_text = result
 
-            if novideo:
-                if on_no_video:
-                    await on_no_video()
-                return
-
-            if toobig_str:
-                await on_error(f"Source video too long (max {MAX_DURATION_SECONDS // 60}min)")
-                return
-
-            if not filepath or not os.path.exists(filepath):
-                msg = error_str or "GIF conversion failed."
-                log.error("GIF failed. Full log:\n%s", log_text)
-                if error_str and "cookies" in error_str.lower():
-                    spawn_tracked(_maybe_send_cookie_warning(client))
-                await on_error(msg)
-                return
-
-            try:
-                await on_success(filepath)
-            except Exception as e:
-                log.exception("Unhandled exception in gif on_success")
-                await on_error(user_facing_upload_error(e))
-            finally:
-                await cleanup_tmp(filepath)
+        try:
+            await on_success(filepath)
+        except Exception as e:
+            log.exception("Unhandled exception in gif on_success")
+            await on_error(user_facing_upload_error(e))
+        finally:
+            await cleanup_tmp(filepath)
     finally:
         if reserved_slot:
             _release_job_slot()
@@ -3322,10 +3501,13 @@ class CoveBot(discord.Client):
                 content = friend_target_post_content(extra_mentions, mention_names)
                 if not content:
                     content = friend_post_content(display_name, extra_mentions)
-                sent = await message.channel.send(
-                    content=content,
-                    file=discord.File(filepath),
-                    allowed_mentions=discord.AllowedMentions(users=False, everyone=False, roles=False),
+                sent = await send_file_with_retry(
+                    message.channel.send,
+                    filepath,
+                    send_kwargs={
+                        "content": content,
+                        "allowed_mentions": discord.AllowedMentions(users=False, everyone=False, roles=False),
+                    },
                 )
                 prune_friend_posts()
                 _friend_posts[sent.id] = (author_id, monotonic() + FRIEND_POST_TTL_SECONDS)
@@ -3339,10 +3521,13 @@ class CoveBot(discord.Client):
                 if extra_mentions:
                     content += f" {extra_mentions}"
 
-                sent = await message.channel.send(
-                    content=content,
-                    file=discord.File(filepath),
-                    allowed_mentions=discord.AllowedMentions(users=False),
+                sent = await send_file_with_retry(
+                    message.channel.send,
+                    filepath,
+                    send_kwargs={
+                        "content": content,
+                        "allowed_mentions": discord.AllowedMentions(users=False),
+                    },
                 )
 
                 prune_deletable()
@@ -3534,14 +3719,17 @@ async def download_cmd(
 
     async def on_success(filepath: str):
         if friend_mode:
-            sent = await interaction.followup.send(
-                content=friend_post_content(interaction.user.display_name, ""),
-                file=discord.File(filepath),
+            sent = await send_file_with_retry(
+                interaction.followup.send,
+                filepath,
+                send_kwargs={
+                    "content": friend_post_content(interaction.user.display_name, ""),
+                },
             )
             prune_friend_posts()
             _friend_posts[sent.id] = (poster_id, monotonic() + FRIEND_POST_TTL_SECONDS)
         else:
-            await interaction.followup.send(file=discord.File(filepath))
+            await send_file_with_retry(interaction.followup.send, filepath)
 
     async def on_error(msg: str):
         await interaction.followup.send(f"\u274c {msg}")
@@ -3607,14 +3795,17 @@ async def audio_cmd(interaction: discord.Interaction, url: str):
 
     async def on_success(filepath: str):
         if friend_mode:
-            sent = await interaction.followup.send(
-                content=friend_post_content(interaction.user.display_name, ""),
-                file=discord.File(filepath),
+            sent = await send_file_with_retry(
+                interaction.followup.send,
+                filepath,
+                send_kwargs={
+                    "content": friend_post_content(interaction.user.display_name, ""),
+                },
             )
             prune_friend_posts()
             _friend_posts[sent.id] = (poster_id, monotonic() + FRIEND_POST_TTL_SECONDS)
         else:
-            await interaction.followup.send(file=discord.File(filepath))
+            await send_file_with_retry(interaction.followup.send, filepath)
 
     async def on_error(msg: str):
         await interaction.followup.send(f"\u274c {msg}")
@@ -3707,14 +3898,17 @@ async def clip_cmd(interaction: discord.Interaction, url: str, start: str, end: 
 
     async def on_success(filepath: str):
         if friend_mode:
-            sent = await interaction.followup.send(
-                content=friend_post_content(interaction.user.display_name, ""),
-                file=discord.File(filepath),
+            sent = await send_file_with_retry(
+                interaction.followup.send,
+                filepath,
+                send_kwargs={
+                    "content": friend_post_content(interaction.user.display_name, ""),
+                },
             )
             prune_friend_posts()
             _friend_posts[sent.id] = (poster_id, monotonic() + FRIEND_POST_TTL_SECONDS)
         else:
-            await interaction.followup.send(file=discord.File(filepath))
+            await send_file_with_retry(interaction.followup.send, filepath)
 
     async def on_error(msg: str):
         await interaction.followup.send(f"❌ {msg}")
@@ -3767,14 +3961,17 @@ async def gif_cmd(interaction: discord.Interaction, url: str):
 
     async def on_success(filepath: str):
         if friend_mode:
-            sent = await interaction.followup.send(
-                content=friend_post_content(interaction.user.display_name, ""),
-                file=discord.File(filepath),
+            sent = await send_file_with_retry(
+                interaction.followup.send,
+                filepath,
+                send_kwargs={
+                    "content": friend_post_content(interaction.user.display_name, ""),
+                },
             )
             prune_friend_posts()
             _friend_posts[sent.id] = (poster_id, monotonic() + FRIEND_POST_TTL_SECONDS)
         else:
-            await interaction.followup.send(file=discord.File(filepath))
+            await send_file_with_retry(interaction.followup.send, filepath)
 
     async def on_error(msg: str):
         await interaction.followup.send(f"❌ {msg}")

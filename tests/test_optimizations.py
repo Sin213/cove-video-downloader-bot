@@ -1,6 +1,11 @@
+import asyncio
+import json
 import os
-import tempfile
 import sqlite3
+import tempfile
+from unittest.mock import MagicMock
+
+import discord
 
 import bot
 from bot import (
@@ -26,6 +31,13 @@ from bot import (
     _release_job_slot,
     _try_reserve_job_slot,
     should_use_aria2c,
+    _run_download_phase,
+    send_file_with_retry,
+    _run_ytdlp_with_info_cache,
+    _get_cached_ytdlp_info,
+    _set_cached_ytdlp_info,
+    _probe_youtube_quality,
+    JOB_SEMAPHORE,
 )
 
 
@@ -240,3 +252,271 @@ def test_boost_tier_limits_correct():
     assert BOOST_TIER_LIMITS_MB[0] == 9.5
     assert BOOST_TIER_LIMITS_MB[2] == 49.0
     assert BOOST_TIER_LIMITS_MB[3] == 99.0
+
+
+# ── PR B: release job slot before upload ─────────────────────────────────────
+
+
+def test_run_download_phase_releases_semaphore_before_return():
+    with tempfile.NamedTemporaryFile(suffix=".mp4", delete=False) as f:
+        path = f.name
+
+    async def fake_download():
+        assert JOB_SEMAPHORE._value == MAX_CONCURRENT_JOBS - 1
+        return path, ""
+
+    async def on_error(msg):
+        pass
+
+    async def on_no_video(log_text):
+        pass
+
+    async def runner():
+        JOB_SEMAPHORE._value = MAX_CONCURRENT_JOBS
+        result = await _run_download_phase(fake_download(), on_error, on_no_video)
+        assert result == (path, "")
+        assert JOB_SEMAPHORE._value == MAX_CONCURRENT_JOBS
+
+    try:
+        asyncio.run(runner())
+    finally:
+        if os.path.exists(path):
+            os.unlink(path)
+
+
+def test_run_download_phase_handles_error_and_releases_semaphore():
+    async def fake_download():
+        raise RuntimeError("boom")
+
+    errors = []
+
+    async def on_error(msg):
+        errors.append(msg)
+
+    async def on_no_video(log_text):
+        pass
+
+    async def runner():
+        JOB_SEMAPHORE._value = MAX_CONCURRENT_JOBS
+        result = await _run_download_phase(fake_download(), on_error, on_no_video)
+        assert result is None
+        assert errors
+        assert JOB_SEMAPHORE._value == MAX_CONCURRENT_JOBS
+
+    asyncio.run(runner())
+
+
+# ── PR D: upload retry with backoff ──────────────────────────────────────────
+
+
+def _http_exc(status: int) -> discord.HTTPException:
+    response = MagicMock()
+    response.status = status
+    return discord.HTTPException(response, "error")
+
+
+def test_send_file_with_retry_retries_500_and_succeeds():
+    call_count = 0
+
+    async def fake_send(*, file, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count < 2:
+            raise _http_exc(500)
+        return "sent"
+
+    async def runner():
+        with tempfile.NamedTemporaryFile(delete=False) as f:
+            f.write(b"fake")
+            path = f.name
+        try:
+            result = await send_file_with_retry(fake_send, path, send_kwargs={"content": "hi"})
+            assert result == "sent"
+            assert call_count == 2
+        finally:
+            os.unlink(path)
+
+    asyncio.run(runner())
+
+
+def test_send_file_with_retry_does_not_retry_403():
+    call_count = 0
+
+    async def fake_send(*, file, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        raise _http_exc(403)
+
+    async def runner():
+        with tempfile.NamedTemporaryFile(delete=False) as f:
+            f.write(b"fake")
+            path = f.name
+        try:
+            try:
+                await send_file_with_retry(fake_send, path)
+            except discord.HTTPException as e:
+                assert e.status == 403
+            assert call_count == 1
+        finally:
+            os.unlink(path)
+
+    asyncio.run(runner())
+
+
+def test_send_file_with_retry_retries_timeout():
+    call_count = 0
+
+    async def fake_send(*, file, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count < 2:
+            raise asyncio.TimeoutError()
+        return "sent"
+
+    async def runner():
+        with tempfile.NamedTemporaryFile(delete=False) as f:
+            f.write(b"fake")
+            path = f.name
+        try:
+            result = await send_file_with_retry(fake_send, path)
+            assert result == "sent"
+            assert call_count == 2
+        finally:
+            os.unlink(path)
+
+    asyncio.run(runner())
+
+
+# ── PR C: info_dict cache ────────────────────────────────────────────────────
+
+
+def test_ytdlp_info_cache_ttl(monkeypatch):
+    monkeypatch.setattr(bot, "_ytdlp_info_cache", {})
+    monkeypatch.setattr(bot, "monotonic", lambda: 0.0)
+    _set_cached_ytdlp_info("https://youtube.com/watch?v=abc", {"title": "ABC"})
+    assert _get_cached_ytdlp_info("https://youtube.com/watch?v=abc") == {"title": "ABC"}
+
+    monkeypatch.setattr(bot, "monotonic", lambda: 10.0 ** 9)
+    assert _get_cached_ytdlp_info("https://youtube.com/watch?v=abc") is None
+
+
+def test_run_ytdlp_with_info_cache_uses_cache_on_hit(monkeypatch, tmp_path):
+    _set_cached_ytdlp_info("https://youtube.com/watch?v=abc", {"title": "cached"})
+
+    async def fake_run_subprocess(cmd, timeout=None):
+        assert "--load-info-json" in cmd
+        return 0, "ok"
+
+    monkeypatch.setattr(bot, "run_subprocess", fake_run_subprocess)
+
+    async def runner():
+        code, out = await _run_ytdlp_with_info_cache(
+            "https://youtube.com/watch?v=abc", ["yt-dlp"], str(tmp_path), 60
+        )
+        assert code == 0
+        assert out == "ok"
+
+    asyncio.run(runner())
+
+
+def test_run_ytdlp_with_info_cache_writes_on_miss(monkeypatch, tmp_path):
+    async def fake_run_subprocess(cmd, timeout=None):
+        assert "--write-info-json" in cmd
+        return 0, "ok"
+
+    monkeypatch.setattr(bot, "run_subprocess", fake_run_subprocess)
+    info_path = tmp_path / "video.info.json"
+    info_path.write_text(json.dumps({"title": "fresh"}))
+    monkeypatch.setattr(bot, "_ytdlp_info_cache", {})
+
+    async def runner():
+        code, out = await _run_ytdlp_with_info_cache(
+            "https://youtube.com/watch?v=xyz", ["yt-dlp"], str(tmp_path), 60
+        )
+        assert code == 0
+        assert _get_cached_ytdlp_info("https://youtube.com/watch?v=xyz") == {"title": "fresh"}
+
+    asyncio.run(runner())
+
+
+def test_run_ytdlp_with_info_cache_invalidates_on_403(monkeypatch, tmp_path):
+    _set_cached_ytdlp_info("https://youtube.com/watch?v=abc", {"title": "cached"})
+
+    async def fake_run_subprocess(cmd, timeout=None):
+        if "--load-info-json" in cmd:
+            return 1, "HTTP Error 403"
+        assert "--write-info-json" in cmd
+        return 0, "ok"
+
+    monkeypatch.setattr(bot, "run_subprocess", fake_run_subprocess)
+
+    async def runner():
+        code, out = await _run_ytdlp_with_info_cache(
+            "https://youtube.com/watch?v=abc", ["yt-dlp"], str(tmp_path), 60
+        )
+        assert code == 0
+        assert out == "ok"
+        assert _get_cached_ytdlp_info("https://youtube.com/watch?v=abc") is None
+
+    asyncio.run(runner())
+
+
+# ── PR A: pre-emptive YouTube quality selection ──────────────────────────────
+
+
+def test_probe_youtube_quality_steps_down_when_too_big(monkeypatch):
+    monkeypatch.setattr(bot, "_ytdlp_info_cache", {})
+
+    async def fake_run_subprocess(cmd, timeout=None):
+        return 0, json.dumps({"filesize_approx": 100 * 1024 * 1024})
+
+    monkeypatch.setattr(bot, "run_subprocess", fake_run_subprocess)
+
+    async def runner():
+        result = await _probe_youtube_quality(
+            "https://youtube.com/watch?v=big", "1080", 10 * 1024 * 1024
+        )
+        assert result == "720"
+
+    asyncio.run(runner())
+
+
+def test_probe_youtube_quality_keeps_when_fits(monkeypatch):
+    monkeypatch.setattr(bot, "_ytdlp_info_cache", {})
+
+    async def fake_run_subprocess(cmd, timeout=None):
+        return 0, json.dumps({"filesize_approx": 5 * 1024 * 1024})
+
+    monkeypatch.setattr(bot, "run_subprocess", fake_run_subprocess)
+
+    async def runner():
+        result = await _probe_youtube_quality(
+            "https://youtube.com/watch?v=small", "1080", 10 * 1024 * 1024
+        )
+        assert result == "1080"
+
+    asyncio.run(runner())
+
+
+def test_probe_youtube_quality_uses_cached_info(monkeypatch):
+    monkeypatch.setattr(bot, "_ytdlp_info_cache", {})
+    _set_cached_ytdlp_info(
+        "https://youtube.com/watch?v=cached", {"filesize_approx": 100 * 1024 * 1024}
+    )
+
+    async def runner():
+        result = await _probe_youtube_quality(
+            "https://youtube.com/watch?v=cached", "1080", 10 * 1024 * 1024
+        )
+        assert result == "720"
+
+    asyncio.run(runner())
+
+
+def test_probe_youtube_quality_passes_through_low_qualities():
+    async def runner():
+        assert await _probe_youtube_quality("https://youtube.com/watch?v=abc", "720", 10) == "720"
+        assert await _probe_youtube_quality("https://youtube.com/watch?v=abc", "480", 10) == "480"
+        assert await _probe_youtube_quality("https://youtube.com/watch?v=abc", "360", 10) == "360"
+
+    asyncio.run(runner())

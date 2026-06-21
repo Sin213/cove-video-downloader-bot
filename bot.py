@@ -1941,7 +1941,7 @@ async def remux_streamable_mp4(src: str, dest: str) -> tuple[bool, str]:
 
 def ffmpeg_video_args(use_nvenc: bool, use_hevc: bool = False) -> list[str]:
     if use_nvenc:
-        return ["-c:v", "h264_nvenc", "-preset", "p5", "-tune", "hq"]
+        return ["-c:v", "h264_nvenc", "-preset", "p4"]
     if use_hevc:
         log.warning("[ffmpeg] HEVC requested but Discord upload output is forced to H.264.")
     return ["-c:v", "libx264", "-preset", "veryfast"]
@@ -1983,8 +1983,6 @@ async def compress_to_target(
             cmd += ["-hwaccel", "cuda"]
         cmd += ["-i", src]
         cmd += ffmpeg_video_args(use_nvenc, use_hevc)
-        if use_nvenc:
-            cmd += ["-multipass", "fullres"]
         cmd += [
             "-map", "0:v:0",
             "-map", "0:a?",

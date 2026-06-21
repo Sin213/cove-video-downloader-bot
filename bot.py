@@ -1414,6 +1414,8 @@ def user_facing_download_error(output: str, *, media: str = "video") -> str | No
         return "Unsupported, private, or unavailable URL."
     if "bad guest token" in lowered or ("querying api" in lowered and "twitter" in lowered):
         return "Twitter/X download failed (API error). Try again in a moment."
+    if "ip address is unable to access" in lowered:
+        return "Reddit API blocked the request. The post may be deleted or Reddit is restricting access."
     if "please update" in lowered and "yt-dlp" in lowered:
         return "yt-dlp looks stale for this site. Update yt-dlp and try again."
     return None
@@ -2254,6 +2256,9 @@ async def download_and_compress(
     else:
         _log.append("[WARN] No cookies.txt — some sites may fail.")
 
+    if is_reddit:
+        cmd.extend(["--impersonate", "chrome"])
+
     cmd.append(url)
 
     log.info("[yt-dlp] Running: %s", ' '.join(cmd))
@@ -2287,7 +2292,12 @@ async def download_and_compress(
         return None, "\n".join(_log)
 
     if code != 0:
-        if any(phrase.lower() in out.lower() for phrase in NO_VIDEO_PHRASES):
+        if is_youtube and (
+            "Sign in to confirm" in out
+            or "confirm you're not a bot" in out.lower()
+        ):
+            _log.append("[ERROR] YouTube bot detection triggered.")
+        elif any(phrase.lower() in out.lower() for phrase in NO_VIDEO_PHRASES):
             if is_instagram:
                 log.info("[cove] Instagram no-video response was unavailable, replying without rewrite.")
                 _log.append(
@@ -2332,11 +2342,6 @@ async def download_and_compress(
         elif "Unsupported URL" in out and is_twitter:
             log.info("[cove] X/Twitter post has no downloadable video — ignoring silently.")
             _log.append("[NOVIDEO]")
-        elif is_youtube and (
-            "Sign in to confirm" in out
-            or "confirm you're not a bot" in out.lower()
-        ):
-            _log.append("[ERROR] YouTube bot detection triggered.")
         elif "empty media response" in out.lower():
             log.info("[cove] Instagram empty media response — account banned or post deleted.")
             _log.append("[ERROR] Instagram post is unavailable (private, restricted, deleted, or the account may be banned).")
@@ -2479,6 +2484,9 @@ async def download_and_clip(
     if COOKIES_EXIST:
         cmd.extend(["--cookies", COOKIES_FILE])
 
+    if is_reddit:
+        cmd.extend(["--impersonate", "chrome"])
+
     cmd.append(url)
 
     log.info("[yt-dlp clip] Running: %s", ' '.join(cmd))
@@ -2602,6 +2610,9 @@ async def download_and_gif(url: str, guild: discord.Guild | None) -> tuple:
     if COOKIES_EXIST:
         cmd.extend(["--cookies", COOKIES_FILE])
 
+    if is_reddit:
+        cmd.extend(["--impersonate", "chrome"])
+
     cmd.append(url)
 
     log.info("[yt-dlp gif] Running: %s", ' '.join(cmd))
@@ -2724,6 +2735,9 @@ async def download_audio(url: str, guild: discord.Guild | None) -> tuple:
             _log.append("[INFO] Using cookies.")
         else:
             _log.append("[WARN] No cookies.txt — some sites may fail.")
+
+        if is_reddit:
+            cmd.extend(["--impersonate", "chrome"])
 
         cmd.append(url)
 

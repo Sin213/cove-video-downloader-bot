@@ -1867,7 +1867,8 @@ async def twitter_has_video(url: str) -> bool:
             _cache_set(_twitter_probe_cache, tweet_id, True, PROBE_FAILURE_CACHE_TTL)
             return True
         media = tweet.get("media") or {}
-        has_vid = bool(media.get("videos"))
+        quote_media = (tweet.get("quote") or {}).get("media") or {}
+        has_vid = bool(media.get("videos")) or bool(quote_media.get("videos"))
         log.info("[twitter-probe] tweet %s has_video=%s", tweet_id, has_vid)
         _cache_set(_twitter_probe_cache, tweet_id, has_vid, TWITTER_PROBE_CACHE_TTL)
         return has_vid

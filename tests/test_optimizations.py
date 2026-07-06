@@ -3,6 +3,7 @@ import json
 import os
 import sqlite3
 import tempfile
+import time
 from unittest.mock import MagicMock
 
 import discord
@@ -15,7 +16,8 @@ from bot import (
     parse_timestamp,
     _inflight_urls,
     _inflight_key,
-    _persist_cache_entry,
+    _cache_write_queue,
+    _flush_cache_writes,
     CACHE_DB_PATH,
     ENCODE_SEMAPHORE,
     MAX_CONCURRENT_JOBS,
@@ -57,18 +59,17 @@ def test_encode_semaphore_exists():
     assert ENCODE_SEMAPHORE._value == NVENC_MAX_SESSIONS
 
 
-def test_ffmpeg_args_h264_nvenc_p5():
+def test_ffmpeg_args_h264_nvenc():
     args = ffmpeg_video_args(use_nvenc=True)
     assert "-c:v" in args
     assert "h264_nvenc" in args
-    assert "p5" in args
-    assert "hq" in args
+    assert "p2" in args
 
 
 def test_ffmpeg_args_hevc_nvenc():
     args = ffmpeg_video_args(use_nvenc=True, use_hevc=True)
     assert "h264_nvenc" in args
-    assert "p5" in args
+    assert "p2" in args
 
 
 def test_ffmpeg_args_libx264_fallback():
@@ -162,7 +163,8 @@ def test_persistent_cache_roundtrip():
 
 
 def test_persist_cache_entry_bool():
-    _persist_cache_entry("test_bool_key", True, "has_video", 3600)
+    _cache_write_queue.append(("test_bool_key", "1", "has_video", time.time() + 3600))
+    _flush_cache_writes()
     try:
         conn = sqlite3.connect(CACHE_DB_PATH)
         row = conn.execute(
@@ -181,7 +183,8 @@ def test_persist_cache_entry_bool():
 
 
 def test_persist_cache_entry_string():
-    _persist_cache_entry("test_str_key", "https://reddit.com/r/test/comments/abc", "shortlink", 3600)
+    _cache_write_queue.append(("test_str_key", "https://reddit.com/r/test/comments/abc", "shortlink", time.time() + 3600))
+    _flush_cache_writes()
     try:
         conn = sqlite3.connect(CACHE_DB_PATH)
         row = conn.execute(

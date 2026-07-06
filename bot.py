@@ -80,7 +80,7 @@ NYO_EMOJI            = "<:NYO:1312902725750624316>"
 MAX_CONCURRENT_JOBS    = _require_int_env("MAX_CONCURRENT_JOBS", default="8")
 MAX_QUEUED_JOBS        = _require_int_env("MAX_QUEUED_JOBS", default="16")
 SUBPROCESS_TIMEOUT     = _require_int_env("SUBPROCESS_TIMEOUT", default="900")
-REDDIT_YTDLP_TIMEOUT   = _require_int_env("REDDIT_YTDLP_TIMEOUT", allow_zero=False, default="45")
+REDDIT_YTDLP_TIMEOUT   = _require_int_env("REDDIT_YTDLP_TIMEOUT", allow_zero=False, default="90")
 DELETE_TTL_SECONDS     = _require_int_env("DELETE_TTL_SECONDS", default="21600")
 FRIEND_POST_TTL_SECONDS = _require_int_env("FRIEND_POST_TTL_SECONDS", default="86400")
 YT_DLP_FRAGMENTS       = _require_int_env("YT_DLP_FRAGMENTS", default="16")
@@ -104,6 +104,7 @@ REDDIT_PRECHECK_TIMEOUT = _require_int_env("REDDIT_PRECHECK_TIMEOUT", allow_zero
 
 JOB_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
 ENCODE_SEMAPHORE = asyncio.Semaphore(NVENC_MAX_SESSIONS)
+GIF_SEMAPHORE = asyncio.Semaphore(max(1, MAX_CONCURRENT_JOBS // 2))
 
 YT_DLP_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
@@ -319,7 +320,8 @@ _instagram_probe_cache: dict[str, tuple[tuple[bool, int | None, str | None], flo
 _twitter_probe_cache: dict[str, tuple[bool, float]] = {}
 SHORTLINK_CACHE_TTL = 24 * 3600
 HAS_VIDEO_CACHE_TTL = 3600
-INSTAGRAM_PROBE_CACHE_TTL = 10 * 60
+INSTAGRAM_PROBE_CACHE_TTL = 3600
+INSTAGRAM_PROBE_UNAVAIL_TTL = 2 * 60
 TWITTER_PROBE_CACHE_TTL = 10 * 60
 FXTWITTER_API_TIMEOUT = 8
 KKINSTAGRAM_PROBE_TIMEOUT = 8
@@ -336,7 +338,7 @@ _queued_jobs = 0
 
 # yt-dlp info.json cache: keyed by canonical URL, TTL in seconds.
 _ytdlp_info_cache: dict[str, tuple[dict, float]] = {}
-YT_DLP_INFO_CACHE_TTL = 300
+YT_DLP_INFO_CACHE_TTL = 1800
 
 
 def _cache_get(cache: dict, key: str):
@@ -540,25 +542,30 @@ def _init_persistent_cache() -> None:
         log.warning("[Cove] Could not load persistent cache: %s", e)
 
 
-def _persist_cache_entry(key: str, value, cache_type: str, ttl: float) -> None:
+_cache_write_queue: list[tuple[str, str, str, float]] = []
+
+
+def _flush_cache_writes() -> None:
     conn = _get_cache_db()
-    if conn is None:
+    if conn is None or not _cache_write_queue:
         return
-    str_value = str(int(value)) if isinstance(value, bool) else str(value)
+    batch = _cache_write_queue[:]
+    _cache_write_queue.clear()
     try:
-        conn.execute(
+        conn.executemany(
             "INSERT OR REPLACE INTO url_cache (key, value, cache_type, expires_at) VALUES (?, ?, ?, ?)",
-            (key, str_value, cache_type, time() + ttl),
+            batch,
         )
         conn.commit()
     except Exception as e:
-        log.warning("[cache] Failed to persist: %s", e)
+        log.warning("[cache] Failed to flush %d writes: %s", len(batch), e)
 
 
 async def _persist_cache_entry_async(key: str, value, cache_type: str, ttl: float) -> None:
     if not PERSISTENT_CACHE:
         return
-    await asyncio.to_thread(_persist_cache_entry, key, value, cache_type, ttl)
+    str_value = str(int(value)) if isinstance(value, bool) else str(value)
+    _cache_write_queue.append((key, str_value, cache_type, time() + ttl))
 
 
 _init_persistent_cache()
@@ -1777,7 +1784,7 @@ async def instagram_post_probe(url: str) -> tuple[bool, int | None, str | None]:
             )
             log.info("[instagram-probe] Post unavailable: %s", cache_key)
             result = (False, None, reason)
-            _cache_set(_instagram_probe_cache, cache_key, result, INSTAGRAM_PROBE_CACHE_TTL)
+            _cache_set(_instagram_probe_cache, cache_key, result, INSTAGRAM_PROBE_UNAVAIL_TTL)
             return result
         return False, None, None
 
@@ -1805,7 +1812,7 @@ async def instagram_post_probe(url: str) -> tuple[bool, int | None, str | None]:
     )
     log.info("[instagram-probe] Not embeddable, treating as unavailable: %s", cache_key)
     result = (False, None, reason)
-    _cache_set(_instagram_probe_cache, cache_key, result, INSTAGRAM_PROBE_CACHE_TTL)
+    _cache_set(_instagram_probe_cache, cache_key, result, INSTAGRAM_PROBE_UNAVAIL_TTL)
     return result
 
 
@@ -2098,7 +2105,7 @@ async def remux_streamable_mp4(src: str, dest: str) -> tuple[bool, str]:
         "-f", "mp4",
         dest,
     ]
-    code, out = await run_subprocess(cmd, timeout=FFMPEG_TIMEOUT, nice=True)
+    code, out = await run_subprocess(cmd, timeout=FFMPEG_TIMEOUT)
     if code != 0:
         return False, out
     return True, ""
@@ -2106,7 +2113,7 @@ async def remux_streamable_mp4(src: str, dest: str) -> tuple[bool, str]:
 
 def ffmpeg_video_args(use_nvenc: bool, use_hevc: bool = False) -> list[str]:
     if use_nvenc:
-        return ["-c:v", "h264_nvenc", "-preset", "p4"]
+        return ["-c:v", "h264_nvenc", "-preset", "p2"]
     if use_hevc:
         log.warning("[ffmpeg] HEVC requested but Discord upload output is forced to H.264.")
     return ["-c:v", "libx264", "-preset", "veryfast"]
@@ -2142,16 +2149,20 @@ async def compress_to_target(
         target_mb, duration, video_kbps, audio_kbps, initial_scale,
     )
 
-    def build_cmd(use_nvenc: bool, bitrate_kbps: int, use_hevc: bool = False) -> list[str]:
+    def build_cmd(use_nvenc: bool, bitrate_kbps: int, use_hevc: bool = False, scale_height: int | None = None) -> list[str]:
         cmd = ["ffmpeg", "-y"]
         if use_nvenc and USE_HWACCEL:
             cmd += ["-hwaccel", "cuda"]
         cmd += ["-i", src]
         cmd += ffmpeg_video_args(use_nvenc, use_hevc)
+        vf_parts = []
+        if scale_height is not None:
+            vf_parts.append(f"scale=-2:{scale_height}")
+        vf_parts.append("format=yuv420p")
         cmd += [
             "-map", "0:v:0",
             "-map", "0:a?",
-            "-pix_fmt", "yuv420p",
+            "-vf", ",".join(vf_parts),
             "-profile:v", "high",
             "-tag:v", "avc1",
             "-b:v", f"{bitrate_kbps}k",
@@ -2224,6 +2235,41 @@ async def compress_to_target(
 
             if code != 0:
                 log.error("[ffmpeg ERROR]\n%s", last_error)
+                break
+
+        if last_error and "still exceeds" in last_error:
+            for res_height in (720, 480):
+                res_kbps = max(250, int(video_kbps * 0.76))
+                log.info("[ffmpeg] Trying resolution reduction to %dp at %sk", res_height, res_kbps)
+                use_nvenc_res = USE_NVENC
+                code, out = await run_subprocess(
+                    build_cmd(use_nvenc_res, res_kbps, scale_height=res_height),
+                    timeout=FFMPEG_TIMEOUT,
+                    nice=True,
+                )
+                if code != 0:
+                    if not use_nvenc_res:
+                        last_error = out
+                        break
+                    code, out = await run_subprocess(
+                        build_cmd(False, res_kbps, scale_height=res_height),
+                        timeout=FFMPEG_TIMEOUT,
+                        nice=True,
+                    )
+                    if code != 0:
+                        last_error = out
+                        break
+
+                final_size = os.path.getsize(dest)
+                final_mb = final_size / (1024 * 1024)
+                log.info("[ffmpeg] Resolution=%dp Video=%sk Output=%.2f MB", res_height, res_kbps, final_mb)
+                if final_size <= target_size:
+                    return True, f"{final_mb:.2f} MB"
+
+                last_error = (
+                    f"Compressed file ({final_mb:.2f} MB) still exceeds "
+                    f"the {target_mb} MB limit."
+                )
 
         if last_error:
             return False, last_error
@@ -2260,7 +2306,7 @@ async def convert_to_gif(
         quality_levels = quality_levels[1:]
 
     final_mb = 0.0
-    async with ENCODE_SEMAPHORE:
+    async with GIF_SEMAPHORE:
         for width, fps in quality_levels:
             vf = f"fps={fps},scale={width}:-1:flags=lanczos"
 
@@ -2419,10 +2465,10 @@ async def download_and_compress(
     elif is_reddit:
         cmd += ["--http-chunk-size", "10M"]
 
-    if COOKIES_EXIST and not is_youtube:
+    if COOKIES_EXIST:
         cmd.extend(["--cookies", COOKIES_FILE])
         _log.append("[INFO] Using cookies.")
-    elif not is_youtube:
+    else:
         _log.append("[WARN] No cookies.txt — some sites may fail.")
 
     if is_reddit:
@@ -2581,9 +2627,13 @@ async def download_and_compress(
             "--max-filesize", f"{MAX_FILESIZE_MB}M",
             "--no-playlist",
             "-o", str(Path(tmp2) / "%(title)s.%(ext)s"),
-            url,
         ]
-        code2, out2 = await run_subprocess_timeout(cmd_720, SUBPROCESS_TIMEOUT)
+        if COOKIES_EXIST:
+            cmd_720.extend(["--cookies", COOKIES_FILE])
+        cmd_720.append(url)
+        code2, out2 = await _run_ytdlp_with_info_cache(
+            url, cmd_720, tmp2, SUBPROCESS_TIMEOUT, kind="video_720p",
+        )
         timer.mark("download_720")
         _log.append(out2.strip())
         mp4_files2 = list(Path(tmp2).glob("*.mp4"))
@@ -2636,10 +2686,6 @@ async def download_and_compress(
     timer.mark("compress")
 
     if ok:
-        final_info = await get_media_info(compressed)
-        timer.mark("final_ffprobe")
-        _, final_summary = discord_mp4_compatibility(final_info, compressed)
-        log.info("[cove] Compressed media info: %s", final_summary)
         _log.append(f"[OK] Final size: {result} ({timer.elapsed_str()})")
         return compressed, "\n".join(_log)
     else:
@@ -3382,9 +3428,19 @@ class CoveBot(discord.Client):
             except Exception as e:
                 log.warning("[Cove] Periodic temp sweep failed: %s", e)
 
+    async def _periodic_cache_flush(self):
+        while not self.is_closed():
+            await asyncio.sleep(5)
+            if _cache_write_queue:
+                try:
+                    await asyncio.get_running_loop().run_in_executor(None, _flush_cache_writes)
+                except Exception as e:
+                    log.warning("[Cove] Periodic cache flush failed: %s", e)
+
     async def setup_hook(self):
         await asyncio.get_running_loop().run_in_executor(None, _sweep_orphaned_tmpdirs)
         asyncio.create_task(self._periodic_temp_sweep())
+        asyncio.create_task(self._periodic_cache_flush())
         guild = discord.Object(id=GUILD_ID)
         self.tree.copy_global_to(guild=guild)
         await self._sync_tree_with_timeout(guild, "Primary")
@@ -3419,6 +3475,8 @@ class CoveBot(discord.Client):
                     log.warning("[Cove] Could not DM yt-dlp warning to guild owner: %s", e)
 
     async def close(self):
+        if _cache_write_queue:
+            await asyncio.get_running_loop().run_in_executor(None, _flush_cache_writes)
         await _close_http_session()
         await super().close()
 

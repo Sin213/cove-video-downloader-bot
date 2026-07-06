@@ -65,8 +65,8 @@ If the file is already under the limit, compression is skipped. Videos over 10 m
 ### 1. Install dependencies
 
 ```bash
-sudo pacman -S python yt-dlp ffmpeg
-pip install discord.py python-dotenv
+sudo pacman -S python ffmpeg
+pip install discord.py python-dotenv yt-dlp yt-dlp-ejs curl_cffi
 ```
 
 ### 2. Configure your environment

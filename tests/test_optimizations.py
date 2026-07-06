@@ -523,3 +523,23 @@ def test_probe_youtube_quality_passes_through_low_qualities():
         assert await _probe_youtube_quality("https://youtube.com/watch?v=abc", "360", 10) == "360"
 
     asyncio.run(runner())
+
+
+def test_reddit_impersonation_args_present_when_curl_cffi_available(monkeypatch):
+    monkeypatch.setattr(bot, "CURL_CFFI_AVAILABLE", True)
+    assert bot.reddit_impersonation_args() == ["--impersonate", "chrome"]
+
+
+def test_reddit_impersonation_args_empty_without_curl_cffi(monkeypatch):
+    monkeypatch.setattr(bot, "CURL_CFFI_AVAILABLE", False)
+    assert bot.reddit_impersonation_args() == []
+
+
+def test_reddit_no_media_phrases_match_ytdlp_output():
+    out = "ERROR: [Reddit] 1uiuvlk: No media found"
+    assert any(p in out.lower() for p in bot.REDDIT_NO_MEDIA_PHRASES)
+
+
+def test_reddit_no_media_phrases_skip_rate_limit_output():
+    out = "ERROR: HTTP Error 429: Too Many Requests"
+    assert not any(p in out.lower() for p in bot.REDDIT_NO_MEDIA_PHRASES)

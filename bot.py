@@ -31,6 +31,21 @@ logging.basicConfig(
 )
 log = logging.getLogger("cove")
 
+try:
+    import curl_cffi  # noqa: F401
+    CURL_CFFI_AVAILABLE = True
+except ImportError:
+    CURL_CFFI_AVAILABLE = False
+    log.error(
+        "[cove] curl_cffi is not installed - yt-dlp impersonation is unavailable. "
+        "Reddit downloads will run without --impersonate and may be blocked. "
+        "Fix: pip install curl_cffi (in the same environment as yt-dlp)."
+    )
+
+
+def reddit_impersonation_args() -> list[str]:
+    return ["--impersonate", "chrome"] if CURL_CFFI_AVAILABLE else []
+
 
 def _require_int_env(name: str, *, allow_zero: bool = True, default: str | None = None) -> int:
     raw = os.getenv(name, default)
@@ -185,6 +200,13 @@ NO_VIDEO_PHRASES = (
     "timed out",
     "TransportError",
     "Unable to download webpage",
+)
+
+REDDIT_NO_MEDIA_PHRASES = (
+    "no media",
+    "no video",
+    "is not a video",
+    "does not have a video",
 )
 
 INSTAGRAM_UNAVAILABLE_PHRASES = (
@@ -1974,6 +1996,9 @@ async def reddit_has_video(url: str) -> bool:
             headers=reddit_json_headers(),
             timeout=aiohttp.ClientTimeout(total=REDDIT_PRECHECK_TIMEOUT),
         ) as resp:
+            if resp.status != 200:
+                log.warning("[reddit-check] Pre-check got HTTP %d - letting yt-dlp try anyway.", resp.status)
+                return True
             content_type = resp.headers.get("Content-Type", "")
             if "json" not in content_type and "text" not in content_type:
                 log.warning("[security] Reddit API returned unexpected Content-Type: %s", content_type)
@@ -2472,7 +2497,7 @@ async def download_and_compress(
         _log.append("[WARN] No cookies.txt — some sites may fail.")
 
     if is_reddit:
-        cmd.extend(["--impersonate", "chrome"])
+        cmd.extend(reddit_impersonation_args())
 
     cmd.append(url)
 
@@ -2537,6 +2562,14 @@ async def download_and_compress(
                     "[ERROR] Link is unavailable. The account may be banned, private, restricted, "
                     "or the post may have been deleted or hidden."
                 )
+            elif is_reddit and REDDIT_POST_RE.search(url) and any(
+                phrase in out.lower() for phrase in REDDIT_NO_MEDIA_PHRASES
+            ):
+                vx_url = replace_hostname(url, "vxreddit.com")
+                log.info("[cove] Reddit non-video post (yt-dlp fallback), sending vxreddit rewrite: %s", vx_url)
+                _log.append(REDDIT_VXREDDIT_MARKER)
+                _log.append(vx_url)
+                _log.append("[NOVIDEO]")
             else:
                 log.info("[cove] No video / network issue — ignoring silently.")
                 _log.append("[NOVIDEO]")
@@ -2759,7 +2792,7 @@ async def download_and_clip(
         cmd.extend(["--cookies", COOKIES_FILE])
 
     if is_reddit:
-        cmd.extend(["--impersonate", "chrome"])
+        cmd.extend(reddit_impersonation_args())
 
     cmd.append(url)
 
@@ -2885,7 +2918,7 @@ async def download_and_gif(url: str, guild: discord.Guild | None) -> tuple:
         cmd.extend(["--cookies", COOKIES_FILE])
 
     if is_reddit:
-        cmd.extend(["--impersonate", "chrome"])
+        cmd.extend(reddit_impersonation_args())
 
     cmd.append(url)
 
@@ -3011,7 +3044,7 @@ async def download_audio(url: str, guild: discord.Guild | None) -> tuple:
             _log.append("[WARN] No cookies.txt — some sites may fail.")
 
         if is_reddit:
-            cmd.extend(["--impersonate", "chrome"])
+            cmd.extend(reddit_impersonation_args())
 
         cmd.append(url)
 

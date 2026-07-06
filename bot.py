@@ -404,6 +404,18 @@ def _set_cached_ytdlp_info(url: str, info: dict) -> None:
     _cache_set(_ytdlp_info_cache, canonical_url_for_key(url), info, YT_DLP_INFO_CACHE_TTL)
 
 
+# Resolved reddit URL -> original arazu URL, so a Reddit 403 can retry the
+# arazu mirror directly (arazu hosts the file itself; v.redd.it often 403s).
+_arazu_fallback_urls: dict[str, str] = {}
+_ARAZU_FALLBACK_MAX = 256
+
+
+def _remember_arazu_fallback(reddit_url: str, arazu_url: str) -> None:
+    if len(_arazu_fallback_urls) >= _ARAZU_FALLBACK_MAX:
+        _arazu_fallback_urls.pop(next(iter(_arazu_fallback_urls)), None)
+    _arazu_fallback_urls[canonical_url_for_key(reddit_url)] = arazu_url
+
+
 def _read_info_json_from_tmp(tmp: str) -> dict | None:
     info_files = list(Path(tmp).glob("*.info.json"))
     if not info_files:
@@ -450,6 +462,24 @@ async def _run_ytdlp_with_info_cache(
 
     fresh_cmd = cmd + ["--write-info-json"]
     code, out = await run_subprocess_timeout(fresh_cmd, timeout)
+    if code != 0 and "HTTP Error 403" in out:
+        fallback_url = _arazu_fallback_urls.get(canonical_url_for_key(url))
+        if fallback_url:
+            log.warning(
+                "[yt-dlp %s] Reddit gave 403; retrying directly from arazu: %s",
+                kind, fallback_url,
+            )
+            for stale in Path(tmp).glob("*.info.json"):
+                stale.unlink(missing_ok=True)
+            fb_cmd = [fallback_url if arg == url else arg for arg in cmd]
+            fb_cmd += ["--write-info-json"]
+            code, out = await run_subprocess_timeout(fb_cmd, timeout)
+            if code == 0:
+                info = _read_info_json_from_tmp(tmp)
+                if info is not None:
+                    _set_cached_ytdlp_info(fallback_url, info)
+                    _set_cached_ytdlp_info(url, info)
+            return code, out
     if code == 0:
         info = _read_info_json_from_tmp(tmp)
         if info is not None:
@@ -2046,6 +2076,7 @@ async def resolve_arazu(url: str) -> str:
         if match:
             reddit_url = match.group(1).replace("old.reddit.com", "www.reddit.com")
             log.info("[arazu] Resolved to: %s", reddit_url)
+            _remember_arazu_fallback(reddit_url, url)
             return reddit_url
         log.warning("[arazu] Could not find Reddit link in page.")
     except Exception as e:

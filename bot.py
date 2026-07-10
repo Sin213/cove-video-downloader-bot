@@ -257,6 +257,7 @@ INSTAGRAM_GALLERY_MAX_IMAGES = 20
 INSTAGRAM_SHORTCODE_ALPHABET = (
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
 )
+INSTAGRAM_CONTENT_PATH_PREFIXES = {"p", "reel", "reels", "tv", "stories", "share"}
 REDDIT_IMAGE_EXTENSIONS = {"jpg", "jpeg", "png", "webp"}
 REDDIT_IMAGE_HOSTS = {"i.redd.it", "preview.redd.it"}
 
@@ -1454,6 +1455,22 @@ def parse_timestamp(ts: str) -> float | None:
     return None
 
 
+def is_instagram_noncontent_url(url: str) -> bool:
+    """True for Instagram links that are not a specific post/reel/story, e.g.
+    profile pages (/username), profile tabs (/username/reels), or bare instagram.com."""
+    if hostname_for(url) != "instagram.com":
+        return False
+    parts = [p.lower() for p in urlparse(url).path.split("/") if p]
+    if not parts:
+        return True
+    for i in (0, 1):
+        # Content prefix may follow a username, e.g. /username/reel/<id>,
+        # and must be followed by an id segment (bare /username/reels is a tab).
+        if i < len(parts) and parts[i] in INSTAGRAM_CONTENT_PATH_PREFIXES and len(parts) > i + 1:
+            return False
+    return True
+
+
 def extract_supported_url(content: str) -> str | None:
     for match in URL_RE.finditer(content):
         url = match.group(0).rstrip(").,>")
@@ -1466,6 +1483,9 @@ def extract_supported_url(content: str) -> str | None:
         if is_twitter_photo_url(url):
             continue
         if urlparse(url).path.lower().endswith(".gif"):
+            continue
+        if is_instagram_noncontent_url(url):
+            log.info("[cove] Ignoring Instagram profile/non-post link: %s", url)
             continue
         if host_matches(host, AUTO_DOWNLOAD_DOMAINS):
             return url

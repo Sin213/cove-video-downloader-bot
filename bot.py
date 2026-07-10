@@ -2015,6 +2015,13 @@ async def instagram_post_probe(url: str) -> tuple[bool, int | None, str | None]:
     if metadata is None:
         out_lower = out.lower()
         if any(phrase.lower() in out_lower for phrase in INSTAGRAM_UNAVAILABLE_PHRASES):
+            if await _kkinstagram_is_embeddable(url):
+                # Direct extraction is blocked (e.g. account action-blocked) but the
+                # post still has media; let the download path use its kkinstagram fallback.
+                log.info("[instagram-probe] Probe blocked but kkinstagram has media, deferring: %s", cache_key)
+                result = (False, None, None)
+                _cache_set(_instagram_probe_cache, cache_key, result, INSTAGRAM_PROBE_UNAVAIL_TTL)
+                return result
             reason = (
                 "This post is unavailable. The account may be banned, private, "
                 "restricted, or the post may have been deleted or hidden."
@@ -2219,6 +2226,52 @@ async def send_instagram_gallery(message: discord.Message, url: str) -> bool:
         log_prefix=f"[instagram-gallery] {url} -",
     )
     return bool(sent)
+
+
+async def download_instagram_via_kkinstagram(url: str, tmp: str) -> tuple[str | None, str | None]:
+    """Fetch post media via the kkinstagram redirect when direct extraction fails.
+
+    Returns ("video", filepath) when a video was saved into tmp, ("image", None)
+    when the post resolves to image media (caller should send the link rewrite),
+    or (None, None) when kkinstagram has no media either.
+    """
+    kk_url = replace_hostname(url, "www.kkinstagram.com")
+    parts = [p for p in urlparse(url).path.split("/") if p]
+    shortcode = _sanitize_filename(parts[-1]) if parts else "video"
+    filepath = str(Path(tmp) / f"instagram_{shortcode}.mp4")
+    try:
+        session = _get_http_session()
+        async with session.get(
+            kk_url,
+            timeout=aiohttp.ClientTimeout(total=180, connect=15),
+            headers={"User-Agent": KKINSTAGRAM_DISCORD_UA},
+            allow_redirects=True,
+        ) as resp:
+            content_type = (resp.content_type or "").lower()
+            if resp.status != 200:
+                log.info("[kkinstagram-fallback] HTTP %d for %s", resp.status, url)
+                return None, None
+            if "image" in content_type:
+                return "image", None
+            if "video" not in content_type:
+                log.info("[kkinstagram-fallback] Non-media response (%s) for %s", content_type, url)
+                return None, None
+            max_bytes = MAX_FILESIZE_MB * 1024 * 1024
+            size = 0
+            with open(filepath, "wb") as f:
+                async for chunk in resp.content.iter_chunked(1024 * 64):
+                    size += len(chunk)
+                    if size > max_bytes:
+                        log.info("[kkinstagram-fallback] Video exceeded %dMB cap for %s", MAX_FILESIZE_MB, url)
+                        return None, None
+                    f.write(chunk)
+        if size == 0:
+            return None, None
+        log.info("[kkinstagram-fallback] Downloaded %.1f MB for %s", size / (1024 * 1024), url)
+        return "video", filepath
+    except Exception as e:
+        log.warning("[kkinstagram-fallback] Download failed (%s) for %s", e, url)
+        return None, None
 
 
 async def instagram_is_image_post(url: str) -> bool:
@@ -2912,6 +2965,26 @@ async def download_and_compress(
         shutil.rmtree(tmp, ignore_errors=True)
         _log.append("[ERROR] Access denied (403). Cookies may be needed or expired.")
         return None, "\n".join(_log)
+
+    if code != 0 and is_instagram and not is_instagram_noncontent_url(url):
+        # yt-dlp runs with --no-part and may leave a partial file behind; remove
+        # leftovers so the mp4 glob below can only pick up the fallback download.
+        for leftover in Path(tmp).glob("*"):
+            try:
+                leftover.unlink()
+            except OSError:
+                pass
+        kk_kind, kk_path = await download_instagram_via_kkinstagram(url, tmp)
+        if kk_kind == "video" and kk_path:
+            log.info("[cove] Instagram extraction failed, kkinstagram video fallback succeeded: %s", url)
+            _log.append("[INFO] Downloaded via kkinstagram fallback.")
+            code = 0
+        elif kk_kind == "image":
+            log.info("[cove] Instagram extraction failed, kkinstagram has image media, sending rewrite: %s", url)
+            _log.append(INSTAGRAM_IMAGE_MARKER)
+            _log.append("[NOVIDEO]")
+            shutil.rmtree(tmp, ignore_errors=True)
+            return None, "\n".join(_log)
 
     if code != 0:
         if is_youtube and (

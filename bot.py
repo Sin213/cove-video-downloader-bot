@@ -11,6 +11,7 @@ import re
 import shutil
 import socket
 import subprocess
+import io
 import sys
 import tempfile
 import json
@@ -246,6 +247,12 @@ TWITTER_IMAGE_MARKER = "[TWITTER_IMAGE]"
 REDDIT_VXREDDIT_MARKER = "[REDDIT_VXREDDIT]"
 INSTAGRAM_IMAGE_EXTENSIONS = {"jpg", "jpeg", "png", "webp", "heic"}
 INSTAGRAM_VIDEO_EXTENSIONS = {"mp4", "m4v", "mov", "webm"}
+INSTAGRAM_APP_ID = "936619743392459"
+INSTAGRAM_GALLERY_TIMEOUT = 10
+INSTAGRAM_GALLERY_MAX_IMAGES = 20
+INSTAGRAM_SHORTCODE_ALPHABET = (
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_"
+)
 REDDIT_IMAGE_EXTENSIONS = {"jpg", "jpeg", "png", "webp"}
 REDDIT_IMAGE_HOSTS = {"i.redd.it", "preview.redd.it"}
 
@@ -671,6 +678,25 @@ def reddit_cookie_header() -> str | None:
         return None
 
 
+def instagram_cookie_header() -> str | None:
+    if not COOKIES_EXIST:
+        return None
+    try:
+        jar = MozillaCookieJar(COOKIES_FILE)
+        jar.load(ignore_discard=True, ignore_expires=True)
+        values = []
+        for cookie in jar:
+            domain = cookie.domain.lower().lstrip(".")
+            if domain.startswith("#httponly_"):
+                domain = domain[len("#httponly_"):]
+            if domain == "instagram.com" or domain.endswith(".instagram.com"):
+                values.append(f"{cookie.name}={cookie.value}")
+        return "; ".join(values) or None
+    except Exception as e:
+        log.warning("[instagram] Could not load cookies.txt for API request: %s", e)
+        return None
+
+
 def reddit_json_headers() -> dict[str, str]:
     headers = {"User-Agent": REDDIT_UA, "Accept": "application/json"}
     cookie_header = reddit_cookie_header()
@@ -992,11 +1018,17 @@ async def send_instagram_image_rewrite(message: discord.Message, url: str, log_t
     rewritten = rewrite_instagram_image_url(url, log_text)
     if not rewritten:
         return False
+    posted_gallery = False
     try:
-        await message.channel.send(rewritten)
-    except discord.HTTPException as e:
-        log.warning("[cove] Failed to send Instagram image/text rewrite: %s", e)
-        return False
+        posted_gallery = await send_instagram_gallery(message, url)
+    except Exception as e:
+        log.warning("[instagram-gallery] Unexpected gallery failure (%s) for %s", e, url)
+    if not posted_gallery:
+        try:
+            await message.channel.send(rewritten)
+        except discord.HTTPException as e:
+            log.warning("[cove] Failed to send Instagram image/text rewrite: %s", e)
+            return False
     try:
         await message.delete()
     except discord.Forbidden as e:
@@ -1887,6 +1919,124 @@ async def _kkinstagram_is_embeddable(url: str) -> bool:
     except Exception as e:
         log.warning("[kkinstagram-probe] Probe failed (%s) for %s, assuming embeddable.", e, url)
         return True
+
+
+def _instagram_shortcode_from_url(url: str) -> str | None:
+    parts = [part for part in urlparse(url).path.split("/") if part]
+    if len(parts) == 2 and parts[0] == "p" and parts[1]:
+        return parts[1]
+    return None
+
+
+def _instagram_shortcode_to_pk(shortcode: str) -> int | None:
+    # Media pk is the base64url decode of the first 11 shortcode characters.
+    pk = 0
+    for ch in shortcode[:11]:
+        index = INSTAGRAM_SHORTCODE_ALPHABET.find(ch)
+        if index < 0:
+            return None
+        pk = pk * 64 + index
+    return pk or None
+
+
+async def fetch_instagram_gallery_image_urls(url: str) -> list[str]:
+    """Returns direct CDN URLs for each image of a carousel post, or [] if not a gallery."""
+    shortcode = _instagram_shortcode_from_url(url)
+    pk = _instagram_shortcode_to_pk(shortcode) if shortcode else None
+    if pk is None:
+        return []
+    headers = {
+        "User-Agent": YT_DLP_UA,
+        "X-IG-App-ID": INSTAGRAM_APP_ID,
+        "Accept": "application/json",
+    }
+    cookie_header = instagram_cookie_header()
+    if cookie_header:
+        headers["Cookie"] = cookie_header
+    api_url = f"https://www.instagram.com/api/v1/media/{pk}/info/"
+    try:
+        session = _get_http_session()
+        async with session.get(
+            api_url,
+            timeout=aiohttp.ClientTimeout(total=INSTAGRAM_GALLERY_TIMEOUT),
+            headers=headers,
+        ) as resp:
+            if resp.status != 200:
+                log.info("[instagram-gallery] API returned %d for %s", resp.status, url)
+                return []
+            data = await resp.json(content_type=None)
+    except Exception as e:
+        log.warning("[instagram-gallery] API request failed (%s) for %s", e, url)
+        return []
+    items = data.get("items") if isinstance(data, dict) else None
+    if not isinstance(items, list) or not items or not isinstance(items[0], dict):
+        return []
+    carousel = items[0].get("carousel_media")
+    if not isinstance(carousel, list) or len(carousel) < 2:
+        return []
+    urls: list[str] = []
+    for item in carousel[:INSTAGRAM_GALLERY_MAX_IMAGES]:
+        # media_type 1 = image; skip any video items in mixed carousels.
+        if not isinstance(item, dict) or item.get("media_type") != 1:
+            continue
+        candidates = (item.get("image_versions2") or {}).get("candidates")
+        if isinstance(candidates, list) and candidates and isinstance(candidates[0], dict):
+            image_url = candidates[0].get("url")
+            if image_url:
+                urls.append(str(image_url))
+    return urls if len(urls) >= 2 else []
+
+
+async def send_instagram_gallery(message: discord.Message, url: str) -> bool:
+    image_urls = await fetch_instagram_gallery_image_urls(url)
+    if not image_urls:
+        return False
+    limit_bytes = int(get_target_mb(message.guild) * 1024 * 1024)
+    files: list[tuple[str, bytes]] = []
+    session = _get_http_session()
+    for index, image_url in enumerate(image_urls, start=1):
+        try:
+            async with session.get(
+                image_url,
+                timeout=aiohttp.ClientTimeout(total=INSTAGRAM_GALLERY_TIMEOUT),
+                headers={"User-Agent": YT_DLP_UA},
+            ) as resp:
+                if resp.status != 200:
+                    log.warning(
+                        "[instagram-gallery] Image %d returned %d for %s",
+                        index, resp.status, url,
+                    )
+                    return False
+                data = await read_limited_response(resp, limit_bytes)
+        except Exception as e:
+            log.warning("[instagram-gallery] Image %d download failed (%s) for %s", index, e, url)
+            return False
+        ext = "jpg"
+        path = urlparse(image_url).path.lower()
+        for known in INSTAGRAM_IMAGE_EXTENSIONS:
+            if path.endswith(f".{known}"):
+                ext = known
+                break
+        files.append((f"{index:02d}.{ext}", data))
+
+    sent_messages: list[discord.Message] = []
+    try:
+        for start in range(0, len(files), 10):
+            chunk = [
+                discord.File(io.BytesIO(data), filename=name)
+                for name, data in files[start:start + 10]
+            ]
+            sent_messages.append(await message.channel.send(files=chunk))
+    except discord.HTTPException as e:
+        log.warning("[instagram-gallery] Failed to send gallery: %s", e)
+        for sent in sent_messages:
+            try:
+                await sent.delete()
+            except discord.HTTPException:
+                pass
+        return False
+    log.info("[instagram-gallery] Posted %d images for %s", len(files), url)
+    return True
 
 
 async def instagram_is_image_post(url: str) -> bool:

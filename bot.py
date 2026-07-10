@@ -245,6 +245,10 @@ REDDIT_GIF_MARKER = "[REDDIT_GIF]"
 REDDIT_IMAGE_MARKER = "[REDDIT_IMAGE]"
 TWITTER_IMAGE_MARKER = "[TWITTER_IMAGE]"
 REDDIT_VXREDDIT_MARKER = "[REDDIT_VXREDDIT]"
+REDDIT_GALLERY_MARKER = "[REDDIT_GALLERY]"
+REDDIT_GALLERY_MAX_IMAGES = 20
+GALLERY_IMAGE_TIMEOUT = 10
+GALLERY_FILE_EXTENSIONS = {"jpg", "jpeg", "png", "webp", "heic", "gif"}
 INSTAGRAM_IMAGE_EXTENSIONS = {"jpg", "jpeg", "png", "webp", "heic"}
 INSTAGRAM_VIDEO_EXTENSIONS = {"mp4", "m4v", "mov", "webm"}
 INSTAGRAM_APP_ID = "936619743392459"
@@ -345,6 +349,7 @@ _reddit_cookie_header_cache: tuple[float, str | None, float] | None = None
 # if a post is edited, so it gets a shorter TTL.
 _reddit_shortlink_cache: dict[str, tuple[str, float]] = {}
 _reddit_has_video_cache: dict[str, tuple[bool, float]] = {}
+_reddit_gallery_cache: dict[str, tuple[tuple[str, ...], float]] = {}
 _instagram_probe_cache: dict[str, tuple[tuple[bool, int | None, str | None], float]] = {}
 _twitter_probe_cache: dict[str, tuple[bool, float]] = {}
 SHORTLINK_CACHE_TTL = 24 * 3600
@@ -703,6 +708,56 @@ def reddit_json_headers() -> dict[str, str]:
     if cookie_header:
         headers["Cookie"] = cookie_header
     return headers
+
+
+_curl_session = None
+
+
+def _get_curl_session():
+    global _curl_session
+    if _curl_session is None:
+        from curl_cffi.requests import AsyncSession
+        _curl_session = AsyncSession(impersonate="chrome")
+    return _curl_session
+
+
+async def _reddit_api_get_json(api_url: str, timeout_seconds: int) -> tuple[int | None, object | None]:
+    """GET a Reddit JSON API URL, impersonating Chrome via curl_cffi when available.
+
+    Reddit 403s plain aiohttp requests based on TLS fingerprint even with valid
+    cookies, so curl_cffi is required for these calls to succeed.
+    Returns (status, parsed_json). parsed_json is None on any non-200 or non-JSON response.
+    """
+    headers = reddit_json_headers()
+    if CURL_CFFI_AVAILABLE:
+        try:
+            session = _get_curl_session()
+            resp = await session.get(api_url, headers=headers, timeout=timeout_seconds)
+            if resp.status_code != 200:
+                return resp.status_code, None
+            content_type = resp.headers.get("Content-Type", "")
+            if "json" not in content_type and "text" not in content_type:
+                log.warning("[security] Reddit API returned unexpected Content-Type: %s", content_type)
+                return resp.status_code, None
+            if len(resp.content) > MAX_HTTP_RESPONSE_BYTES:
+                raise ValueError(f"response exceeded {MAX_HTTP_RESPONSE_BYTES} bytes")
+            return resp.status_code, json.loads(resp.content.decode(errors="replace"))
+        except Exception as e:
+            log.warning("[reddit-api] curl_cffi request failed (%s), falling back to aiohttp.", e)
+    session = _get_http_session()
+    async with session.get(
+        api_url,
+        headers=headers,
+        timeout=aiohttp.ClientTimeout(total=timeout_seconds),
+    ) as resp:
+        if resp.status != 200:
+            return resp.status, None
+        content_type = resp.headers.get("Content-Type", "")
+        if "json" not in content_type and "text" not in content_type:
+            log.warning("[security] Reddit API returned unexpected Content-Type: %s", content_type)
+            return resp.status, None
+        body = await read_limited_response(resp, MAX_HTTP_RESPONSE_BYTES)
+        return resp.status, json.loads(body.decode(errors="replace"))
 
 
 async def read_limited_response(resp: aiohttp.ClientResponse, limit: int) -> bytes:
@@ -1191,24 +1246,102 @@ def reddit_image_url_from_post(post: dict) -> str | None:
     return None
 
 
+def reddit_gallery_image_urls_from_post(post: dict) -> list[str]:
+    media_metadata = post.get("media_metadata")
+    gallery_data = post.get("gallery_data")
+    if not isinstance(media_metadata, dict) or not isinstance(gallery_data, dict):
+        return []
+    items = gallery_data.get("items")
+    if not isinstance(items, list):
+        return []
+    urls: list[str] = []
+    for item in items[:REDDIT_GALLERY_MAX_IMAGES]:
+        if not isinstance(item, dict):
+            continue
+        meta = media_metadata.get(item.get("media_id"))
+        if not isinstance(meta, dict):
+            continue
+        source = meta.get("s")
+        if not isinstance(source, dict):
+            continue
+        image_url = source.get("u") or source.get("gif")
+        if not isinstance(image_url, str) or not image_url:
+            continue
+        image_url = html_unescape(image_url)
+        if _is_valid_reddit_gallery_url(image_url):
+            urls.append(image_url)
+    return urls if len(urls) >= 2 else []
+
+
+def _is_valid_reddit_gallery_url(image_url: str) -> bool:
+    parsed = urlparse(image_url)
+    if parsed.scheme != "https" or hostname_for(image_url) not in REDDIT_IMAGE_HOSTS:
+        return False
+    ext = parsed.path.rsplit(".", 1)[-1].lower()
+    return ext in GALLERY_FILE_EXTENSIONS
+
+
+async def reddit_gallery_image_urls(url: str) -> list[str]:
+    if not REDDIT_POST_RE.search(url):
+        return []
+    api_url = reddit_api_url(url)
+    cached = _cache_get(_reddit_gallery_cache, api_url)
+    if cached is not None:
+        return list(cached)
+    try:
+        _status, data = await _reddit_api_get_json(api_url, REDDIT_PRECHECK_TIMEOUT)
+        if data is None:
+            return []
+        post = data[0]["data"]["children"][0]["data"]
+        urls = reddit_gallery_image_urls_from_post(post)
+        _cache_set(_reddit_gallery_cache, api_url, tuple(urls), HAS_VIDEO_CACHE_TTL)
+        return urls
+    except Exception as e:
+        log.warning("[reddit-gallery] Failed to resolve gallery: %s", e)
+        return []
+
+
+def reddit_gallery_urls_from_log(log_text: str) -> list[str]:
+    # Re-validate: the log also carries raw yt-dlp output, so marker-shaped
+    # lines cannot be trusted to contain only Reddit media URLs.
+    lines = log_text.splitlines()
+    for index, line in enumerate(lines):
+        if line.strip() == REDDIT_GALLERY_MARKER and index + 1 < len(lines):
+            urls = [
+                u for u in lines[index + 1].split(" ")
+                if u and _is_valid_reddit_gallery_url(u)
+            ]
+            return urls if len(urls) >= 2 else []
+    return []
+
+
+async def send_reddit_gallery(
+    message: discord.Message, image_urls: list[str], content: str | None = None
+) -> "list[discord.Message] | None":
+    sent = await _send_image_gallery_files(
+        message,
+        image_urls,
+        headers={"User-Agent": REDDIT_UA},
+        log_prefix="[reddit-gallery]",
+        content=content,
+    )
+    if sent is None:
+        return None
+    try:
+        await message.delete()
+    except discord.HTTPException:
+        pass
+    return sent
+
+
 async def reddit_image_url(url: str) -> str | None:
     if not REDDIT_POST_RE.search(url):
         return None
     api_url = reddit_api_url(url)
     try:
-        session = _get_http_session()
-        async with session.get(
-            api_url,
-            headers=reddit_json_headers(),
-            timeout=aiohttp.ClientTimeout(total=REDDIT_PRECHECK_TIMEOUT),
-        ) as resp:
-            content_type = resp.headers.get("Content-Type", "")
-            if "json" not in content_type and "text" not in content_type:
-                log.warning("[security] Reddit image API returned unexpected Content-Type: %s", content_type)
-                return None
-            body = await read_limited_response(resp, MAX_HTTP_RESPONSE_BYTES)
-            raw = body.decode(errors="replace")
-        data = json.loads(raw)
+        _status, data = await _reddit_api_get_json(api_url, REDDIT_PRECHECK_TIMEOUT)
+        if data is None:
+            return None
         post = data[0]["data"]["children"][0]["data"]
         return reddit_image_url_from_post(post)
     except Exception as e:
@@ -1987,10 +2120,19 @@ async def fetch_instagram_gallery_image_urls(url: str) -> list[str]:
     return urls if len(urls) >= 2 else []
 
 
-async def send_instagram_gallery(message: discord.Message, url: str) -> bool:
-    image_urls = await fetch_instagram_gallery_image_urls(url)
-    if not image_urls:
-        return False
+async def _send_image_gallery_files(
+    message: discord.Message,
+    image_urls: list[str],
+    *,
+    headers: dict[str, str],
+    log_prefix: str,
+    content: str | None = None,
+) -> "list[discord.Message] | None":
+    """Download images and upload them as Discord attachments in chunks of 10.
+
+    Returns all sent messages, or None if any download or send failed
+    (partially sent messages are deleted).
+    """
     limit_bytes = int(get_target_mb(message.guild) * 1024 * 1024)
     files: list[tuple[str, bytes]] = []
     session = _get_http_session()
@@ -1998,22 +2140,23 @@ async def send_instagram_gallery(message: discord.Message, url: str) -> bool:
         try:
             async with session.get(
                 image_url,
-                timeout=aiohttp.ClientTimeout(total=INSTAGRAM_GALLERY_TIMEOUT),
-                headers={"User-Agent": YT_DLP_UA},
+                timeout=aiohttp.ClientTimeout(total=GALLERY_IMAGE_TIMEOUT),
+                headers=headers,
             ) as resp:
                 if resp.status != 200:
-                    log.warning(
-                        "[instagram-gallery] Image %d returned %d for %s",
-                        index, resp.status, url,
-                    )
-                    return False
+                    log.warning("%s Image %d returned %d", log_prefix, index, resp.status)
+                    return None
+                content_type = (resp.content_type or "").lower()
+                if not content_type.startswith("image/"):
+                    log.warning("%s Image %d unexpected Content-Type: %s", log_prefix, index, content_type)
+                    return None
                 data = await read_limited_response(resp, limit_bytes)
         except Exception as e:
-            log.warning("[instagram-gallery] Image %d download failed (%s) for %s", index, e, url)
-            return False
+            log.warning("%s Image %d download failed (%s)", log_prefix, index, e)
+            return None
         ext = "jpg"
         path = urlparse(image_url).path.lower()
-        for known in INSTAGRAM_IMAGE_EXTENSIONS:
+        for known in GALLERY_FILE_EXTENSIONS:
             if path.endswith(f".{known}"):
                 ext = known
                 break
@@ -2026,17 +2169,36 @@ async def send_instagram_gallery(message: discord.Message, url: str) -> bool:
                 discord.File(io.BytesIO(data), filename=name)
                 for name, data in files[start:start + 10]
             ]
-            sent_messages.append(await message.channel.send(files=chunk))
+            sent_messages.append(
+                await message.channel.send(
+                    content=content if start == 0 else None,
+                    files=chunk,
+                    allowed_mentions=discord.AllowedMentions(users=False, everyone=False, roles=False),
+                )
+            )
     except discord.HTTPException as e:
-        log.warning("[instagram-gallery] Failed to send gallery: %s", e)
+        log.warning("%s Failed to send gallery: %s", log_prefix, e)
         for sent in sent_messages:
             try:
                 await sent.delete()
             except discord.HTTPException:
                 pass
+        return None
+    log.info("%s Posted %d images.", log_prefix, len(files))
+    return sent_messages if sent_messages else None
+
+
+async def send_instagram_gallery(message: discord.Message, url: str) -> bool:
+    image_urls = await fetch_instagram_gallery_image_urls(url)
+    if not image_urls:
         return False
-    log.info("[instagram-gallery] Posted %d images for %s", len(files), url)
-    return True
+    sent = await _send_image_gallery_files(
+        message,
+        image_urls,
+        headers={"User-Agent": YT_DLP_UA},
+        log_prefix=f"[instagram-gallery] {url} -",
+    )
+    return bool(sent)
 
 
 async def instagram_is_image_post(url: str) -> bool:
@@ -2170,23 +2332,17 @@ async def reddit_has_video(url: str) -> bool:
         log.info("[reddit-check] Cache hit for %s", api_url)
         return cached
     try:
-        session = _get_http_session()
-        async with session.get(
-            api_url,
-            headers=reddit_json_headers(),
-            timeout=aiohttp.ClientTimeout(total=REDDIT_PRECHECK_TIMEOUT),
-        ) as resp:
-            if resp.status != 200:
-                log.warning("[reddit-check] Pre-check got HTTP %d - letting yt-dlp try anyway.", resp.status)
-                return True
-            content_type = resp.headers.get("Content-Type", "")
-            if "json" not in content_type and "text" not in content_type:
-                log.warning("[security] Reddit API returned unexpected Content-Type: %s", content_type)
-                return True
-            body = await read_limited_response(resp, MAX_HTTP_RESPONSE_BYTES)
-            raw = body.decode(errors="replace")
-        data = json.loads(raw)
+        status, data = await _reddit_api_get_json(api_url, REDDIT_PRECHECK_TIMEOUT)
+        if data is None:
+            log.warning("[reddit-check] Pre-check got HTTP %s - letting yt-dlp try anyway.", status)
+            return True
         post = data[0]["data"]["children"][0]["data"]
+        _cache_set(
+            _reddit_gallery_cache,
+            api_url,
+            tuple(reddit_gallery_image_urls_from_post(post)),
+            HAS_VIDEO_CACHE_TTL,
+        )
         if post.get("is_video"):
             _cache_set(_reddit_has_video_cache, api_url, True, HAS_VIDEO_CACHE_TTL)
             await _persist_cache_entry_async(api_url, True, "has_video", HAS_VIDEO_CACHE_TTL)
@@ -2605,6 +2761,13 @@ async def download_and_compress(
         has_video = await reddit_has_video(url)
         timer.mark("reddit_probe")
         if not has_video:
+            gallery_urls = await reddit_gallery_image_urls(url)
+            if gallery_urls:
+                log.info("[cove] Reddit gallery post detected (%d images): %s", len(gallery_urls), url)
+                _log.append(REDDIT_GALLERY_MARKER)
+                _log.append(" ".join(gallery_urls))
+                _log.append("[NOVIDEO]")
+                return None, "\n".join(_log)
             vx_url = replace_hostname(url, "vxreddit.com")
             log.info("[cove] Reddit non-video post detected, sending vxreddit rewrite: %s", vx_url)
             _log.append(REDDIT_VXREDDIT_MARKER)
@@ -3851,6 +4014,48 @@ class CoveBot(discord.Client):
             reddit_gif_url = reddit_gif_url_from_log(log_text)
             if reddit_gif_url:
                 await send_reddit_gif_repost(message, reddit_gif_url)
+                return
+            gallery_urls = reddit_gallery_urls_from_log(log_text)
+            if gallery_urls:
+                if friend_mode:
+                    gallery_content = friend_target_post_content(extra_mentions, mention_names)
+                    if not gallery_content:
+                        gallery_content = friend_post_content(display_name, extra_mentions)
+                else:
+                    gallery_content = f"<@{author_id}> posted:"
+                    if extra_mentions:
+                        gallery_content += f" {extra_mentions}"
+                sent_gallery = await send_reddit_gallery(message, gallery_urls, gallery_content)
+                if sent_gallery is not None:
+                    if friend_mode:
+                        prune_friend_posts()
+                        for sent in sent_gallery:
+                            _friend_posts[sent.id] = (author_id, monotonic() + FRIEND_POST_TTL_SECONDS)
+                    else:
+                        prune_deletable()
+                        for sent in sent_gallery:
+                            _deletable[sent.id] = (author_id, monotonic() + DELETE_TTL_SECONDS)
+                            try:
+                                await sent.add_reaction("❌")
+                            except discord.HTTPException:
+                                pass
+                        if author_id in WHITELIST_IDS:
+                            try:
+                                await message.delete()
+                            except discord.HTTPException:
+                                pass
+                else:
+                    vx_url = replace_hostname(url, "vxreddit.com")
+                    log.info("[cove] Gallery send failed, falling back to vxreddit rewrite: %s", vx_url)
+                    try:
+                        await message.channel.send(vx_url)
+                    except discord.HTTPException as e:
+                        log.warning("[cove] Failed to send vxreddit fallback: %s", e)
+                    else:
+                        try:
+                            await message.delete()
+                        except discord.HTTPException:
+                            pass
                 return
             reddit_image_url_from_output = reddit_image_url_from_log(log_text)
             if reddit_image_url_from_output:

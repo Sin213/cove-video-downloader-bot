@@ -244,6 +244,7 @@ INSTAGRAM_IMAGE_NO_VIDEO_PHRASES = (
 )
 
 INSTAGRAM_IMAGE_MARKER = "[INSTAGRAM_IMAGE]"
+INFLIGHT_MARKER = "[INFLIGHT]"
 REDDIT_GIF_MARKER = "[REDDIT_GIF]"
 REDDIT_IMAGE_MARKER = "[REDDIT_IMAGE]"
 TWITTER_IMAGE_MARKER = "[TWITTER_IMAGE]"
@@ -355,6 +356,7 @@ _reddit_shortlink_cache: dict[str, tuple[str, float]] = {}
 _reddit_has_video_cache: dict[str, tuple[bool, float]] = {}
 _reddit_gallery_cache: dict[str, tuple[tuple[str, ...], float]] = {}
 _instagram_probe_cache: dict[str, tuple[tuple[bool, int | None, str | None], float]] = {}
+_instagram_mirror_cache: dict[str, tuple[tuple[str | None, str | None], float]] = {}
 _twitter_probe_cache: dict[str, tuple[bool, float]] = {}
 SHORTLINK_CACHE_TTL = 24 * 3600
 HAS_VIDEO_CACHE_TTL = 3600
@@ -363,6 +365,7 @@ INSTAGRAM_PROBE_UNAVAIL_TTL = 2 * 60
 TWITTER_PROBE_CACHE_TTL = 10 * 60
 FXTWITTER_API_TIMEOUT = 8
 INSTAGRAM_MIRROR_PROBE_TIMEOUT = 8
+INSTAGRAM_MIRROR_CACHE_TTL = 10 * 60
 PROBE_FAILURE_CACHE_TTL = 2 * 60
 # Embed-proxy mirrors tried in order; first one that reports media wins.
 # instagram7 and zzinstagram share the oginstagram offload backend while
@@ -2110,6 +2113,13 @@ async def _instagram_mirror_media_from_host(url: str, host: str) -> tuple[str | 
         return "video", video_url
     image_url = _og_meta_content(html, "og:image")
     if image_url and image_url.startswith("https://"):
+        parsed = urlparse(image_url)
+        params = [(k, v) for k, v in parse_qsl(parsed.query) if k != "thumbnail"]
+        if len(params) != len(parse_qsl(parsed.query)):
+            # The mirror intermittently omits og:video while og:image still
+            # points at the video's thumbnail endpoint; dropping the thumbnail
+            # param yields the video itself.
+            return "video", urlunparse(parsed._replace(query=urlencode(params)))
         return "image", image_url
     log.info("[instagram-mirror] No media tags from %s for %s", host, url)
     return None, None
@@ -2122,16 +2132,32 @@ async def _instagram_mirror_media(url: str) -> tuple[str | None, str | None]:
     mirror could be reached, or (None, None) when the mirrors have no media for
     the post (deleted, private, or restricted).
     """
+    cache_key = canonical_url_for_key(url)
+    cached = _cache_get(_instagram_mirror_cache, cache_key)
+    if cached is not None:
+        return cached
+    image_result = None
     saw_no_media = False
     for host in INSTAGRAM_MIRROR_HOSTS:
         kind, media_url = await _instagram_mirror_media_from_host(url, host)
-        if kind in ("video", "image"):
+        if kind == "video":
             if host != INSTAGRAM_MIRROR_HOSTS[0]:
                 log.info("[instagram-mirror] %s served media for %s", host, url)
+            _cache_set(_instagram_mirror_cache, cache_key, (kind, media_url), INSTAGRAM_MIRROR_CACHE_TTL)
             return kind, media_url
-        if kind is None:
+        if kind == "image" and image_result is None:
+            # Keep asking the other hosts: one host's missing og:video must not
+            # turn a video post into an image verdict.
+            image_result = (kind, media_url)
+        elif kind is None:
             saw_no_media = True
-    return (None, None) if saw_no_media else ("error", None)
+    if image_result is not None:
+        _cache_set(_instagram_mirror_cache, cache_key, image_result, INSTAGRAM_MIRROR_CACHE_TTL)
+        return image_result
+    if saw_no_media:
+        _cache_set(_instagram_mirror_cache, cache_key, (None, None), INSTAGRAM_PROBE_UNAVAIL_TTL)
+        return None, None
+    return "error", None
 
 
 async def _instagram_mirror_is_embeddable(url: str) -> bool:
@@ -3309,6 +3335,32 @@ async def download_and_clip(
     log.info("[yt-dlp clip] Exit code: %d", code)
     _log.append(out.strip())
 
+    is_instagram = host_matches(hostname_for(url), {"instagram.com"})
+    if code != 0 and is_instagram and not is_instagram_noncontent_url(url):
+        for leftover in Path(tmp).glob("*"):
+            try:
+                leftover.unlink()
+            except OSError:
+                pass
+        kk_kind, kk_path = await download_instagram_via_mirror(url, tmp)
+        if kk_kind == "video" and kk_path:
+            # Mirror serves the whole video; cut the requested section locally.
+            # Stream copy snaps to keyframes, which is close enough for a fallback.
+            trimmed = str(Path(tmp) / "clip_trimmed.mp4")
+            trim_cmd = [
+                "ffmpeg", "-y", "-ss", f"{start:.3f}", "-i", kk_path,
+                "-t", f"{max(0.0, clip_duration):.3f}",
+                "-c", "copy", "-avoid_negative_ts", "make_zero", trimmed,
+            ]
+            t_code, t_out = await run_subprocess(trim_cmd)
+            if t_code == 0 and os.path.exists(trimmed) and os.path.getsize(trimmed) > 0:
+                os.unlink(kk_path)
+                log.info("[yt-dlp clip] Instagram extraction failed, mirror + local trim succeeded: %s", url)
+                _log.append("[INFO] Downloaded via instagram7 mirror fallback.")
+                code = 0
+            else:
+                log.info("[yt-dlp clip] Mirror fallback trim failed (%d) for %s", t_code, url)
+
     if code != 0:
         if any(phrase.lower() in out.lower() for phrase in NO_VIDEO_PHRASES):
             _log.append("[NOVIDEO]")
@@ -3439,6 +3491,19 @@ async def download_and_gif(url: str, guild: discord.Guild | None) -> tuple:
         _log.append(f"[TOOBIG] >{MAX_DURATION_SECONDS // 60}min")
         shutil.rmtree(tmp, ignore_errors=True)
         return None, "\n".join(_log)
+
+    is_instagram = host_matches(hostname_for(url), {"instagram.com"})
+    if code != 0 and is_instagram and not is_instagram_noncontent_url(url):
+        for leftover in Path(tmp).glob("*"):
+            try:
+                leftover.unlink()
+            except OSError:
+                pass
+        kk_kind, kk_path = await download_instagram_via_mirror(url, tmp)
+        if kk_kind == "video" and kk_path:
+            log.info("[yt-dlp gif] Instagram extraction failed, mirror fallback succeeded: %s", url)
+            _log.append("[INFO] Downloaded via instagram7 mirror fallback.")
+            code = 0
 
     if code != 0:
         if any(phrase.lower() in out.lower() for phrase in NO_VIDEO_PHRASES):
@@ -3729,7 +3794,7 @@ async def process_url(
     if canonical in _inflight_urls:
         log.info("[dedup] Skipping already-in-flight URL: %s", url)
         if on_no_video:
-            await on_no_video("")
+            await on_no_video(INFLIGHT_MARKER)
         return
     _inflight_urls.add(canonical)
     reserved_slot = False
@@ -4378,6 +4443,15 @@ async def download_cmd(
         await interaction.followup.send(f"\u274c {msg}")
 
     async def on_no_video(log_text: str = ""):
+        if INFLIGHT_MARKER in log_text:
+            await interaction.followup.send(
+                "\u23f3 That link is already being processed - the result will be posted shortly."
+            )
+            return
+        instagram_rewrite = rewrite_instagram_image_url(url, log_text)
+        if instagram_rewrite:
+            await interaction.followup.send(instagram_rewrite)
+            return
         fx_url = twitter_fxtwitter_url_from_log(log_text)
         if fx_url:
             await interaction.followup.send(fx_url)

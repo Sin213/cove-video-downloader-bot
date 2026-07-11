@@ -4053,6 +4053,7 @@ class CoveBot(discord.Client):
         await self._sync_tree_with_timeout(guild, "Primary")
         if FRIEND_GUILD_ID != 0:
             friend_guild = discord.Object(id=FRIEND_GUILD_ID)
+            self.tree.copy_global_to(guild=friend_guild)
             await self._sync_tree_with_timeout(friend_guild, "Friend")
 
     async def on_ready(self):

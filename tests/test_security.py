@@ -174,7 +174,7 @@ def test_rewrite_instagram_image_url_uses_embed_proxy_host():
         "https://www.instagram.com/p/abc123/?img_index=1",
         f"{INSTAGRAM_IMAGE_MARKER}\n[NOVIDEO]",
     )
-    assert result == "https://www.kkinstagram.com/p/abc123/?img_index=1"
+    assert result == "https://instagram7.com/p/abc123/?img_index=1"
 
 
 def test_rewrite_instagram_image_url_requires_image_signal():
@@ -193,9 +193,17 @@ def test_rewrite_instagram_image_url_rejects_non_instagram_url():
     assert result is None
 
 
-def test_rewrite_instagram_image_url_rejects_non_post_instagram_url():
+def test_rewrite_instagram_image_url_accepts_reel_url():
     result = rewrite_instagram_image_url(
         "https://www.instagram.com/reel/abc123/",
+        f"{INSTAGRAM_IMAGE_MARKER}\n[NOVIDEO]",
+    )
+    assert result == "https://instagram7.com/reel/abc123/"
+
+
+def test_rewrite_instagram_image_url_rejects_non_post_instagram_url():
+    result = rewrite_instagram_image_url(
+        "https://www.instagram.com/stories/someuser/123/",
         f"{INSTAGRAM_IMAGE_MARKER}\n[NOVIDEO]",
     )
     assert result is None
@@ -246,7 +254,11 @@ def test_instagram_image_post_rejects_all_null_playlist_metadata(monkeypatch):
         assert "--ignore-no-formats" in cmd
         return 0, '{"entries": [null, null]}'
 
+    async def fake_mirror_is_embeddable(url):
+        return False
+
     monkeypatch.setattr("bot.run_subprocess", fake_run_subprocess)
+    monkeypatch.setattr("bot._instagram_mirror_is_embeddable", fake_mirror_is_embeddable)
 
     assert asyncio.run(instagram_is_image_post("https://www.instagram.com/p/abc123/")) is False
 
@@ -306,11 +318,12 @@ def test_instagram_image_post_rejects_non_post_url(monkeypatch):
 
     monkeypatch.setattr("bot.run_subprocess", fail_run_subprocess)
 
-    assert asyncio.run(instagram_is_image_post("https://www.instagram.com/reel/abc123/")) is False
+    assert asyncio.run(instagram_is_image_post("https://www.instagram.com/someuser/")) is False
 
 
 def test_rewritten_instagram_url_is_not_auto_downloaded():
     assert extract_supported_url("https://kkinstagram.com/p/abc123/") is None
+    assert extract_supported_url("https://instagram7.com/p/abc123/") is None
 
 
 def test_direct_gif_url_is_not_auto_downloaded():
@@ -518,7 +531,7 @@ def test_successful_instagram_image_rewrite_deletes_original_message():
 
     assert result is True
     assert events == [
-        ("send", "https://www.kkinstagram.com/p/DWw6liflLcV/"),
+        ("send", "https://instagram7.com/p/DWw6liflLcV/"),
         ("delete", None),
     ]
 
@@ -538,7 +551,7 @@ def test_failed_instagram_image_rewrite_repost_does_not_delete(monkeypatch):
     )
 
     assert result is False
-    assert events == [("send", "https://www.kkinstagram.com/p/DWw6liflLcV/")]
+    assert events == [("send", "https://instagram7.com/p/DWw6liflLcV/")]
 
 
 def test_instagram_video_download_path_does_not_delete_original_message():
@@ -573,7 +586,7 @@ def test_instagram_image_rewrite_forbidden_delete_failure_does_not_crash(monkeyp
 
     assert result is True
     assert events == [
-        ("send", "https://www.kkinstagram.com/p/DWw6liflLcV/"),
+        ("send", "https://instagram7.com/p/DWw6liflLcV/"),
         ("delete", None),
     ]
 
@@ -609,7 +622,7 @@ def test_process_url_instagram_image_text_only_no_video_sends_rewritten_url(monk
 
     asyncio.run(process_url(url, None, fail_success, fail_error, fail_too_big, on_no_video))
 
-    assert sent == [("send", "https://www.kkinstagram.com/p/DWw6liflLcV/")]
+    assert sent == [("send", "https://instagram7.com/p/DWw6liflLcV/")]
 
 
 @pytest.mark.parametrize(

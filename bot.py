@@ -158,6 +158,9 @@ AUTO_DOWNLOAD_DOMAINS = {
 
 BLACKLISTED_DOMAINS = {
     "kkinstagram.com",
+    "instagram7.com",
+    "vxinstagram.com",
+    "zzinstagram.com",
     "fixupx.com",
     "fxtwitter.com",
     "vxtwitter.com",
@@ -359,9 +362,14 @@ INSTAGRAM_PROBE_CACHE_TTL = 3600
 INSTAGRAM_PROBE_UNAVAIL_TTL = 2 * 60
 TWITTER_PROBE_CACHE_TTL = 10 * 60
 FXTWITTER_API_TIMEOUT = 8
-KKINSTAGRAM_PROBE_TIMEOUT = 8
+INSTAGRAM_MIRROR_PROBE_TIMEOUT = 8
 PROBE_FAILURE_CACHE_TTL = 2 * 60
-KKINSTAGRAM_DISCORD_UA = "Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)"
+# Embed-proxy mirrors tried in order; first one that reports media wins.
+# instagram7 and zzinstagram share the oginstagram offload backend while
+# vxinstagram runs its own, so one backend outage does not kill the chain.
+INSTAGRAM_MIRROR_HOSTS = ("instagram7.com", "vxinstagram.com", "zzinstagram.com")
+INSTAGRAM_MIRROR_HOST = INSTAGRAM_MIRROR_HOSTS[0]
+INSTAGRAM_MIRROR_DISCORD_UA = "Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)"
 CACHE_MAX_ENTRIES = 512
 MAX_HTTP_RESPONSE_BYTES = 1024 * 1024
 MAX_SUBPROCESS_OUTPUT_BYTES = 512 * 1024
@@ -1066,7 +1074,7 @@ def rewrite_instagram_image_url(url: str, log_text: str) -> str | None:
         INSTAGRAM_IMAGE_MARKER in log_text.splitlines()
         and _is_supported_instagram_post_url(url)
     ):
-        return replace_hostname(url, "www.kkinstagram.com")
+        return replace_hostname(url, INSTAGRAM_MIRROR_HOST)
     return None
 
 
@@ -1772,6 +1780,16 @@ def user_facing_download_error(output: str, *, media: str = "video") -> str | No
         return "The site is asking for sign-in or bot verification. Cookies may need to be refreshed."
     if "private" in lowered or "login required" in lowered or "this post is private" in lowered:
         return f"That {media} appears to be private or login-only."
+    if "[instagram]" in lowered and (
+        "empty media response" in lowered
+        or "http error 404" in lowered
+        or "not found" in lowered
+    ):
+        return (
+            "Instagram refused to serve this post to the bot. The post itself may "
+            "still be up - the bot's Instagram account is likely rate-limited or "
+            "blocked, or the post is private, restricted, or deleted."
+        )
     if "empty media response" in lowered:
         return "Link is unavailable. The account may be banned, private, restricted, or the post may have been deleted or hidden."
     if "http error 403" in lowered:
@@ -1970,7 +1988,7 @@ def _is_supported_instagram_post_url(url: str) -> bool:
     if hostname_for(url) != "instagram.com":
         return False
     parts = [part for part in urlparse(url).path.split("/") if part]
-    return len(parts) == 2 and parts[0] == "p" and bool(parts[1])
+    return len(parts) == 2 and parts[0] in {"p", "reel", "reels", "tv"} and bool(parts[1])
 
 
 def _load_ytdlp_json(output: str) -> dict | None:
@@ -2015,10 +2033,10 @@ async def instagram_post_probe(url: str) -> tuple[bool, int | None, str | None]:
     if metadata is None:
         out_lower = out.lower()
         if any(phrase.lower() in out_lower for phrase in INSTAGRAM_UNAVAILABLE_PHRASES):
-            if await _kkinstagram_is_embeddable(url):
+            if await _instagram_mirror_is_embeddable(url):
                 # Direct extraction is blocked (e.g. account action-blocked) but the
-                # post still has media; let the download path use its kkinstagram fallback.
-                log.info("[instagram-probe] Probe blocked but kkinstagram has media, deferring: %s", cache_key)
+                # post still has media; let the download path use its mirror fallback.
+                log.info("[instagram-probe] Probe blocked but mirror has media, deferring: %s", cache_key)
                 result = (False, None, None)
                 _cache_set(_instagram_probe_cache, cache_key, result, INSTAGRAM_PROBE_UNAVAIL_TTL)
                 return result
@@ -2043,9 +2061,9 @@ async def instagram_post_probe(url: str) -> tuple[bool, int | None, str | None]:
         _cache_set(_instagram_probe_cache, cache_key, result, INSTAGRAM_PROBE_CACHE_TTL)
         return result
 
-    embeddable = await _kkinstagram_is_embeddable(url)
+    embeddable = await _instagram_mirror_is_embeddable(url)
     if embeddable:
-        log.info("[instagram-probe] kkinstagram confirms embeddable image post: %s", cache_key)
+        log.info("[instagram-probe] Mirror confirms embeddable image post: %s", cache_key)
         result = (True, None, None)
         _cache_set(_instagram_probe_cache, cache_key, result, INSTAGRAM_PROBE_CACHE_TTL)
         return result
@@ -2060,25 +2078,67 @@ async def instagram_post_probe(url: str) -> tuple[bool, int | None, str | None]:
     return result
 
 
-async def _kkinstagram_is_embeddable(url: str) -> bool:
-    kk_url = replace_hostname(url, "www.kkinstagram.com")
+def _og_meta_content(html: str, prop: str) -> str | None:
+    match = re.search(
+        r'<meta property="' + re.escape(prop) + r'" content="([^"]+)"', html
+    )
+    if not match:
+        return None
+    return html_unescape(match.group(1))
+
+
+async def _instagram_mirror_media_from_host(url: str, host: str) -> tuple[str | None, str | None]:
+    mirror_url = replace_hostname(url, host)
     try:
         session = _get_http_session()
         async with session.get(
-            kk_url,
-            timeout=aiohttp.ClientTimeout(total=KKINSTAGRAM_PROBE_TIMEOUT),
-            headers={"User-Agent": KKINSTAGRAM_DISCORD_UA},
+            mirror_url,
+            timeout=aiohttp.ClientTimeout(total=INSTAGRAM_MIRROR_PROBE_TIMEOUT),
+            headers={"User-Agent": INSTAGRAM_MIRROR_DISCORD_UA},
             allow_redirects=True,
         ) as resp:
-            content_type = (resp.content_type or "").lower()
-            if "image" in content_type or "video" in content_type:
-                log.info("[kkinstagram-probe] Media response (%s) for %s", content_type, url)
-                return True
-            log.info("[kkinstagram-probe] Non-media response (%s, %d) for %s", content_type, resp.status, url)
-            return False
+            if resp.status != 200:
+                log.info("[instagram-mirror] HTTP %d from %s for %s", resp.status, host, url)
+                return "error", None
+            body = await resp.content.read(MAX_HTTP_RESPONSE_BYTES)
     except Exception as e:
-        log.warning("[kkinstagram-probe] Probe failed (%s) for %s, assuming embeddable.", e, url)
-        return True
+        log.warning("[instagram-mirror] Probe failed (%s) via %s for %s", e, host, url)
+        return "error", None
+    html = body.decode("utf-8", "replace")
+    video_url = _og_meta_content(html, "og:video")
+    if video_url and video_url.startswith("https://"):
+        return "video", video_url
+    image_url = _og_meta_content(html, "og:image")
+    if image_url and image_url.startswith("https://"):
+        return "image", image_url
+    log.info("[instagram-mirror] No media tags from %s for %s", host, url)
+    return None, None
+
+
+async def _instagram_mirror_media(url: str) -> tuple[str | None, str | None]:
+    """Ask the embed-proxy mirrors, in order, what media a post has.
+
+    Returns ("video", media_url), ("image", media_url), ("error", None) when no
+    mirror could be reached, or (None, None) when the mirrors have no media for
+    the post (deleted, private, or restricted).
+    """
+    saw_no_media = False
+    for host in INSTAGRAM_MIRROR_HOSTS:
+        kind, media_url = await _instagram_mirror_media_from_host(url, host)
+        if kind in ("video", "image"):
+            if host != INSTAGRAM_MIRROR_HOSTS[0]:
+                log.info("[instagram-mirror] %s served media for %s", host, url)
+            return kind, media_url
+        if kind is None:
+            saw_no_media = True
+    return (None, None) if saw_no_media else ("error", None)
+
+
+async def _instagram_mirror_is_embeddable(url: str) -> bool:
+    kind, _ = await _instagram_mirror_media(url)
+    # Treat mirror outages leniently so transient failures do not mark
+    # otherwise-fine posts as unavailable.
+    return kind is not None
 
 
 def _instagram_shortcode_from_url(url: str) -> str | None:
@@ -2228,33 +2288,37 @@ async def send_instagram_gallery(message: discord.Message, url: str) -> bool:
     return bool(sent)
 
 
-async def download_instagram_via_kkinstagram(url: str, tmp: str) -> tuple[str | None, str | None]:
-    """Fetch post media via the kkinstagram redirect when direct extraction fails.
+async def download_instagram_via_mirror(url: str, tmp: str) -> tuple[str | None, str | None]:
+    """Fetch post media via the instagram7 embed proxy when direct extraction fails.
 
     Returns ("video", filepath) when a video was saved into tmp, ("image", None)
     when the post resolves to image media (caller should send the link rewrite),
-    or (None, None) when kkinstagram has no media either.
+    or (None, None) when the mirror has no media either.
     """
-    kk_url = replace_hostname(url, "www.kkinstagram.com")
+    kind, media_url = await _instagram_mirror_media(url)
+    if kind == "image":
+        return "image", None
+    if kind != "video" or not media_url:
+        return None, None
     parts = [p for p in urlparse(url).path.split("/") if p]
     shortcode = _sanitize_filename(parts[-1]) if parts else "video"
     filepath = str(Path(tmp) / f"instagram_{shortcode}.mp4")
     try:
         session = _get_http_session()
         async with session.get(
-            kk_url,
+            media_url,
             timeout=aiohttp.ClientTimeout(total=180, connect=15),
-            headers={"User-Agent": KKINSTAGRAM_DISCORD_UA},
+            headers={"User-Agent": INSTAGRAM_MIRROR_DISCORD_UA},
             allow_redirects=True,
         ) as resp:
             content_type = (resp.content_type or "").lower()
             if resp.status != 200:
-                log.info("[kkinstagram-fallback] HTTP %d for %s", resp.status, url)
+                log.info("[instagram-mirror-fallback] HTTP %d for %s", resp.status, url)
                 return None, None
-            if "image" in content_type:
-                return "image", None
-            if "video" not in content_type:
-                log.info("[kkinstagram-fallback] Non-media response (%s) for %s", content_type, url)
+            # vxinstagram serves mp4 as application/octet-stream; only reject
+            # clearly non-media responses like HTML error/ad pages.
+            if "video" not in content_type and content_type not in ("application/octet-stream", "binary/octet-stream"):
+                log.info("[instagram-mirror-fallback] Non-video response (%s) for %s", content_type, url)
                 return None, None
             max_bytes = MAX_FILESIZE_MB * 1024 * 1024
             size = 0
@@ -2262,15 +2326,15 @@ async def download_instagram_via_kkinstagram(url: str, tmp: str) -> tuple[str | 
                 async for chunk in resp.content.iter_chunked(1024 * 64):
                     size += len(chunk)
                     if size > max_bytes:
-                        log.info("[kkinstagram-fallback] Video exceeded %dMB cap for %s", MAX_FILESIZE_MB, url)
+                        log.info("[instagram-mirror-fallback] Video exceeded %dMB cap for %s", MAX_FILESIZE_MB, url)
                         return None, None
                     f.write(chunk)
         if size == 0:
             return None, None
-        log.info("[kkinstagram-fallback] Downloaded %.1f MB for %s", size / (1024 * 1024), url)
+        log.info("[instagram-mirror-fallback] Downloaded %.1f MB for %s", size / (1024 * 1024), url)
         return "video", filepath
     except Exception as e:
-        log.warning("[kkinstagram-fallback] Download failed (%s) for %s", e, url)
+        log.warning("[instagram-mirror-fallback] Download failed (%s) for %s", e, url)
         return None, None
 
 
@@ -2818,7 +2882,7 @@ async def download_and_compress(
             _log.append(f"[ERROR] {instagram_unavailable}")
             return None, "\n".join(_log)
         if instagram_image_only:
-            log.info("[cove] Instagram image/text post detected, sending kkinstagram rewrite.")
+            log.info("[cove] Instagram image/text post detected, sending mirror rewrite.")
             _log.append(INSTAGRAM_IMAGE_MARKER)
             _log.append("[NOVIDEO]")
             return None, "\n".join(_log)
@@ -2974,13 +3038,13 @@ async def download_and_compress(
                 leftover.unlink()
             except OSError:
                 pass
-        kk_kind, kk_path = await download_instagram_via_kkinstagram(url, tmp)
+        kk_kind, kk_path = await download_instagram_via_mirror(url, tmp)
         if kk_kind == "video" and kk_path:
-            log.info("[cove] Instagram extraction failed, kkinstagram video fallback succeeded: %s", url)
-            _log.append("[INFO] Downloaded via kkinstagram fallback.")
+            log.info("[cove] Instagram extraction failed, mirror video fallback succeeded: %s", url)
+            _log.append("[INFO] Downloaded via instagram7 mirror fallback.")
             code = 0
         elif kk_kind == "image":
-            log.info("[cove] Instagram extraction failed, kkinstagram has image media, sending rewrite: %s", url)
+            log.info("[cove] Instagram extraction failed, mirror has image media, sending rewrite: %s", url)
             _log.append(INSTAGRAM_IMAGE_MARKER)
             _log.append("[NOVIDEO]")
             shutil.rmtree(tmp, ignore_errors=True)
@@ -3046,8 +3110,12 @@ async def download_and_compress(
             log.info("[cove] X/Twitter post has no downloadable video — ignoring silently.")
             _log.append("[NOVIDEO]")
         elif "empty media response" in out.lower():
-            log.info("[cove] Instagram empty media response — account banned or post deleted.")
-            _log.append("[ERROR] Instagram post is unavailable (private, restricted, deleted, or the account may be banned).")
+            log.info("[cove] Instagram empty media response - bot account blocked or post deleted.")
+            _log.append(
+                "[ERROR] Instagram refused to serve this post to the bot. The post itself may "
+                "still be up - the bot's Instagram account is likely rate-limited or blocked, "
+                "or the post is private, restricted, or deleted."
+            )
         elif friendly := user_facing_download_error(out, media="video"):
             _log.append(f"[ERROR] {friendly}")
         elif "Unsupported URL" in out:
@@ -3525,8 +3593,12 @@ async def download_audio(url: str, guild: discord.Guild | None) -> tuple:
             ):
                 _log.append("[ERROR] YouTube bot detection triggered.")
             elif "empty media response" in out.lower():
-                log.info("[cove] Instagram empty media response — account banned or post deleted.")
-                _log.append("[ERROR] Instagram post is unavailable (private, restricted, deleted, or the account may be banned).")
+                log.info("[cove] Instagram empty media response - bot account blocked or post deleted.")
+                _log.append(
+                    "[ERROR] Instagram refused to serve this post to the bot. The post itself may "
+                    "still be up - the bot's Instagram account is likely rate-limited or blocked, "
+                    "or the post is private, restricted, or deleted."
+                )
             elif "Unsupported URL" in out:
                 _log.append("[ERROR] Unsupported or private URL.")
             elif "HTTP Error 403" in out:

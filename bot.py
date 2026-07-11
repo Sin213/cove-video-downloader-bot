@@ -406,9 +406,8 @@ def _cache_set(cache: dict, key: str, value, ttl: float) -> None:
             del cache[k]
         if len(cache) >= CACHE_MAX_ENTRIES:
             to_drop = len(cache) - CACHE_MAX_ENTRIES * 3 // 4
-            it = iter(cache)
-            for _ in range(to_drop):
-                cache.pop(next(it), None)
+            for k in list(cache)[:to_drop]:
+                cache.pop(k, None)
     cache[key] = (value, monotonic() + ttl)
 
 
@@ -626,7 +625,7 @@ def _flush_cache_writes() -> None:
     if conn is None or not _cache_write_queue:
         return
     batch = _cache_write_queue[:]
-    _cache_write_queue.clear()
+    del _cache_write_queue[:len(batch)]
     try:
         conn.executemany(
             "INSERT OR REPLACE INTO url_cache (key, value, cache_type, expires_at) VALUES (?, ?, ?, ?)",
@@ -744,16 +743,24 @@ async def _reddit_api_get_json(api_url: str, timeout_seconds: int) -> tuple[int 
     if CURL_CFFI_AVAILABLE:
         try:
             session = _get_curl_session()
-            resp = await session.get(api_url, headers=headers, timeout=timeout_seconds)
-            if resp.status_code != 200:
-                return resp.status_code, None
-            content_type = resp.headers.get("Content-Type", "")
-            if "json" not in content_type and "text" not in content_type:
-                log.warning("[security] Reddit API returned unexpected Content-Type: %s", content_type)
-                return resp.status_code, None
-            if len(resp.content) > MAX_HTTP_RESPONSE_BYTES:
-                raise ValueError(f"response exceeded {MAX_HTTP_RESPONSE_BYTES} bytes")
-            return resp.status_code, json.loads(resp.content.decode(errors="replace"))
+            resp = await session.get(api_url, headers=headers, timeout=timeout_seconds, stream=True)
+            try:
+                if resp.status_code != 200:
+                    return resp.status_code, None
+                content_type = resp.headers.get("Content-Type", "")
+                if "json" not in content_type and "text" not in content_type:
+                    log.warning("[security] Reddit API returned unexpected Content-Type: %s", content_type)
+                    return resp.status_code, None
+                chunks = []
+                total = 0
+                async for chunk in resp.aiter_content():
+                    total += len(chunk)
+                    if total > MAX_HTTP_RESPONSE_BYTES:
+                        raise ValueError(f"response exceeded {MAX_HTTP_RESPONSE_BYTES} bytes")
+                    chunks.append(chunk)
+            finally:
+                await resp.aclose()
+            return resp.status_code, json.loads(b"".join(chunks).decode(errors="replace"))
         except Exception as e:
             log.warning("[reddit-api] curl_cffi request failed (%s), falling back to aiohttp.", e)
     session = _get_http_session()
@@ -784,10 +791,16 @@ async def read_limited_response(resp: aiohttp.ClientResponse, limit: int) -> byt
 
 
 async def _close_http_session() -> None:
-    global _http_session
+    global _http_session, _curl_session
     if _http_session is not None and not _http_session.closed:
         await _http_session.close()
     _http_session = None
+    if _curl_session is not None:
+        try:
+            await _curl_session.close()
+        except Exception as e:
+            log.warning("[Cove] Failed to close curl session: %s", e)
+    _curl_session = None
 
 
 def _on_task_done(task: asyncio.Task) -> None:
@@ -1346,21 +1359,6 @@ async def send_reddit_gallery(
     return sent
 
 
-async def reddit_image_url(url: str) -> str | None:
-    if not REDDIT_POST_RE.search(url):
-        return None
-    api_url = reddit_api_url(url)
-    try:
-        _status, data = await _reddit_api_get_json(api_url, REDDIT_PRECHECK_TIMEOUT)
-        if data is None:
-            return None
-        post = data[0]["data"]["children"][0]["data"]
-        return reddit_image_url_from_post(post)
-    except Exception as e:
-        log.warning("[reddit-image] Failed to resolve image URL: %s", e)
-        return None
-
-
 async def download_reddit_image(url: str, guild: discord.Guild | None) -> str | None:
     parsed = urlparse(url)
     ext = parsed.path.rsplit(".", 1)[-1].lower()
@@ -1527,6 +1525,12 @@ async def validate_manual_url(url: str) -> tuple[bool, str]:
         return False, "Invalid URL."
     if parsed.scheme not in ("http", "https"):
         return False, "Only http(s) URLs are allowed."
+    try:
+        port = parsed.port
+    except ValueError:
+        return False, "Invalid URL port."
+    if port not in (None, 80, 443):
+        return False, "Only default http(s) ports are allowed."
     host = (parsed.hostname or "").lower()
     if not host:
         return False, "URL has no host."
@@ -1537,8 +1541,8 @@ async def validate_manual_url(url: str) -> tuple[bool, str]:
         return False, "URL points to a non-public address."
     loop = asyncio.get_running_loop()
     try:
-        infos = await loop.getaddrinfo(host, None)
-    except socket.gaierror:
+        infos = await asyncio.wait_for(loop.getaddrinfo(host, None), timeout=10)
+    except (asyncio.TimeoutError, OSError, UnicodeError):
         return False, "Could not resolve URL host."
     for info in infos:
         if _is_internal_ip(info[4][0]):
@@ -1600,6 +1604,13 @@ def clean_env():
 ENV = clean_env()
 
 
+def _version_tuple(version: str) -> tuple[int, ...]:
+    try:
+        return tuple(int(part) for part in version.split("."))
+    except ValueError:
+        return ()
+
+
 def _check_ytdlp_version() -> tuple[bool, str]:
     global _ytdlp_version_status
     try:
@@ -1613,7 +1624,7 @@ def _check_ytdlp_version() -> tuple[bool, str]:
             _ytdlp_version_status = (False, message)
             log.warning("[security] %s", message)
             return _ytdlp_version_status
-        if version < YT_DLP_MIN_VERSION:
+        if _version_tuple(version) < _version_tuple(YT_DLP_MIN_VERSION):
             message = f"yt-dlp {version} is older than configured minimum {YT_DLP_MIN_VERSION}."
             _ytdlp_version_status = (False, message)
             log.warning(
@@ -2030,7 +2041,7 @@ async def instagram_post_probe(url: str) -> tuple[bool, int | None, str | None]:
         cmd.extend(["--cookies", COOKIES_FILE])
     cmd.append(url)
 
-    _code, out = await run_subprocess(cmd)
+    _code, out = await run_subprocess_timeout(cmd, 60)
 
     metadata = _load_ytdlp_json(out)
     if metadata is None:
@@ -2169,7 +2180,7 @@ async def _instagram_mirror_is_embeddable(url: str) -> bool:
 
 def _instagram_shortcode_from_url(url: str) -> str | None:
     parts = [part for part in urlparse(url).path.split("/") if part]
-    if len(parts) == 2 and parts[0] == "p" and parts[1]:
+    if len(parts) == 2 and parts[0] in ("p", "reel", "reels") and parts[1]:
         return parts[1]
     return None
 
@@ -2442,7 +2453,6 @@ async def _reddit_shortlink_location(url: str) -> str | None:
             allow_redirects=False,
             timeout=aiohttp.ClientTimeout(total=8),
         ) as resp:
-            await resp.read()
             if resp.status in (301, 302, 303, 307, 308):
                 location = resp.headers.get("Location", "")
                 if location and "/comments/" in location:
@@ -2831,45 +2841,42 @@ async def convert_to_gif(
         quality_levels = quality_levels[1:]
 
     final_mb = 0.0
-    async with GIF_SEMAPHORE:
-        for width, fps in quality_levels:
-            vf = f"fps={fps},scale={width}:-1:flags=lanczos"
-
-            code, out = await run_subprocess([
-                "ffmpeg", "-y", "-t", str(clip_duration), "-i", src,
-                "-vf", f"{vf},palettegen=stats_mode=diff",
-                palette_path,
-            ], timeout=FFMPEG_TIMEOUT, nice=True)
-            if code != 0:
-                return False, out
-
-            code, out = await run_subprocess([
-                "ffmpeg", "-y", "-t", str(clip_duration), "-i", src,
-                "-i", palette_path,
-                "-filter_complex",
-                f"[0:v] {vf} [x]; [x][1:v] paletteuse=dither=bayer:bayer_scale=5",
-                dest,
-            ], timeout=FFMPEG_TIMEOUT, nice=True)
-            if code != 0:
-                return False, out
-
-            final_size = os.path.getsize(dest)
-            final_mb = final_size / (1024 * 1024)
-            log.info("[gif] %dp %dfps %.1fs → %.2f MB", width, fps, clip_duration, final_mb)
-
-            if final_size <= target_size:
-                try:
-                    os.remove(palette_path)
-                except OSError:
-                    pass
-                return True, f"{final_mb:.2f} MB ({clip_duration:.0f}s)"
-
-            log.warning("[gif] Too large at %dp %dfps (%.2fMB), trying lower quality", width, fps, final_mb)
-
     try:
-        os.remove(palette_path)
-    except OSError:
-        pass
+        async with GIF_SEMAPHORE:
+            for width, fps in quality_levels:
+                vf = f"fps={fps},scale={width}:-1:flags=lanczos"
+
+                code, out = await run_subprocess([
+                    "ffmpeg", "-y", "-t", str(clip_duration), "-i", src,
+                    "-vf", f"{vf},palettegen=stats_mode=diff",
+                    palette_path,
+                ], timeout=FFMPEG_TIMEOUT, nice=True)
+                if code != 0:
+                    return False, out
+
+                code, out = await run_subprocess([
+                    "ffmpeg", "-y", "-t", str(clip_duration), "-i", src,
+                    "-i", palette_path,
+                    "-filter_complex",
+                    f"[0:v] {vf} [x]; [x][1:v] paletteuse=dither=bayer:bayer_scale=5",
+                    dest,
+                ], timeout=FFMPEG_TIMEOUT, nice=True)
+                if code != 0:
+                    return False, out
+
+                final_size = os.path.getsize(dest)
+                final_mb = final_size / (1024 * 1024)
+                log.info("[gif] %dp %dfps %.1fs → %.2f MB", width, fps, clip_duration, final_mb)
+
+                if final_size <= target_size:
+                    return True, f"{final_mb:.2f} MB ({clip_duration:.0f}s)"
+
+                log.warning("[gif] Too large at %dp %dfps (%.2fMB), trying lower quality", width, fps, final_mb)
+    finally:
+        try:
+            os.remove(palette_path)
+        except OSError:
+            pass
     return False, f"GIF too large even at lowest quality ({final_mb:.2f}MB > {target_mb}MB)."
 
 
@@ -3364,7 +3371,7 @@ async def download_and_clip(
     if code != 0:
         if any(phrase.lower() in out.lower() for phrase in NO_VIDEO_PHRASES):
             _log.append("[NOVIDEO]")
-        elif "Unsupported URL" in out and is_reddit and any(p in out for p in REDDIT_SILENT_URL_PATTERNS):
+        elif "Unsupported URL" in out and is_reddit and any(p in unquote(out) for p in REDDIT_SILENT_URL_PATTERNS):
             _log.append("[NOVIDEO]")
         elif "Unsupported URL" in out and is_twitter:
             _log.append("[NOVIDEO]")
@@ -3508,7 +3515,7 @@ async def download_and_gif(url: str, guild: discord.Guild | None) -> tuple:
     if code != 0:
         if any(phrase.lower() in out.lower() for phrase in NO_VIDEO_PHRASES):
             _log.append("[NOVIDEO]")
-        elif "Unsupported URL" in out and is_reddit and any(p in out for p in REDDIT_SILENT_URL_PATTERNS):
+        elif "Unsupported URL" in out and is_reddit and any(p in unquote(out) for p in REDDIT_SILENT_URL_PATTERNS):
             _log.append("[NOVIDEO]")
         elif "Unsupported URL" in out and is_twitter:
             _log.append("[NOVIDEO]")
@@ -3644,7 +3651,7 @@ async def download_audio(url: str, guild: discord.Guild | None) -> tuple:
             elif is_reddit and "[generic]" in out and not is_reddit_short:
                 log.info("[cove] Reddit link-post (external, no audio) — ignoring silently.")
                 _log.append("[NOVIDEO]")
-            elif "Unsupported URL" in out and is_reddit and any(p in out for p in REDDIT_SILENT_URL_PATTERNS):
+            elif "Unsupported URL" in out and is_reddit and any(p in unquote(out) for p in REDDIT_SILENT_URL_PATTERNS):
                 log.info("[cove] Reddit GIF/image URL — ignoring silently.")
                 _log.append("[NOVIDEO]")
             elif "Unsupported URL" in out and is_twitter:
@@ -4046,8 +4053,8 @@ class CoveBot(discord.Client):
 
     async def setup_hook(self):
         await asyncio.get_running_loop().run_in_executor(None, _sweep_orphaned_tmpdirs)
-        asyncio.create_task(self._periodic_temp_sweep())
-        asyncio.create_task(self._periodic_cache_flush())
+        spawn_tracked(self._periodic_temp_sweep())
+        spawn_tracked(self._periodic_cache_flush())
         guild = discord.Object(id=GUILD_ID)
         self.tree.copy_global_to(guild=guild)
         await self._sync_tree_with_timeout(guild, "Primary")
@@ -4084,8 +4091,14 @@ class CoveBot(discord.Client):
 
     async def close(self):
         if _cache_write_queue:
-            await asyncio.get_running_loop().run_in_executor(None, _flush_cache_writes)
-        await _close_http_session()
+            try:
+                await asyncio.get_running_loop().run_in_executor(None, _flush_cache_writes)
+            except Exception as e:
+                log.warning("[Cove] Final cache flush failed: %s", e)
+        try:
+            await _close_http_session()
+        except Exception as e:
+            log.warning("[Cove] HTTP session close failed: %s", e)
         await super().close()
 
     async def on_message(self, message: discord.Message):
@@ -4117,7 +4130,9 @@ class CoveBot(discord.Client):
                             await message.channel.send(
                                 content=f"<@{target_user_id}> **{replier_name}**: {content}",
                                 reference=referenced,
-                                allowed_mentions=discord.AllowedMentions(users=True, everyone=False, roles=False),
+                                allowed_mentions=discord.AllowedMentions(
+                                    users=[discord.Object(id=target_user_id)], everyone=False, roles=False
+                                ),
                             )
                             try:
                                 await message.delete()
@@ -4528,7 +4543,7 @@ async def audio_cmd(interaction: discord.Interaction, url: str):
     async def on_error(msg: str):
         await interaction.followup.send(f"\u274c {msg}")
 
-    async def on_no_video():
+    async def on_no_video(log_text: str = ""):
         await interaction.followup.send("\u274c No audio found at that link.")
 
     async def on_too_big(size_str: str):
@@ -4631,7 +4646,7 @@ async def clip_cmd(interaction: discord.Interaction, url: str, start: str, end: 
     async def on_error(msg: str):
         await interaction.followup.send(f"❌ {msg}")
 
-    async def on_no_video():
+    async def on_no_video(log_text: str = ""):
         await interaction.followup.send("❌ No video found at that link.")
 
     await process_clip_url(
@@ -4694,7 +4709,7 @@ async def gif_cmd(interaction: discord.Interaction, url: str):
     async def on_error(msg: str):
         await interaction.followup.send(f"❌ {msg}")
 
-    async def on_no_video():
+    async def on_no_video(log_text: str = ""):
         await interaction.followup.send("❌ No video found at that link.")
 
     await process_gif_url(

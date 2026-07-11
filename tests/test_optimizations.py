@@ -113,7 +113,8 @@ def test_canonical_url_normalizes_reddit_hosts():
 
 def test_should_use_aria2c_is_site_aware(monkeypatch):
     monkeypatch.setattr(bot, "USE_ARIA2C", True)
-    assert should_use_aria2c("https://youtube.com/watch?v=abc") is True
+    assert should_use_aria2c("https://youtube.com/watch?v=abc") is False
+    assert should_use_aria2c("https://streamable.com/abc123") is True
     assert should_use_aria2c("https://www.instagram.com/p/abc/") is False
     assert should_use_aria2c("https://old.reddit.com/r/test/comments/abc/title/") is False
 
@@ -162,44 +163,41 @@ def test_persistent_cache_roundtrip():
             os.remove(db_path)
 
 
-def test_persist_cache_entry_bool():
+def _isolate_cache_db(monkeypatch, tmp_path):
+    monkeypatch.setattr(bot, "CACHE_DB_PATH", str(tmp_path / "test_cache.db"))
+    monkeypatch.setattr(bot, "PERSISTENT_CACHE", True)
+    monkeypatch.setattr(bot, "_cache_db_conn", None)
+    bot._init_persistent_cache()
+
+
+def test_persist_cache_entry_bool(monkeypatch, tmp_path):
+    _isolate_cache_db(monkeypatch, tmp_path)
     _cache_write_queue.append(("test_bool_key", "1", "has_video", time.time() + 3600))
     _flush_cache_writes()
-    try:
-        conn = sqlite3.connect(CACHE_DB_PATH)
-        row = conn.execute(
-            "SELECT value, cache_type FROM url_cache WHERE key = ?",
-            ("test_bool_key",),
-        ).fetchone()
-        conn.close()
-        assert row is not None
-        assert row[0] == "1"
-        assert row[1] == "has_video"
-    finally:
-        conn = sqlite3.connect(CACHE_DB_PATH)
-        conn.execute("DELETE FROM url_cache WHERE key = ?", ("test_bool_key",))
-        conn.commit()
-        conn.close()
+    conn = sqlite3.connect(bot.CACHE_DB_PATH)
+    row = conn.execute(
+        "SELECT value, cache_type FROM url_cache WHERE key = ?",
+        ("test_bool_key",),
+    ).fetchone()
+    conn.close()
+    assert row is not None
+    assert row[0] == "1"
+    assert row[1] == "has_video"
 
 
-def test_persist_cache_entry_string():
+def test_persist_cache_entry_string(monkeypatch, tmp_path):
+    _isolate_cache_db(monkeypatch, tmp_path)
     _cache_write_queue.append(("test_str_key", "https://reddit.com/r/test/comments/abc", "shortlink", time.time() + 3600))
     _flush_cache_writes()
-    try:
-        conn = sqlite3.connect(CACHE_DB_PATH)
-        row = conn.execute(
-            "SELECT value, cache_type FROM url_cache WHERE key = ?",
-            ("test_str_key",),
-        ).fetchone()
-        conn.close()
-        assert row is not None
-        assert row[0] == "https://reddit.com/r/test/comments/abc"
-        assert row[1] == "shortlink"
-    finally:
-        conn = sqlite3.connect(CACHE_DB_PATH)
-        conn.execute("DELETE FROM url_cache WHERE key = ?", ("test_str_key",))
-        conn.commit()
-        conn.close()
+    conn = sqlite3.connect(bot.CACHE_DB_PATH)
+    row = conn.execute(
+        "SELECT value, cache_type FROM url_cache WHERE key = ?",
+        ("test_str_key",),
+    ).fetchone()
+    conn.close()
+    assert row is not None
+    assert row[0] == "https://reddit.com/r/test/comments/abc"
+    assert row[1] == "shortlink"
 
 
 def test_process_nice_default():

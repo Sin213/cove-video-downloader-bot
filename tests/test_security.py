@@ -11,6 +11,7 @@ from bot import (
     reddit_gif_url_from_log,
     reddit_image_url_from_log,
     reddit_image_url_from_post,
+    reddit_vxreddit_url_from_log,
     reddit_media_gif_url_from_text,
     reddit_media_image_url_from_text,
     rewrite_instagram_image_url,
@@ -446,7 +447,7 @@ def test_process_url_reddit_unsupported_direct_gif_sends_repost(monkeypatch):
     assert sent == [("send", "https://i.redd.it/isd965xyhwsf1.gif")]
 
 
-def test_process_url_reddit_no_video_direct_image_sends_repost(monkeypatch):
+def test_process_url_reddit_no_video_sends_vxreddit_rewrite(monkeypatch):
     url = "https://www.reddit.com/r/shitposting/comments/example/title/"
     sent = []
 
@@ -460,16 +461,16 @@ def test_process_url_reddit_no_video_direct_image_sends_repost(monkeypatch):
         raise AssertionError(f"on_too_big should not run: {duration}")
 
     async def on_no_video(log_text=""):
-        image_url = reddit_image_url_from_log(log_text)
-        if image_url:
-            sent.append(("send_image", image_url))
+        vx_url = reddit_vxreddit_url_from_log(log_text)
+        if vx_url:
+            sent.append(("send", vx_url))
 
     monkeypatch.setattr("bot.reddit_has_video", lambda url: asyncio.sleep(0, result=False))
-    monkeypatch.setattr("bot.reddit_image_url", lambda url: asyncio.sleep(0, result="https://i.redd.it/example.jpg"))
+    monkeypatch.setattr("bot.reddit_gallery_image_urls", lambda url: asyncio.sleep(0, result=[]))
 
     asyncio.run(process_url(url, None, fail_success, fail_error, fail_too_big, on_no_video))
 
-    assert sent == [("send_image", "https://i.redd.it/example.jpg")]
+    assert sent == [("send", "https://vxreddit.com/r/shitposting/comments/example/title/")]
 
 
 def test_reddit_gif_repost_deletes_after_success():
@@ -721,5 +722,7 @@ def test_process_url_instagram_video_success_sends_no_rewrite(monkeypatch):
 
     asyncio.run(process_url(url, None, on_success, fail_error, fail_too_big, on_no_video))
 
-    assert succeeded == ["compressed.mp4"]
+    # The 5-byte fake download fits under the Discord limit, so compression is
+    # skipped and the original file is sent as-is.
+    assert succeeded == ["clip.mp4"]
     assert sent == []

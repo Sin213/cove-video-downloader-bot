@@ -5,6 +5,7 @@ import pytest
 
 from bot import (
     extract_supported_url,
+    validate_manual_url,
     instagram_is_image_post,
     process_url,
     reddit_api_url,
@@ -745,3 +746,15 @@ def test_process_url_instagram_video_success_sends_no_rewrite(monkeypatch):
     # skipped and the original file is sent as-is.
     assert succeeded == ["clip.mp4"]
     assert sent == []
+
+
+def test_validate_manual_url_blocks_mirrors_but_allows_fixup_hosts():
+    ok, msg = asyncio.run(validate_manual_url("https://instagram7.com/p/abc/"))
+    assert ok is False
+    assert "mirror" in msg
+
+    # Fixup hosts must not be blacklist-rejected: the download pipelines
+    # rewrite them to x.com via resolve_fixup_url. DNS may fail offline, so
+    # only assert the rejection reason is not the mirror/proxy message.
+    _ok, msg = asyncio.run(validate_manual_url("https://fxtwitter.com/user/status/123"))
+    assert "mirror" not in msg

@@ -148,10 +148,6 @@ AUTO_DOWNLOAD_DOMAINS = {
     "threads.net",
     "vimeo.com",
     "arazu.io",
-    "fixupx.com",
-    "fxtwitter.com",
-    "vxtwitter.com",
-    "twittpr.com",
     "twitch.tv",
     "clips.twitch.tv",
 }
@@ -1556,7 +1552,9 @@ async def validate_manual_url(url: str) -> tuple[bool, str]:
     host = (parsed.hostname or "").lower()
     if not host:
         return False, "URL has no host."
-    if host_matches(host, BLACKLISTED_DOMAINS):
+    # Fixup hosts are allowed here: the download pipelines rewrite them to
+    # x.com via resolve_fixup_url. Only unresolvable mirror hosts are blocked.
+    if host_matches(host, BLACKLISTED_DOMAINS) and not host_matches(host, FIXUP_DOMAINS):
         return False, "That mirror/proxy host is not supported. Use the original post URL."
     if host in {"localhost", "ip6-localhost", "ip6-loopback"}:
         return False, "URL points to a non-public address."

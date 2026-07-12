@@ -290,7 +290,11 @@ def test_instagram_image_post_rejects_non_image_no_video_errors(monkeypatch, out
     async def fake_run_subprocess(cmd):
         return 1, output
 
+    async def fake_mirror_is_embeddable(url):
+        return False
+
     monkeypatch.setattr("bot.run_subprocess", fake_run_subprocess)
+    monkeypatch.setattr("bot._instagram_mirror_is_embeddable", fake_mirror_is_embeddable)
 
     assert asyncio.run(instagram_is_image_post("https://www.instagram.com/p/abc123/")) is False
 
@@ -619,7 +623,11 @@ def test_process_url_instagram_image_text_only_no_video_sends_rewritten_url(monk
         if rewritten:
             sent.append(("send", rewritten))
 
+    async def fake_mirror_is_embeddable(u):
+        return True
+
     monkeypatch.setattr("bot.run_subprocess", fake_run_subprocess)
+    monkeypatch.setattr("bot._instagram_mirror_is_embeddable", fake_mirror_is_embeddable)
 
     asyncio.run(process_url(url, None, fail_success, fail_error, fail_too_big, on_no_video))
 
@@ -662,7 +670,15 @@ def test_process_url_instagram_private_deleted_login_rate_limit_timeout_sends_no
         if rewritten:
             sent.append(("send", rewritten))
 
+    async def fake_mirror_is_embeddable(u):
+        return False
+
+    async def fake_mirror_download(u, tmp):
+        return None, None
+
     monkeypatch.setattr("bot.run_subprocess", fake_run_subprocess)
+    monkeypatch.setattr("bot._instagram_mirror_is_embeddable", fake_mirror_is_embeddable)
+    monkeypatch.setattr("bot.download_instagram_via_mirror", fake_mirror_download)
 
     asyncio.run(process_url(url, None, fail_success, on_error, fail_too_big, on_no_video))
 

@@ -793,7 +793,10 @@ async def read_limited_response(resp: aiohttp.ClientResponse, limit: int) -> byt
 async def _close_http_session() -> None:
     global _http_session, _curl_session
     if _http_session is not None and not _http_session.closed:
-        await _http_session.close()
+        try:
+            await _http_session.close()
+        except Exception as e:
+            log.warning("[Cove] Failed to close HTTP session: %s", e)
     _http_session = None
     if _curl_session is not None:
         try:
@@ -1529,7 +1532,7 @@ async def validate_manual_url(url: str) -> tuple[bool, str]:
         port = parsed.port
     except ValueError:
         return False, "Invalid URL port."
-    if port not in (None, 80, 443):
+    if port is not None and port != (80 if parsed.scheme == "http" else 443):
         return False, "Only default http(s) ports are allowed."
     host = (parsed.hostname or "").lower()
     if not host:
@@ -1624,7 +1627,13 @@ def _check_ytdlp_version() -> tuple[bool, str]:
             _ytdlp_version_status = (False, message)
             log.warning("[security] %s", message)
             return _ytdlp_version_status
-        if _version_tuple(version) < _version_tuple(YT_DLP_MIN_VERSION):
+        min_tuple = _version_tuple(YT_DLP_MIN_VERSION)
+        if not min_tuple:
+            log.warning(
+                "[security] YT_DLP_MIN_VERSION %r is not a parseable version; skipping minimum check.",
+                YT_DLP_MIN_VERSION,
+            )
+        if min_tuple and _version_tuple(version) < min_tuple:
             message = f"yt-dlp {version} is older than configured minimum {YT_DLP_MIN_VERSION}."
             _ytdlp_version_status = (False, message)
             log.warning(
@@ -3852,7 +3861,7 @@ async def process_audio_url(
     if canonical in _inflight_urls:
         log.info("[dedup] Skipping already-in-flight audio URL: %s", url)
         if on_no_video:
-            await on_no_video()
+            await on_no_video(INFLIGHT_MARKER)
         return
     _inflight_urls.add(canonical)
     reserved_slot = False
@@ -3903,7 +3912,7 @@ async def process_clip_url(
     if canonical in _inflight_urls:
         log.info("[dedup] Skipping already-in-flight clip URL: %s", url)
         if on_no_video:
-            await on_no_video()
+            await on_no_video(INFLIGHT_MARKER)
         return
     _inflight_urls.add(canonical)
     reserved_slot = False
@@ -3950,7 +3959,7 @@ async def process_gif_url(
     if canonical in _inflight_urls:
         log.info("[dedup] Skipping already-in-flight GIF URL: %s", url)
         if on_no_video:
-            await on_no_video()
+            await on_no_video(INFLIGHT_MARKER)
         return
     _inflight_urls.add(canonical)
     reserved_slot = False
@@ -4208,7 +4217,7 @@ class CoveBot(discord.Client):
                     filepath,
                     send_kwargs={
                         "content": content,
-                        "allowed_mentions": discord.AllowedMentions(users=False),
+                        "allowed_mentions": discord.AllowedMentions(users=False, everyone=False, roles=False),
                     },
                 )
 
@@ -4544,6 +4553,11 @@ async def audio_cmd(interaction: discord.Interaction, url: str):
         await interaction.followup.send(f"\u274c {msg}")
 
     async def on_no_video(log_text: str = ""):
+        if INFLIGHT_MARKER in log_text:
+            await interaction.followup.send(
+                "\u23f3 That link is already being processed - the result will be posted shortly."
+            )
+            return
         await interaction.followup.send("\u274c No audio found at that link.")
 
     async def on_too_big(size_str: str):
@@ -4647,6 +4661,11 @@ async def clip_cmd(interaction: discord.Interaction, url: str, start: str, end: 
         await interaction.followup.send(f"❌ {msg}")
 
     async def on_no_video(log_text: str = ""):
+        if INFLIGHT_MARKER in log_text:
+            await interaction.followup.send(
+                "⏳ That link is already being processed - the result will be posted shortly."
+            )
+            return
         await interaction.followup.send("❌ No video found at that link.")
 
     await process_clip_url(
@@ -4710,6 +4729,11 @@ async def gif_cmd(interaction: discord.Interaction, url: str):
         await interaction.followup.send(f"❌ {msg}")
 
     async def on_no_video(log_text: str = ""):
+        if INFLIGHT_MARKER in log_text:
+            await interaction.followup.send(
+                "⏳ That link is already being processed - the result will be posted shortly."
+            )
+            return
         await interaction.followup.send("❌ No video found at that link.")
 
     await process_gif_url(

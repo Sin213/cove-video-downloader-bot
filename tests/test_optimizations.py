@@ -93,7 +93,9 @@ def test_inflight_url_dedup():
 
 
 def test_inflight_key_normalizes_url_and_namespaces_kind():
-    assert _inflight_key("video", "HTTPS://Example.com/Video/") == "video:https://example.com/video"
+    # Scheme and host are case-insensitive; path case is preserved (only
+    # reddit paths are lowercased, since reddit is case-insensitive).
+    assert _inflight_key("video", "HTTPS://Example.com/Video/") == "video:https://example.com/Video"
     assert _inflight_key("audio", "https://example.com/video") != _inflight_key("video", "https://example.com/video")
 
 
@@ -108,6 +110,13 @@ def test_canonical_url_normalizes_reddit_hosts():
     assert (
         canonical_url_for_key("https://old.reddit.com/r/Test/comments/ABC/?share_id=123")
         == "https://reddit.com/r/test/comments/abc"
+    )
+
+
+def test_canonical_url_preserves_path_case_outside_reddit():
+    # Instagram shortcodes are case-sensitive; distinct posts must not share keys.
+    assert canonical_url_for_key("https://www.instagram.com/p/AbCdEf/") != canonical_url_for_key(
+        "https://www.instagram.com/p/abcdef/"
     )
 
 

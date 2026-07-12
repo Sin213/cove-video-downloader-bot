@@ -17,6 +17,7 @@ _BOT_STATE_ATTRS = (
     "_inflight_urls",
     "_cache_write_queue",
     "_arazu_fallback_urls",
+    "_active_tmpdirs",
     "_deletable",
     "_friend_posts",
     "_friend_neet_skip_users",

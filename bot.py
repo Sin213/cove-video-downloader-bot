@@ -10,6 +10,7 @@ import os
 import re
 import shutil
 import socket
+import signal
 import subprocess
 import io
 import sys
@@ -457,8 +458,10 @@ async def _run_ytdlp_with_info_cache(
 ) -> tuple[int, str]:
     """Run yt-dlp, using cached info.json when available.
 
-    If a cached info.json produces a 403, it is invalidated and yt-dlp is retried
-    with a fresh extraction. Successful fresh downloads cache their info.json.
+    If a cached info.json fails for any reason (expired signed URLs surface as
+    403/401/404/410 or extractor-specific errors), it is invalidated and yt-dlp
+    is retried with a fresh extraction. Successful fresh downloads cache their
+    info.json.
     """
     if use_cache:
         cached_info = _get_cached_ytdlp_info(url)
@@ -472,9 +475,10 @@ async def _run_ytdlp_with_info_cache(
                 code, out = await run_subprocess_timeout(cached_cmd, timeout)
                 if code == 0:
                     return code, out
-                if "HTTP Error 403" not in out:
-                    return code, out
-                log.warning("[yt-dlp %s] Cached info.json produced 403; retrying fresh extraction", kind)
+                log.warning(
+                    "[yt-dlp %s] Cached info.json failed (exit %d); invalidating and retrying fresh extraction",
+                    kind, code,
+                )
                 _ytdlp_info_cache.pop(canonical_url_for_key(url), None)
             except Exception:
                 log.exception("[yt-dlp %s] Failed to use cached info.json", kind)
@@ -542,7 +546,11 @@ def canonical_url_for_key(url: str) -> str:
         query = urlencode(keep)
         return urlunparse(("https", "youtube.com", "/watch", "", query, ""))
 
-    path = re.sub(r"/+", "/", parsed.path).rstrip("/").lower()
+    path = re.sub(r"/+", "/", parsed.path).rstrip("/")
+    if host_matches(host, {"reddit.com", "redd.it"}):
+        # Reddit paths are case-insensitive; most other hosts (e.g. Instagram
+        # shortcodes) are case-sensitive, so preserve case elsewhere.
+        path = path.lower()
     query_items = []
     allowed_query_keys = {"v", "list", "t", "start"}
     for key, value in parse_qsl(parsed.query, keep_blank_values=False):
@@ -940,12 +948,57 @@ def _check_user_rate_limit(user_id: int) -> bool:
     return True
 
 
+# Registration time per active job dir. Entries protect a dir from the orphan
+# sweeper (directory mtime does not refresh while a single file is appended to,
+# so dir age alone cannot distinguish active from orphaned). After
+# ACTIVE_TMPDIR_MAX_AGE, protection is extended only while files inside are
+# still being written (file mtimes, unlike the dir mtime, do refresh on
+# writes), so a crashed job cannot shield its dir forever but a long-running
+# multi-phase job keeps its protection.
+_active_tmpdirs: dict[str, float] = {}
+ACTIVE_TMPDIR_MAX_AGE = 3600.0
+
+
+def _tmpdir_recently_active(path: str, cutoff: float) -> bool:
+    try:
+        newest = os.stat(path).st_mtime
+        with os.scandir(path) as entries:
+            for entry in entries:
+                try:
+                    newest = max(newest, entry.stat(follow_symlinks=False).st_mtime)
+                except OSError:
+                    continue
+        return newest > cutoff
+    except OSError:
+        return False
+
+
+def _make_job_tmpdir(prefix: str = "cove_") -> str:
+    tmp = tempfile.mkdtemp(prefix=prefix, dir=TMP_BASE)
+    os.chmod(tmp, 0o700)
+    _active_tmpdirs[tmp] = time()
+    return tmp
+
+
 def _sweep_orphaned_tmpdirs(min_age_seconds: float = 900) -> None:
     root = Path(TMP_BASE or tempfile.gettempdir())
-    cutoff = time() - min_age_seconds
+    now = time()
+    cutoff = now - min_age_seconds
+    for entry, registered_at in list(_active_tmpdirs.items()):
+        if not os.path.isdir(entry):
+            _active_tmpdirs.pop(entry, None)
+            continue
+        if now - registered_at > ACTIVE_TMPDIR_MAX_AGE:
+            if _tmpdir_recently_active(entry, cutoff):
+                # Files are still being written; extend protection.
+                _active_tmpdirs[entry] = now
+            else:
+                _active_tmpdirs.pop(entry, None)
     try:
         for path in root.glob("cove_*"):
             if not path.is_dir():
+                continue
+            if str(path) in _active_tmpdirs:
                 continue
             try:
                 stat = path.stat()
@@ -1384,8 +1437,7 @@ async def download_reddit_image(url: str, guild: discord.Guild | None) -> str | 
         return None
 
     target_size = int(get_target_mb(guild) * 1024 * 1024)
-    tmp = tempfile.mkdtemp(prefix="cove_reddit_image_", dir=TMP_BASE)
-    os.chmod(tmp, 0o700)
+    tmp = _make_job_tmpdir("cove_reddit_image_")
     filename = _sanitize_filename(Path(unquote(parsed.path)).name) or f"reddit-image.{ext}"
     filepath = str(Path(tmp) / filename)
     downloaded = False
@@ -1921,6 +1973,18 @@ def _sanitize_filename(name: str) -> str:
 
 # ── Subprocess ────────────────────────────────────────────────────────────────
 
+def _kill_process_group(proc: asyncio.subprocess.Process) -> None:
+    # The child runs in its own session, so killing the group also reaps
+    # descendants (yt-dlp's ffmpeg/aria2c helpers) that proc.kill() would miss.
+    try:
+        os.killpg(proc.pid, signal.SIGKILL)
+    except (ProcessLookupError, PermissionError, OSError):
+        try:
+            proc.kill()
+        except ProcessLookupError:
+            pass
+
+
 async def run_subprocess(
     cmd: list[str], timeout: int = SUBPROCESS_TIMEOUT, nice: bool = False,
 ) -> tuple[int, str]:
@@ -1931,19 +1995,42 @@ async def run_subprocess(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.STDOUT,
         env=ENV,
+        start_new_session=True,
     )
+
+    # The buffer lives outside drain_and_wait so bytes read before a timeout
+    # or cancellation survive for the caller's error classification. Only the
+    # first MAX_SUBPROCESS_OUTPUT_BYTES are kept (matching the old post-hoc
+    # slice); the rest is drained and discarded so a verbose child cannot
+    # grow memory unbounded.
+    buf = bytearray()
+
+    async def drain_and_wait() -> None:
+        while True:
+            chunk = await proc.stdout.read(64 * 1024)
+            if not chunk:
+                break
+            if len(buf) < MAX_SUBPROCESS_OUTPUT_BYTES:
+                buf.extend(chunk[:MAX_SUBPROCESS_OUTPUT_BYTES - len(buf)])
+        await proc.wait()
+
     try:
-        stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=timeout)
-    except asyncio.TimeoutError:
-        proc.kill()
         try:
-            stdout, _ = await asyncio.wait_for(proc.communicate(), timeout=5)
+            await asyncio.wait_for(drain_and_wait(), timeout=timeout)
         except asyncio.TimeoutError:
-            output = ""
-            return 124, output + "\n[ERROR] Subprocess timed out and did not exit cleanly."
-        output = stdout[:MAX_SUBPROCESS_OUTPUT_BYTES].decode(errors="replace")
-        return 124, output + "\n[ERROR] Subprocess timed out."
-    return proc.returncode, stdout[:MAX_SUBPROCESS_OUTPUT_BYTES].decode(errors="replace")
+            _kill_process_group(proc)
+            try:
+                await asyncio.wait_for(drain_and_wait(), timeout=5)
+            except asyncio.TimeoutError:
+                output = bytes(buf).decode(errors="replace")
+                return 124, output + "\n[ERROR] Subprocess timed out and did not exit cleanly."
+            output = bytes(buf).decode(errors="replace")
+            return 124, output + "\n[ERROR] Subprocess timed out."
+        return proc.returncode, bytes(buf).decode(errors="replace")
+    except asyncio.CancelledError:
+        # Shutdown-driven task cancellation must not orphan the child group.
+        _kill_process_group(proc)
+        raise
 
 
 async def run_subprocess_timeout(cmd: list[str], timeout: int) -> tuple[int, str]:
@@ -2992,8 +3079,7 @@ async def download_and_compress(
             _log.append("[NOVIDEO]")
             return None, "\n".join(_log)
 
-    tmp = tempfile.mkdtemp(prefix="cove_", dir=TMP_BASE)
-    os.chmod(tmp, 0o700)
+    tmp = _make_job_tmpdir()
     output_template = str(Path(tmp) / "%(title)s.%(ext)s")
 
     if FAST_SOURCE_MODE:
@@ -3222,8 +3308,7 @@ async def download_and_compress(
     if fmt_is_above_720 and orig_mb > target_mb:
         log.info("[cove] %.1f MB > %.1f MB target — re-downloading at 720p", orig_mb, target_mb)
         _log.append(f"[INFO] {orig_mb:.0f}MB over limit — re-downloading at 720p...")
-        tmp2 = tempfile.mkdtemp(prefix="cove_", dir=TMP_BASE)
-        os.chmod(tmp2, 0o700)
+        tmp2 = _make_job_tmpdir()
         cmd_720 = [
             "yt-dlp", "--no-config", "--user-agent", YT_DLP_UA,
             "-f", YOUTUBE_QUALITY_FORMATS["720"],
@@ -3332,8 +3417,7 @@ async def download_and_clip(
             _log.append("[NOVIDEO]")
             return None, "\n".join(_log)
 
-    tmp = tempfile.mkdtemp(prefix="cove_", dir=TMP_BASE)
-    os.chmod(tmp, 0o700)
+    tmp = _make_job_tmpdir()
     output_template = str(Path(tmp) / "%(title)s.%(ext)s")
 
     if is_reddit:
@@ -3483,8 +3567,7 @@ async def download_and_gif(url: str, guild: discord.Guild | None) -> tuple:
             _log.append("[NOVIDEO]")
             return None, "\n".join(_log)
 
-    tmp = tempfile.mkdtemp(prefix="cove_", dir=TMP_BASE)
-    os.chmod(tmp, 0o700)
+    tmp = _make_job_tmpdir()
     output_template = str(Path(tmp) / "%(title)s.%(ext)s")
 
     if is_reddit:
@@ -3624,8 +3707,7 @@ async def download_audio(url: str, guild: discord.Guild | None) -> tuple:
             _log.append("[NOVIDEO]")
             return None, "\n".join(_log)
 
-    tmp = tempfile.mkdtemp(prefix="cove_", dir=TMP_BASE)
-    os.chmod(tmp, 0o700)
+    tmp = _make_job_tmpdir()
     keep_tmp = False
     try:
         output_template = str(Path(tmp) / "%(title)s.%(ext)s")
@@ -3750,6 +3832,7 @@ def _cleanup_tmp_sync(filepath: str):
         parent = str(Path(filepath).parent)
         if "cove_" in parent:
             shutil.rmtree(parent, ignore_errors=True)
+            _active_tmpdirs.pop(parent, None)
         else:
             os.remove(filepath)
     except Exception:
@@ -4137,6 +4220,18 @@ class CoveBot(discord.Client):
                     log.warning("[Cove] Could not DM yt-dlp warning to guild owner: %s", e)
 
     async def close(self):
+        # Stop background/processing tasks before tearing down the shared
+        # sessions they may still be using.
+        pending = [t for t in _active_tasks if not t.done()]
+        for task in pending:
+            task.cancel()
+        if pending:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*pending, return_exceptions=True), timeout=10
+                )
+            except asyncio.TimeoutError:
+                log.warning("[Cove] Some background tasks did not stop within 10s.")
         if _cache_write_queue:
             try:
                 await asyncio.get_running_loop().run_in_executor(None, _flush_cache_writes)

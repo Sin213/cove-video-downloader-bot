@@ -1108,6 +1108,7 @@ async def _probe_youtube_quality(url: str, requested_quality: str, target_size: 
         cmd = [
             "yt-dlp", "--no-config", "--user-agent", YT_DLP_UA,
             "--no-download",
+            "--no-playlist",
             "--dump-json",
             "-f", fmt,
             url,
@@ -1206,7 +1207,7 @@ def reddit_vxreddit_url_from_log(log_text: str) -> str | None:
 
 def reddit_media_url_from_text(text: str, extensions: set[str]) -> str | None:
     for match in URL_RE.finditer(unquote(text)):
-        url = match.group(0).rstrip(").,>")
+        url = match.group(0).rstrip(").,>;:!?'\"]}")
         parsed = urlparse(url)
         ext = parsed.path.rsplit(".", 1)[-1].lower()
         if hostname_for(url) in REDDIT_IMAGE_HOSTS and ext in extensions:
@@ -1552,7 +1553,7 @@ def is_instagram_noncontent_url(url: str) -> bool:
 
 def extract_supported_url(content: str) -> str | None:
     for match in URL_RE.finditer(content):
-        url = match.group(0).rstrip(").,>")
+        url = match.group(0).rstrip(").,>;:!?'\"]}")
         if len(url) > MAX_URL_LENGTH:
             continue
         host = hostname_for(url)
@@ -1586,7 +1587,7 @@ def _is_internal_ip(ip_str: str) -> bool:
     )
 
 
-async def validate_manual_url(url: str) -> tuple[bool, str]:
+def _validate_manual_url_syntax(url: str) -> tuple[bool, str]:
     if len(url) > MAX_URL_LENGTH:
         return False, "URL is too long."
     try:
@@ -1613,6 +1614,11 @@ async def validate_manual_url(url: str) -> tuple[bool, str]:
     if _is_internal_ip(host):
         log.warning("[security] Blocked SSRF attempt to internal IP: %s", host)
         return False, "URL points to a non-public address."
+    return True, ""
+
+
+async def _validate_manual_url_dns(url: str) -> tuple[bool, str]:
+    host = (urlparse(url).hostname or "").lower()
     loop = asyncio.get_running_loop()
     try:
         infos = await asyncio.wait_for(loop.getaddrinfo(host, None), timeout=10)
@@ -1623,6 +1629,13 @@ async def validate_manual_url(url: str) -> tuple[bool, str]:
             log.warning("[security] Blocked SSRF attempt: %s resolved to internal IP %s", host, info[4][0])
             return False, "URL points to a non-public address."
     return True, ""
+
+
+async def validate_manual_url(url: str) -> tuple[bool, str]:
+    ok, err = _validate_manual_url_syntax(url)
+    if not ok:
+        return ok, err
+    return await _validate_manual_url_dns(url)
 
 
 def is_friend_server(guild: discord.Guild | None) -> bool:
@@ -2150,14 +2163,20 @@ def _is_supported_instagram_post_url(url: str) -> bool:
 
 
 def _load_ytdlp_json(output: str) -> dict | None:
-    json_start = output.find("{")
-    if json_start < 0:
-        return None
-    try:
-        metadata = json.loads(output[json_start:])
-    except (ValueError, TypeError):
-        return None
-    return metadata if isinstance(metadata, dict) else None
+    # Merged stdout+stderr may hold log lines with stray "{" before the JSON,
+    # and playlist URLs emit multiple objects; take the first valid dict.
+    decoder = json.JSONDecoder()
+    idx = output.find("{")
+    while idx >= 0:
+        try:
+            obj, _end = decoder.raw_decode(output, idx)
+        except ValueError:
+            idx = output.find("{", idx + 1)
+            continue
+        if isinstance(obj, dict):
+            return obj
+        idx = output.find("{", idx + 1)
+    return None
 
 
 async def instagram_post_probe(url: str) -> tuple[bool, int | None, str | None]:
@@ -4585,7 +4604,7 @@ async def download_cmd(
     url: str,
     resolution: app_commands.Choice[str] | None = None,
 ):
-    ok, err = await validate_manual_url(url)
+    ok, err = _validate_manual_url_syntax(url)
     if not ok:
         try:
             await interaction.response.send_message(f"\u274c {err}", ephemeral=True)
@@ -4606,6 +4625,15 @@ async def download_cmd(
     try:
         await interaction.response.defer(thinking=True)
     except (discord.errors.NotFound, discord.errors.HTTPException):
+        return
+
+    # DNS resolution can exceed Discord's 3s ack window, so it runs after defer.
+    ok, err = await _validate_manual_url_dns(url)
+    if not ok:
+        try:
+            await interaction.followup.send(f"❌ {err}")
+        except (discord.errors.NotFound, discord.errors.HTTPException):
+            pass
         return
 
     friend_mode = is_friend_server(interaction.guild)
@@ -4690,7 +4718,7 @@ async def download_cmd(
 )
 @app_commands.describe(url="The video URL to extract audio from")
 async def audio_cmd(interaction: discord.Interaction, url: str):
-    ok, err = await validate_manual_url(url)
+    ok, err = _validate_manual_url_syntax(url)
     if not ok:
         try:
             await interaction.response.send_message(f"\u274c {err}", ephemeral=True)
@@ -4711,6 +4739,15 @@ async def audio_cmd(interaction: discord.Interaction, url: str):
     try:
         await interaction.response.defer(thinking=True)
     except (discord.errors.NotFound, discord.errors.HTTPException):
+        return
+
+    # DNS resolution can exceed Discord's 3s ack window, so it runs after defer.
+    ok, err = await _validate_manual_url_dns(url)
+    if not ok:
+        try:
+            await interaction.followup.send(f"❌ {err}")
+        except (discord.errors.NotFound, discord.errors.HTTPException):
+            pass
         return
 
     friend_mode = is_friend_server(interaction.guild)
@@ -4766,7 +4803,7 @@ async def audio_cmd(interaction: discord.Interaction, url: str):
     end="End time (e.g. 2:00, 120, 0:30)",
 )
 async def clip_cmd(interaction: discord.Interaction, url: str, start: str, end: str):
-    ok, err = await validate_manual_url(url)
+    ok, err = _validate_manual_url_syntax(url)
     if not ok:
         try:
             await interaction.response.send_message(f"❌ {err}", ephemeral=True)
@@ -4821,6 +4858,15 @@ async def clip_cmd(interaction: discord.Interaction, url: str, start: str, end: 
     except (discord.errors.NotFound, discord.errors.HTTPException):
         return
 
+    # DNS resolution can exceed Discord's 3s ack window, so it runs after defer.
+    ok, err = await _validate_manual_url_dns(url)
+    if not ok:
+        try:
+            await interaction.followup.send(f"❌ {err}")
+        except (discord.errors.NotFound, discord.errors.HTTPException):
+            pass
+        return
+
     friend_mode = is_friend_server(interaction.guild)
     poster_id   = interaction.user.id
 
@@ -4866,7 +4912,7 @@ async def clip_cmd(interaction: discord.Interaction, url: str, start: str, end: 
 )
 @app_commands.describe(url="The video URL to convert to GIF")
 async def gif_cmd(interaction: discord.Interaction, url: str):
-    ok, err = await validate_manual_url(url)
+    ok, err = _validate_manual_url_syntax(url)
     if not ok:
         try:
             await interaction.response.send_message(f"❌ {err}", ephemeral=True)
@@ -4887,6 +4933,15 @@ async def gif_cmd(interaction: discord.Interaction, url: str):
     try:
         await interaction.response.defer(thinking=True)
     except (discord.errors.NotFound, discord.errors.HTTPException):
+        return
+
+    # DNS resolution can exceed Discord's 3s ack window, so it runs after defer.
+    ok, err = await _validate_manual_url_dns(url)
+    if not ok:
+        try:
+            await interaction.followup.send(f"❌ {err}")
+        except (discord.errors.NotFound, discord.errors.HTTPException):
+            pass
         return
 
     friend_mode = is_friend_server(interaction.guild)

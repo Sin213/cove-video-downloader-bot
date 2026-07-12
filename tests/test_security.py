@@ -758,3 +758,27 @@ def test_validate_manual_url_blocks_mirrors_but_allows_fixup_hosts():
     # only assert the rejection reason is not the mirror/proxy message.
     _ok, msg = asyncio.run(validate_manual_url("https://fxtwitter.com/user/status/123"))
     assert "mirror" not in msg
+
+
+def test_extract_supported_url_strips_trailing_punctuation():
+    base = "https://twitter.com/user/status/123"
+    for trail in ("!", "?", ";", ":", "'", '"', "]", "}", ")!?"):
+        assert extract_supported_url(f"check this {base}{trail}") == base
+    # Query strings must survive: rstrip only touches trailing chars.
+    q = "https://twitter.com/user/status/123?s=20"
+    assert extract_supported_url(f"see {q},") == q
+
+
+def test_load_ytdlp_json_skips_log_noise_and_extra_objects():
+    from bot import _load_ytdlp_json
+
+    # Log line containing "{" before the real JSON (merged stdout+stderr).
+    noisy = '[debug] fmt {format_id} selected\n{"id": "vid1", "duration": 30}'
+    assert _load_ytdlp_json(noisy) == {"id": "vid1", "duration": 30}
+
+    # Playlist output: multiple JSON objects; first dict wins.
+    multi = '{"id": "vid1"}\n{"id": "vid2"}'
+    assert _load_ytdlp_json(multi) == {"id": "vid1"}
+
+    assert _load_ytdlp_json("no json here") is None
+    assert _load_ytdlp_json("[1, 2, 3]") is None

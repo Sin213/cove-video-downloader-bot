@@ -1347,7 +1347,8 @@ async def send_reddit_gallery(
     message: discord.Message, image_urls: list[str], content: str | None = None
 ) -> "list[discord.Message] | None":
     sent = await _send_image_gallery_files(
-        message,
+        message.channel.send,
+        message.guild,
         image_urls,
         headers={"User-Agent": REDDIT_UA},
         log_prefix="[reddit-gallery]",
@@ -1608,10 +1609,14 @@ ENV = clean_env()
 
 
 def _version_tuple(version: str) -> tuple[int, ...]:
-    try:
-        return tuple(int(part) for part in version.split("."))
-    except ValueError:
-        return ()
+    # Compare only the leading numeric components so PEP 440 style suffixes
+    # (e.g. "2024.01.01.post1") do not invalidate the whole version.
+    parts: list[int] = []
+    for part in version.split("."):
+        if not part.isdigit():
+            break
+        parts.append(int(part))
+    return tuple(parts)
 
 
 def _check_ytdlp_version() -> tuple[bool, str]:
@@ -2254,7 +2259,8 @@ async def fetch_instagram_gallery_image_urls(url: str) -> list[str]:
 
 
 async def _send_image_gallery_files(
-    message: discord.Message,
+    send,
+    guild: discord.Guild | None,
     image_urls: list[str],
     *,
     headers: dict[str, str],
@@ -2263,10 +2269,12 @@ async def _send_image_gallery_files(
 ) -> "list[discord.Message] | None":
     """Download images and upload them as Discord attachments in chunks of 10.
 
+    `send` is any coroutine with a channel.send-compatible signature that
+    returns the sent message (channel.send or interaction.followup.send).
     Returns all sent messages, or None if any download or send failed
     (partially sent messages are deleted).
     """
-    limit_bytes = int(get_target_mb(message.guild) * 1024 * 1024)
+    limit_bytes = int(get_target_mb(guild) * 1024 * 1024)
     files: list[tuple[str, bytes]] = []
     session = _get_http_session()
     for index, image_url in enumerate(image_urls, start=1):
@@ -2303,7 +2311,7 @@ async def _send_image_gallery_files(
                 for name, data in files[start:start + 10]
             ]
             sent_messages.append(
-                await message.channel.send(
+                await send(
                     content=content if start == 0 else None,
                     files=chunk,
                     allowed_mentions=discord.AllowedMentions(users=False, everyone=False, roles=False),
@@ -2326,7 +2334,8 @@ async def send_instagram_gallery(message: discord.Message, url: str) -> bool:
     if not image_urls:
         return False
     sent = await _send_image_gallery_files(
-        message,
+        message.channel.send,
+        message.guild,
         image_urls,
         headers={"User-Agent": YT_DLP_UA},
         log_prefix=f"[instagram-gallery] {url} -",
@@ -3760,28 +3769,38 @@ async def _run_download_phase(
     Returns (filepath, log_text) on success, or None if an error/no-video callback
     handled the result.
     """
+
+    async def safe_callback(callback, *args):
+        # Callbacks send Discord replies and can fail (expired interaction
+        # token, missing permissions); never let that crash the job.
+        try:
+            await callback(*args)
+        except Exception:
+            log.exception("Unhandled exception in %s result callback", kind)
+
     async with JOB_SEMAPHORE:
         try:
             filepath, log_text = await download_coro
         except Exception as e:
             log.exception("Unhandled exception during %s", kind)
-            await on_error(f"Unexpected error: {e}")
+            await safe_callback(on_error, f"Unexpected error: {e}")
             return None
 
         novideo, toobig_str, error_str = _parse_log_markers(log_text)
 
         if novideo:
             if on_no_video:
-                await on_no_video(log_text)
+                await safe_callback(on_no_video, log_text)
             return None
 
         if toobig_str:
             if on_too_big:
-                await on_too_big(toobig_str)
+                await safe_callback(on_too_big, toobig_str)
                 return None
             if too_big_msg:
-                await on_error(
-                    too_big_msg.format(toobig_str=toobig_str, max_min=MAX_DURATION_SECONDS // 60)
+                await safe_callback(
+                    on_error,
+                    too_big_msg.format(toobig_str=toobig_str, max_min=MAX_DURATION_SECONDS // 60),
                 )
                 return None
             # otherwise fall through, matching legacy clip behavior
@@ -3791,7 +3810,7 @@ async def _run_download_phase(
             log.error("%s failed. Full log:\n%s", kind.capitalize(), log_text)
             if error_str and "cookies" in error_str.lower():
                 spawn_tracked(_maybe_send_cookie_warning(client))
-            await on_error(msg)
+            await safe_callback(on_error, msg)
             return None
 
         return filepath, log_text
@@ -3975,7 +3994,7 @@ async def process_gif_url(
             download_and_gif(url, guild),
             on_error,
             on_no_video,
-            too_big_msg="Source video too long (max {max_min}min)",
+            too_big_msg="Source video too long ({toobig_str}, max {max_min}min)",
             no_file_msg="GIF conversion failed.",
             kind="gif",
         )
@@ -4468,7 +4487,7 @@ async def download_cmd(
         await interaction.followup.send(f"\u274c {msg}")
 
     async def on_no_video(log_text: str = ""):
-        if INFLIGHT_MARKER in log_text:
+        if log_text.strip() == INFLIGHT_MARKER:
             await interaction.followup.send(
                 "\u23f3 That link is already being processed - the result will be posted shortly."
             )
@@ -4484,6 +4503,26 @@ async def download_cmd(
         vx_url = reddit_vxreddit_url_from_log(log_text)
         if vx_url:
             await interaction.followup.send(vx_url)
+            return
+        reddit_gif = reddit_gif_url_from_log(log_text)
+        if reddit_gif:
+            await interaction.followup.send(reddit_gif)
+            return
+        gallery_urls = reddit_gallery_urls_from_log(log_text)
+        if gallery_urls:
+            sent_gallery = await _send_image_gallery_files(
+                interaction.followup.send,
+                interaction.guild,
+                gallery_urls,
+                headers={"User-Agent": REDDIT_UA},
+                log_prefix="[reddit-gallery]",
+            )
+            if sent_gallery is None:
+                await interaction.followup.send(replace_hostname(url, "vxreddit.com"))
+            return
+        reddit_image = reddit_image_url_from_log(log_text)
+        if reddit_image:
+            await interaction.followup.send(reddit_image)
             return
         await interaction.followup.send("\u274c No video found at that link.")
 
@@ -4553,7 +4592,7 @@ async def audio_cmd(interaction: discord.Interaction, url: str):
         await interaction.followup.send(f"\u274c {msg}")
 
     async def on_no_video(log_text: str = ""):
-        if INFLIGHT_MARKER in log_text:
+        if log_text.strip() == INFLIGHT_MARKER:
             await interaction.followup.send(
                 "\u23f3 That link is already being processed - the result will be posted shortly."
             )
@@ -4661,7 +4700,7 @@ async def clip_cmd(interaction: discord.Interaction, url: str, start: str, end: 
         await interaction.followup.send(f"❌ {msg}")
 
     async def on_no_video(log_text: str = ""):
-        if INFLIGHT_MARKER in log_text:
+        if log_text.strip() == INFLIGHT_MARKER:
             await interaction.followup.send(
                 "⏳ That link is already being processed - the result will be posted shortly."
             )
@@ -4729,7 +4768,7 @@ async def gif_cmd(interaction: discord.Interaction, url: str):
         await interaction.followup.send(f"❌ {msg}")
 
     async def on_no_video(log_text: str = ""):
-        if INFLIGHT_MARKER in log_text:
+        if log_text.strip() == INFLIGHT_MARKER:
             await interaction.followup.send(
                 "⏳ That link is already being processed - the result will be posted shortly."
             )

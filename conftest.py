@@ -45,6 +45,7 @@ def isolate_cache_db(tmp_path_factory):
         bot._cache_db_conn.close()
     bot._cache_db_conn = None
     bot.CACHE_DB_PATH = str(tmp_path_factory.mktemp("cove_cache") / "cache.db")
+    bot._init_persistent_cache()
     yield
 
 

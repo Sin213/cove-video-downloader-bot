@@ -521,7 +521,8 @@ def test_reddit_image_repost_uploads_file_and_deletes_after_success(monkeypatch,
     ]
 
 
-def test_successful_instagram_image_rewrite_deletes_original_message():
+def test_successful_instagram_image_rewrite_deletes_original_message(monkeypatch):
+    monkeypatch.setattr("bot.send_instagram_gallery", lambda message, url: asyncio.sleep(0, result=False))
     events = []
     message = FakeMessage(events)
     log_text = f"{INSTAGRAM_IMAGE_MARKER}\n[NOVIDEO]"
@@ -542,6 +543,7 @@ def test_successful_instagram_image_rewrite_deletes_original_message():
 
 
 def test_failed_instagram_image_rewrite_repost_does_not_delete(monkeypatch):
+    monkeypatch.setattr("bot.send_instagram_gallery", lambda message, url: asyncio.sleep(0, result=False))
     monkeypatch.setattr("bot.discord.HTTPException", FakeDiscordError)
     events = []
     message = FakeMessage(events, send_error=FakeDiscordError("send failed"))
@@ -576,6 +578,7 @@ def test_instagram_video_download_path_does_not_delete_original_message():
 
 
 def test_instagram_image_rewrite_forbidden_delete_failure_does_not_crash(monkeypatch):
+    monkeypatch.setattr("bot.send_instagram_gallery", lambda message, url: asyncio.sleep(0, result=False))
     monkeypatch.setattr("bot.discord.Forbidden", FakeDiscordError)
     events = []
     message = FakeMessage(events, delete_error=FakeDiscordError("delete forbidden"))
@@ -684,6 +687,7 @@ def test_process_url_instagram_private_deleted_login_rate_limit_timeout_sends_no
 
     assert calls
     assert sent == []
+    assert errors
 
 
 def test_process_url_instagram_video_success_sends_no_rewrite(monkeypatch):
@@ -734,7 +738,6 @@ def test_process_url_instagram_video_success_sends_no_rewrite(monkeypatch):
         lambda filepath: asyncio.sleep(0, result={"format": {"duration": "12.3"}, "streams": []}),
     )
     monkeypatch.setattr("bot.compress_to_target", fake_compress_to_target)
-    monkeypatch.setattr("bot.cleanup_tmp", lambda filepath: asyncio.sleep(0))
 
     asyncio.run(process_url(url, None, on_success, fail_error, fail_too_big, on_no_video))
 

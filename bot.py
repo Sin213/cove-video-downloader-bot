@@ -1998,21 +1998,31 @@ async def run_subprocess(
         start_new_session=True,
     )
 
-    # The buffer lives outside drain_and_wait so bytes read before a timeout
-    # or cancellation survive for the caller's error classification. Only the
-    # last MAX_SUBPROCESS_OUTPUT_BYTES are kept as a rolling tail: callers
-    # classify failures by markers like "HTTP Error 403" that appear at the
-    # end of output, so a verbose child must not push them out of the cap.
-    buf = bytearray()
+    # The buffers live outside drain_and_wait so bytes read before a timeout
+    # or cancellation survive for the caller's error classification. Callers
+    # classify failures by markers like "HTTP Error 403" that can appear
+    # early (mid-stream fragment 403 with exit 0 -> partial-download guard)
+    # or at the very end (terminal diagnostic -> retry/fallback), so keep a
+    # fixed head plus a rolling tail within MAX_SUBPROCESS_OUTPUT_BYTES; only
+    # the middle of a verbose child's output is dropped.
+    head_cap = MAX_SUBPROCESS_OUTPUT_BYTES // 2
+    tail_cap = MAX_SUBPROCESS_OUTPUT_BYTES - head_cap
+    head = bytearray()
+    tail = bytearray()
 
     async def drain_and_wait() -> None:
         while True:
             chunk = await proc.stdout.read(64 * 1024)
             if not chunk:
                 break
-            buf.extend(chunk)
-            if len(buf) > MAX_SUBPROCESS_OUTPUT_BYTES:
-                del buf[:len(buf) - MAX_SUBPROCESS_OUTPUT_BYTES]
+            if len(head) < head_cap:
+                take = head_cap - len(head)
+                head.extend(chunk[:take])
+                chunk = chunk[take:]
+            if chunk:
+                tail.extend(chunk)
+                if len(tail) > tail_cap:
+                    del tail[:len(tail) - tail_cap]
         await proc.wait()
 
     try:
@@ -2023,11 +2033,11 @@ async def run_subprocess(
             try:
                 await asyncio.wait_for(drain_and_wait(), timeout=5)
             except asyncio.TimeoutError:
-                output = bytes(buf).decode(errors="replace")
+                output = bytes(head + tail).decode(errors="replace")
                 return 124, output + "\n[ERROR] Subprocess timed out and did not exit cleanly."
-            output = bytes(buf).decode(errors="replace")
+            output = bytes(head + tail).decode(errors="replace")
             return 124, output + "\n[ERROR] Subprocess timed out."
-        return proc.returncode, bytes(buf).decode(errors="replace")
+        return proc.returncode, bytes(head + tail).decode(errors="replace")
     except asyncio.CancelledError:
         # Shutdown-driven task cancellation must not orphan the child group.
         _kill_process_group(proc)

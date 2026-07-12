@@ -569,3 +569,18 @@ def test_run_subprocess_bounded_capture_keeps_terminal_error():
     assert code == 1
     assert len(out.encode()) <= bot.MAX_SUBPROCESS_OUTPUT_BYTES
     assert "HTTP Error 403: TERMINAL-MARKER" in out
+
+
+def test_run_subprocess_bounded_capture_keeps_early_error_marker():
+    script = (
+        "import sys; sys.stdout.write('HTTP Error 403: EARLY-MARKER'); "
+        "sys.stdout.write('x' * 600000); sys.exit(0)"
+    )
+
+    async def runner():
+        return await bot.run_subprocess([sys.executable, "-c", script], timeout=30)
+
+    code, out = asyncio.run(runner())
+    assert code == 0
+    assert len(out.encode()) <= bot.MAX_SUBPROCESS_OUTPUT_BYTES
+    assert "HTTP Error 403: EARLY-MARKER" in out

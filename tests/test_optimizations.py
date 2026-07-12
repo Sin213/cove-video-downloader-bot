@@ -172,7 +172,7 @@ def _isolate_cache_db(monkeypatch, tmp_path):
 
 def test_persist_cache_entry_bool(monkeypatch, tmp_path):
     _isolate_cache_db(monkeypatch, tmp_path)
-    _cache_write_queue.append(("test_bool_key", "1", "has_video", time.time() + 3600))
+    asyncio.run(bot._persist_cache_entry_async("test_bool_key", True, "has_video", 3600))
     _flush_cache_writes()
     conn = sqlite3.connect(bot.CACHE_DB_PATH)
     row = conn.execute(
@@ -187,7 +187,9 @@ def test_persist_cache_entry_bool(monkeypatch, tmp_path):
 
 def test_persist_cache_entry_string(monkeypatch, tmp_path):
     _isolate_cache_db(monkeypatch, tmp_path)
-    _cache_write_queue.append(("test_str_key", "https://reddit.com/r/test/comments/abc", "shortlink", time.time() + 3600))
+    asyncio.run(
+        bot._persist_cache_entry_async("test_str_key", "https://reddit.com/r/test/comments/abc", "shortlink", 3600)
+    )
     _flush_cache_writes()
     conn = sqlite3.connect(bot.CACHE_DB_PATH)
     row = conn.execute(
@@ -251,6 +253,7 @@ def test_gif_max_duration():
 
 def test_boost_tier_limits_correct():
     assert BOOST_TIER_LIMITS_MB[0] == 9.5
+    assert BOOST_TIER_LIMITS_MB[1] == 9.5
     assert BOOST_TIER_LIMITS_MB[2] == 49.0
     assert BOOST_TIER_LIMITS_MB[3] == 99.0
 

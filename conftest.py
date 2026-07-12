@@ -29,6 +29,7 @@ _BOT_SCALAR_DEFAULTS = {
     "_user_rate_last_sweep": 0,
     "_ytdlp_admin_warning_sent": False,
     "_reddit_cookie_header_cache": None,
+    "_instagram_cookie_header_cache": None,
 }
 
 
@@ -47,6 +48,9 @@ def isolate_cache_db(tmp_path_factory):
     bot.CACHE_DB_PATH = str(tmp_path_factory.mktemp("cove_cache") / "cache.db")
     bot._init_persistent_cache()
     yield
+    if bot._cache_db_conn is not None:
+        bot._cache_db_conn.close()
+        bot._cache_db_conn = None
 
 
 @pytest.fixture(autouse=True)

@@ -694,10 +694,25 @@ def reddit_cookie_header() -> str | None:
         return None
 
 
+_instagram_cookie_header_cache: tuple[float, str | None, float] | None = None
+
+
 def instagram_cookie_header() -> str | None:
+    global _instagram_cookie_header_cache
     if not COOKIES_EXIST:
         return None
     try:
+        now = monotonic()
+        if _instagram_cookie_header_cache:
+            cached_mtime, cached_header, cached_at = _instagram_cookie_header_cache
+            if now - cached_at < _COOKIE_HEADER_TTL:
+                return cached_header
+
+        mtime = os.path.getmtime(COOKIES_FILE)
+        if _instagram_cookie_header_cache and _instagram_cookie_header_cache[0] == mtime:
+            _instagram_cookie_header_cache = (mtime, _instagram_cookie_header_cache[1], now)
+            return _instagram_cookie_header_cache[1]
+
         jar = MozillaCookieJar(COOKIES_FILE)
         jar.load(ignore_discard=True, ignore_expires=True)
         values = []
@@ -707,9 +722,12 @@ def instagram_cookie_header() -> str | None:
                 domain = domain[len("#httponly_"):]
             if domain == "instagram.com" or domain.endswith(".instagram.com"):
                 values.append(f"{cookie.name}={cookie.value}")
-        return "; ".join(values) or None
+        header = "; ".join(values) or None
+        _instagram_cookie_header_cache = (mtime, header, now)
+        return header
     except Exception as e:
         log.warning("[instagram] Could not load cookies.txt for API request: %s", e)
+        _instagram_cookie_header_cache = None
         return None
 
 
@@ -1538,6 +1556,8 @@ async def validate_manual_url(url: str) -> tuple[bool, str]:
     host = (parsed.hostname or "").lower()
     if not host:
         return False, "URL has no host."
+    if host_matches(host, BLACKLISTED_DOMAINS):
+        return False, "That mirror/proxy host is not supported. Use the original post URL."
     if host in {"localhost", "ip6-localhost", "ip6-loopback"}:
         return False, "URL points to a non-public address."
     if _is_internal_ip(host):
@@ -2194,7 +2214,7 @@ async def _instagram_mirror_is_embeddable(url: str) -> bool:
 
 def _instagram_shortcode_from_url(url: str) -> str | None:
     parts = [part for part in urlparse(url).path.split("/") if part]
-    if len(parts) == 2 and parts[0] in ("p", "reel", "reels") and parts[1]:
+    if len(parts) == 2 and parts[0] in ("p", "reel", "reels", "tv") and parts[1]:
         return parts[1]
     return None
 
@@ -3754,6 +3774,15 @@ def busy_message() -> str:
     )
 
 
+async def _safe_notify(callback, kind: str, *args) -> None:
+    # Result callbacks send Discord replies and can fail (expired interaction
+    # token, missing permissions); never let that crash the job.
+    try:
+        await callback(*args)
+    except Exception:
+        log.exception("Unhandled exception in %s result callback", kind)
+
+
 async def _run_download_phase(
     download_coro,
     on_error,
@@ -3769,37 +3798,29 @@ async def _run_download_phase(
     Returns (filepath, log_text) on success, or None if an error/no-video callback
     handled the result.
     """
-
-    async def safe_callback(callback, *args):
-        # Callbacks send Discord replies and can fail (expired interaction
-        # token, missing permissions); never let that crash the job.
-        try:
-            await callback(*args)
-        except Exception:
-            log.exception("Unhandled exception in %s result callback", kind)
-
     async with JOB_SEMAPHORE:
         try:
             filepath, log_text = await download_coro
         except Exception as e:
             log.exception("Unhandled exception during %s", kind)
-            await safe_callback(on_error, f"Unexpected error: {e}")
+            await _safe_notify(on_error, kind, f"Unexpected error: {e}")
             return None
 
         novideo, toobig_str, error_str = _parse_log_markers(log_text)
 
         if novideo:
             if on_no_video:
-                await safe_callback(on_no_video, log_text)
+                await _safe_notify(on_no_video, kind, log_text)
             return None
 
         if toobig_str:
             if on_too_big:
-                await safe_callback(on_too_big, toobig_str)
+                await _safe_notify(on_too_big, kind, toobig_str)
                 return None
             if too_big_msg:
-                await safe_callback(
+                await _safe_notify(
                     on_error,
+                    kind,
                     too_big_msg.format(toobig_str=toobig_str, max_min=MAX_DURATION_SECONDS // 60),
                 )
                 return None
@@ -3810,7 +3831,7 @@ async def _run_download_phase(
             log.error("%s failed. Full log:\n%s", kind.capitalize(), log_text)
             if error_str and "cookies" in error_str.lower():
                 spawn_tracked(_maybe_send_cookie_warning(client))
-            await safe_callback(on_error, msg)
+            await _safe_notify(on_error, kind, msg)
             return None
 
         return filepath, log_text
@@ -3829,13 +3850,13 @@ async def process_url(
     if canonical in _inflight_urls:
         log.info("[dedup] Skipping already-in-flight URL: %s", url)
         if on_no_video:
-            await on_no_video(INFLIGHT_MARKER)
+            await _safe_notify(on_no_video, "video", INFLIGHT_MARKER)
         return
     _inflight_urls.add(canonical)
     reserved_slot = False
     try:
         if not _try_reserve_job_slot():
-            await on_error(busy_message())
+            await _safe_notify(on_error, "video", busy_message())
             return
         reserved_slot = True
         running, waiting = _job_queue_status()
@@ -3859,7 +3880,7 @@ async def process_url(
             await on_success(filepath)
         except Exception as e:
             log.exception("Unhandled exception in on_success")
-            await on_error(user_facing_upload_error(e))
+            await _safe_notify(on_error, "upload", user_facing_upload_error(e))
         finally:
             await cleanup_tmp(filepath)
     finally:
@@ -3880,13 +3901,13 @@ async def process_audio_url(
     if canonical in _inflight_urls:
         log.info("[dedup] Skipping already-in-flight audio URL: %s", url)
         if on_no_video:
-            await on_no_video(INFLIGHT_MARKER)
+            await _safe_notify(on_no_video, "audio", INFLIGHT_MARKER)
         return
     _inflight_urls.add(canonical)
     reserved_slot = False
     try:
         if not _try_reserve_job_slot():
-            await on_error(BUSY_MESSAGE)
+            await _safe_notify(on_error, "audio", BUSY_MESSAGE)
             return
         reserved_slot = True
         running, waiting = _job_queue_status()
@@ -3909,7 +3930,7 @@ async def process_audio_url(
             await on_success(filepath)
         except Exception as e:
             log.exception("Unhandled exception in audio on_success")
-            await on_error(user_facing_upload_error(e))
+            await _safe_notify(on_error, "upload", user_facing_upload_error(e))
         finally:
             await cleanup_tmp(filepath)
     finally:
@@ -3931,13 +3952,13 @@ async def process_clip_url(
     if canonical in _inflight_urls:
         log.info("[dedup] Skipping already-in-flight clip URL: %s", url)
         if on_no_video:
-            await on_no_video(INFLIGHT_MARKER)
+            await _safe_notify(on_no_video, "clip", INFLIGHT_MARKER)
         return
     _inflight_urls.add(canonical)
     reserved_slot = False
     try:
         if not _try_reserve_job_slot():
-            await on_error(BUSY_MESSAGE)
+            await _safe_notify(on_error, "clip", BUSY_MESSAGE)
             return
         reserved_slot = True
         running, waiting = _job_queue_status()
@@ -3958,7 +3979,7 @@ async def process_clip_url(
             await on_success(filepath)
         except Exception as e:
             log.exception("Unhandled exception in clip on_success")
-            await on_error(user_facing_upload_error(e))
+            await _safe_notify(on_error, "upload", user_facing_upload_error(e))
         finally:
             await cleanup_tmp(filepath)
     finally:
@@ -3978,13 +3999,13 @@ async def process_gif_url(
     if canonical in _inflight_urls:
         log.info("[dedup] Skipping already-in-flight GIF URL: %s", url)
         if on_no_video:
-            await on_no_video(INFLIGHT_MARKER)
+            await _safe_notify(on_no_video, "gif", INFLIGHT_MARKER)
         return
     _inflight_urls.add(canonical)
     reserved_slot = False
     try:
         if not _try_reserve_job_slot():
-            await on_error(BUSY_MESSAGE)
+            await _safe_notify(on_error, "gif", BUSY_MESSAGE)
             return
         reserved_slot = True
         running, waiting = _job_queue_status()
@@ -4006,7 +4027,7 @@ async def process_gif_url(
             await on_success(filepath)
         except Exception as e:
             log.exception("Unhandled exception in gif on_success")
-            await on_error(user_facing_upload_error(e))
+            await _safe_notify(on_error, "upload", user_facing_upload_error(e))
         finally:
             await cleanup_tmp(filepath)
     finally:
@@ -4378,7 +4399,10 @@ class CoveBot(discord.Client):
             try:
                 await message.reply(f"\u274c {msg}", mention_author=False)
             except discord.HTTPException:
-                await message.channel.send(f"\u274c {msg}")
+                try:
+                    await message.channel.send(f"\u274c {msg}")
+                except discord.HTTPException as e:
+                    log.warning("[cove] Could not deliver error reply: %s", e)
 
         spawn_tracked(
             process_url(url, message.guild, on_success, on_error, on_too_big, on_no_video)

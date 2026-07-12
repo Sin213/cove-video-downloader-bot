@@ -2004,17 +2004,25 @@ async def run_subprocess(
     # early (mid-stream fragment 403 with exit 0 -> partial-download guard)
     # or at the very end (terminal diagnostic -> retry/fallback), so keep a
     # fixed head plus a rolling tail within MAX_SUBPROCESS_OUTPUT_BYTES; only
-    # the middle of a verbose child's output is dropped.
+    # the middle of a verbose child's output is dropped. Because substring
+    # checks against the excerpt cannot see a marker evicted with the middle
+    # (and must not match across the head/tail seam), the 403 marker is also
+    # tracked while streaming and re-appended if truncation dropped it.
+    marker_403 = b"HTTP Error 403"
     head_cap = MAX_SUBPROCESS_OUTPUT_BYTES // 2
     tail_cap = MAX_SUBPROCESS_OUTPUT_BYTES - head_cap
     head = bytearray()
     tail = bytearray()
+    state = {"truncated": False, "marker_seen": False, "carry": b""}
 
     async def drain_and_wait() -> None:
         while True:
             chunk = await proc.stdout.read(64 * 1024)
             if not chunk:
                 break
+            if not state["marker_seen"] and marker_403 in state["carry"] + chunk:
+                state["marker_seen"] = True
+            state["carry"] = chunk[-(len(marker_403) - 1):]
             if len(head) < head_cap:
                 take = head_cap - len(head)
                 head.extend(chunk[:take])
@@ -2022,8 +2030,16 @@ async def run_subprocess(
             if chunk:
                 tail.extend(chunk)
                 if len(tail) > tail_cap:
+                    state["truncated"] = True
                     del tail[:len(tail) - tail_cap]
         await proc.wait()
+
+    def render_output() -> str:
+        seam = b"\n[... output truncated ...]\n" if state["truncated"] else b""
+        out = (bytes(head) + seam + bytes(tail)).decode(errors="replace")
+        if state["marker_seen"] and "HTTP Error 403" not in out:
+            out += "\n[HTTP Error 403 detected in truncated output]"
+        return out
 
     try:
         try:
@@ -2033,11 +2049,9 @@ async def run_subprocess(
             try:
                 await asyncio.wait_for(drain_and_wait(), timeout=5)
             except asyncio.TimeoutError:
-                output = bytes(head + tail).decode(errors="replace")
-                return 124, output + "\n[ERROR] Subprocess timed out and did not exit cleanly."
-            output = bytes(head + tail).decode(errors="replace")
-            return 124, output + "\n[ERROR] Subprocess timed out."
-        return proc.returncode, bytes(head + tail).decode(errors="replace")
+                return 124, render_output() + "\n[ERROR] Subprocess timed out and did not exit cleanly."
+            return 124, render_output() + "\n[ERROR] Subprocess timed out."
+        return proc.returncode, render_output()
     except asyncio.CancelledError:
         # Shutdown-driven task cancellation must not orphan the child group.
         _kill_process_group(proc)

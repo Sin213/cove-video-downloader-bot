@@ -567,7 +567,7 @@ def test_run_subprocess_bounded_capture_keeps_terminal_error():
 
     code, out = asyncio.run(runner())
     assert code == 1
-    assert len(out.encode()) <= bot.MAX_SUBPROCESS_OUTPUT_BYTES
+    assert len(out.encode()) <= bot.MAX_SUBPROCESS_OUTPUT_BYTES + 100
     assert "HTTP Error 403: TERMINAL-MARKER" in out
 
 
@@ -582,5 +582,41 @@ def test_run_subprocess_bounded_capture_keeps_early_error_marker():
 
     code, out = asyncio.run(runner())
     assert code == 0
-    assert len(out.encode()) <= bot.MAX_SUBPROCESS_OUTPUT_BYTES
+    assert len(out.encode()) <= bot.MAX_SUBPROCESS_OUTPUT_BYTES + 100
     assert "HTTP Error 403: EARLY-MARKER" in out
+
+
+def test_run_subprocess_bounded_capture_keeps_middle_error_marker():
+    script = (
+        "import sys; sys.stdout.write('a' * 300000); "
+        "sys.stdout.write('HTTP Error 403: MIDDLE'); "
+        "sys.stdout.write('b' * 300000); sys.exit(0)"
+    )
+
+    async def runner():
+        return await bot.run_subprocess([sys.executable, "-c", script], timeout=30)
+
+    code, out = asyncio.run(runner())
+    assert code == 0
+    assert len(out.encode()) <= bot.MAX_SUBPROCESS_OUTPUT_BYTES + 100
+    assert "HTTP Error 403" in out
+
+
+def test_run_subprocess_truncation_seam_cannot_synthesize_403():
+    head_cap = bot.MAX_SUBPROCESS_OUTPUT_BYTES // 2
+    tail_cap = bot.MAX_SUBPROCESS_OUTPUT_BYTES - head_cap
+    script = (
+        "import sys; "
+        f"sys.stdout.write('x' * {head_cap - 11}); "
+        "sys.stdout.write('HTTP Error '); "
+        "sys.stdout.write('z' * 100); "
+        "sys.stdout.write('403'); "
+        f"sys.stdout.write('y' * {tail_cap - 3}); sys.exit(0)"
+    )
+
+    async def runner():
+        return await bot.run_subprocess([sys.executable, "-c", script], timeout=30)
+
+    code, out = asyncio.run(runner())
+    assert code == 0
+    assert "HTTP Error 403" not in out

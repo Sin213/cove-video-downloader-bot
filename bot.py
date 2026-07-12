@@ -2000,9 +2000,9 @@ async def run_subprocess(
 
     # The buffer lives outside drain_and_wait so bytes read before a timeout
     # or cancellation survive for the caller's error classification. Only the
-    # first MAX_SUBPROCESS_OUTPUT_BYTES are kept (matching the old post-hoc
-    # slice); the rest is drained and discarded so a verbose child cannot
-    # grow memory unbounded.
+    # last MAX_SUBPROCESS_OUTPUT_BYTES are kept as a rolling tail: callers
+    # classify failures by markers like "HTTP Error 403" that appear at the
+    # end of output, so a verbose child must not push them out of the cap.
     buf = bytearray()
 
     async def drain_and_wait() -> None:
@@ -2010,8 +2010,9 @@ async def run_subprocess(
             chunk = await proc.stdout.read(64 * 1024)
             if not chunk:
                 break
-            if len(buf) < MAX_SUBPROCESS_OUTPUT_BYTES:
-                buf.extend(chunk[:MAX_SUBPROCESS_OUTPUT_BYTES - len(buf)])
+            buf.extend(chunk)
+            if len(buf) > MAX_SUBPROCESS_OUTPUT_BYTES:
+                del buf[:len(buf) - MAX_SUBPROCESS_OUTPUT_BYTES]
         await proc.wait()
 
     try:

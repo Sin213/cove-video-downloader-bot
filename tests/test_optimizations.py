@@ -2,6 +2,7 @@ import asyncio
 import json
 import os
 import sqlite3
+import sys
 import tempfile
 import time
 from unittest.mock import MagicMock
@@ -553,3 +554,18 @@ def test_reddit_no_media_phrases_match_ytdlp_output():
 def test_reddit_no_media_phrases_skip_rate_limit_output():
     out = "ERROR: HTTP Error 429: Too Many Requests"
     assert not any(p in out.lower() for p in bot.REDDIT_NO_MEDIA_PHRASES)
+
+
+def test_run_subprocess_bounded_capture_keeps_terminal_error():
+    script = (
+        "import sys; sys.stdout.write('x' * 600000); "
+        "sys.stdout.write('HTTP Error 403: TERMINAL-MARKER'); sys.exit(1)"
+    )
+
+    async def runner():
+        return await bot.run_subprocess([sys.executable, "-c", script], timeout=30)
+
+    code, out = asyncio.run(runner())
+    assert code == 1
+    assert len(out.encode()) <= bot.MAX_SUBPROCESS_OUTPUT_BYTES
+    assert "HTTP Error 403: TERMINAL-MARKER" in out

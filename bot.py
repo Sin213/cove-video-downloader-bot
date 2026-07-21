@@ -147,6 +147,7 @@ AUTO_DOWNLOAD_DOMAINS = {
     "instagram.com",
     "streamable.com",
     "threads.net",
+    "threads.com",
     "vimeo.com",
     "arazu.io",
     "twitch.tv",
@@ -174,6 +175,11 @@ FIXUP_DOMAINS = {
 TWITTER_DOMAINS = {
     "x.com",
     "twitter.com",
+}
+
+THREADS_DOMAINS = {
+    "threads.net",
+    "threads.com",
 }
 
 VIDEO_DOMAINS = {
@@ -253,6 +259,9 @@ GALLERY_FILE_EXTENSIONS = {"jpg", "jpeg", "png", "webp", "heic", "gif"}
 INSTAGRAM_IMAGE_EXTENSIONS = {"jpg", "jpeg", "png", "webp", "heic"}
 INSTAGRAM_VIDEO_EXTENSIONS = {"mp4", "m4v", "mov", "webm"}
 INSTAGRAM_APP_ID = "936619743392459"
+# Threads shares Instagram's media backend but requires the Barcelona (Threads)
+# app id and its own api host to resolve a post's media info.
+THREADS_APP_ID = "238260118697367"
 INSTAGRAM_GALLERY_TIMEOUT = 10
 INSTAGRAM_GALLERY_MAX_IMAGES = 20
 INSTAGRAM_SHORTCODE_ALPHABET = (
@@ -2547,6 +2556,112 @@ async def instagram_is_image_post(url: str) -> bool:
     return image_only
 
 
+# ── Threads helpers ──────────────────────────────────────────────────────────
+
+def _threads_shortcode_from_url(url: str) -> str | None:
+    """Extract the post shortcode from a Threads URL (/@user/post/CODE or /t/CODE)."""
+    parts = [part for part in urlparse(url).path.split("/") if part]
+    for index, part in enumerate(parts):
+        if part == "post" and index + 1 < len(parts):
+            return parts[index + 1]
+    if len(parts) == 2 and parts[0] == "t":
+        return parts[1]
+    return None
+
+
+def _threads_video_url_from_info(data: object) -> str | None:
+    """Return the first video CDN URL from a Threads media-info response, or None."""
+    items = data.get("items") if isinstance(data, dict) else None
+    if not isinstance(items, list) or not items or not isinstance(items[0], dict):
+        return None
+    media = items[0]
+    candidates = [media]
+    carousel = media.get("carousel_media")
+    if isinstance(carousel, list):
+        candidates.extend(item for item in carousel if isinstance(item, dict))
+    for item in candidates:
+        versions = item.get("video_versions")
+        if isinstance(versions, list) and versions and isinstance(versions[0], dict):
+            video_url = versions[0].get("url")
+            if video_url:
+                return str(video_url)
+    return None
+
+
+async def download_threads_video(url: str, tmp: str) -> str | None:
+    """Download a Threads post's video via the Threads media-info API.
+
+    Threads has no yt-dlp extractor, so the post's media pk is resolved from its
+    shortcode and looked up through the Barcelona media-info endpoint (same media
+    backend as Instagram). Returns the saved mp4 path, or None when the post has
+    no downloadable video or the lookup fails.
+    """
+    shortcode = _threads_shortcode_from_url(url)
+    pk = _instagram_shortcode_to_pk(shortcode) if shortcode else None
+    if pk is None:
+        log.info("[threads] Could not parse post id from %s", url)
+        return None
+    headers = {
+        "User-Agent": YT_DLP_UA,
+        "X-IG-App-ID": THREADS_APP_ID,
+        "Accept": "application/json",
+    }
+    cookie_header = instagram_cookie_header()
+    if cookie_header:
+        headers["Cookie"] = cookie_header
+    api_url = f"https://www.threads.net/api/v1/media/{pk}/info/"
+    try:
+        session = _get_http_session()
+        async with session.get(
+            api_url,
+            timeout=aiohttp.ClientTimeout(total=INSTAGRAM_GALLERY_TIMEOUT),
+            headers=headers,
+        ) as resp:
+            if resp.status != 200:
+                log.info("[threads] media info API returned %d for %s", resp.status, url)
+                return None
+            data = await resp.json(content_type=None)
+    except Exception as e:
+        log.warning("[threads] media info request failed (%s) for %s", e, url)
+        return None
+    media_url = _threads_video_url_from_info(data)
+    if not media_url:
+        log.info("[threads] No video in post %s", url)
+        return None
+    filepath = str(Path(tmp) / f"threads_{_sanitize_filename(shortcode)}.mp4")
+    try:
+        session = _get_http_session()
+        async with session.get(
+            media_url,
+            timeout=aiohttp.ClientTimeout(total=180, connect=15),
+            headers={"User-Agent": YT_DLP_UA},
+            allow_redirects=True,
+        ) as resp:
+            content_type = (resp.content_type or "").lower()
+            if resp.status != 200:
+                log.info("[threads] Video CDN returned %d for %s", resp.status, url)
+                return None
+            if "video" not in content_type and content_type not in ("application/octet-stream", "binary/octet-stream"):
+                log.info("[threads] Non-video response (%s) for %s", content_type, url)
+                return None
+            max_bytes = MAX_FILESIZE_MB * 1024 * 1024
+            size = 0
+            with open(filepath, "wb") as f:
+                async for chunk in resp.content.iter_chunked(1024 * 64):
+                    size += len(chunk)
+                    if size > max_bytes:
+                        log.info("[threads] Video exceeded %dMB cap for %s", MAX_FILESIZE_MB, url)
+                        return None
+                    f.write(chunk)
+        if size == 0:
+            return None
+        log.info("[threads] Downloaded %.1f MB for %s", size / (1024 * 1024), url)
+        return filepath
+    except Exception as e:
+        log.warning("[threads] Download failed (%s) for %s", e, url)
+        return None
+
+
 # ── Twitter/X helpers ────────────────────────────────────────────────────────
 
 _TWITTER_STATUS_RE = re.compile(r"(?:twitter\.com|x\.com)/[^/]+/status/(\d+)")
@@ -3071,6 +3186,7 @@ async def download_and_compress(
     is_twitter = host_matches(hostname_for(url), TWITTER_DOMAINS)
     is_youtube = host_matches(hostname_for(url), {"youtube.com", "youtu.be"})
     is_instagram = host_matches(hostname_for(url), {"instagram.com"})
+    is_threads = host_matches(hostname_for(url), THREADS_DOMAINS)
     is_reddit_short = REDDIT_SHORT_RE.search(url) is not None
     instagram_playlist_item = None
 
@@ -3129,88 +3245,100 @@ async def download_and_compress(
     if FAST_SOURCE_MODE:
         log.info("[cove] Fast source mode enabled; applying site-specific fast selectors.")
 
-    if is_reddit:
-        fmt = FORMAT_REDDIT_FAST if FAST_SOURCE_MODE else FORMAT_REDDIT
+    if is_threads:
+        # Threads has no yt-dlp extractor; fetch the video via its media-info API.
+        _log.append("[INFO] Downloading via Threads API...")
+        threads_path = await download_threads_video(url, tmp)
+        timer.mark("threads_download")
+        if threads_path is None:
+            log.info("[cove] Threads post has no downloadable video — ignoring silently.")
+            shutil.rmtree(tmp, ignore_errors=True)
+            _log.append("[NOVIDEO]")
+            return None, "\n".join(_log)
+        code, out = 0, ""
     else:
-        fmt = FORMAT_DEFAULT
-        yt_fmt = youtube_quality_format(url, youtube_quality)
-        if yt_fmt is not None:
-            chosen_quality = youtube_quality or get_youtube_quality()
-            fitted_quality = await _probe_youtube_quality(url, chosen_quality, target_size)
-            fmt = YOUTUBE_QUALITY_FORMATS[fitted_quality]
-            if fitted_quality != chosen_quality:
-                _log.append(
-                    f"[INFO] Pre-emptive quality: {chosen_quality}p estimated too large, using {fitted_quality}p"
-                )
-            if youtube_quality is not None:
-                _log.append(f"[INFO] YouTube resolution override: {fitted_quality}p")
+        if is_reddit:
+            fmt = FORMAT_REDDIT_FAST if FAST_SOURCE_MODE else FORMAT_REDDIT
+        else:
+            fmt = FORMAT_DEFAULT
+            yt_fmt = youtube_quality_format(url, youtube_quality)
+            if yt_fmt is not None:
+                chosen_quality = youtube_quality or get_youtube_quality()
+                fitted_quality = await _probe_youtube_quality(url, chosen_quality, target_size)
+                fmt = YOUTUBE_QUALITY_FORMATS[fitted_quality]
+                if fitted_quality != chosen_quality:
+                    _log.append(
+                        f"[INFO] Pre-emptive quality: {chosen_quality}p estimated too large, using {fitted_quality}p"
+                    )
+                if youtube_quality is not None:
+                    _log.append(f"[INFO] YouTube resolution override: {fitted_quality}p")
 
-    cmd = ["yt-dlp", "--no-config", "--user-agent", YT_DLP_UA]
+        cmd = ["yt-dlp", "--no-config", "--user-agent", YT_DLP_UA]
 
-    cmd += [
-        "-f", fmt,
-        "--merge-output-format", "mp4",
-        "-N", str(YT_DLP_FRAGMENTS),
-        "--no-part",
-        "--trim-filenames", "150",
-        "--extractor-retries", "3" if is_youtube else "0",
-        "--max-filesize", f"{MAX_FILESIZE_MB}M",
-        "--match-filter", "!duration",
-        "--match-filter", f"duration <= {MAX_DURATION_SECONDS}",
-        "-o", output_template,
-    ]
+        cmd += [
+            "-f", fmt,
+            "--merge-output-format", "mp4",
+            "-N", str(YT_DLP_FRAGMENTS),
+            "--no-part",
+            "--trim-filenames", "150",
+            "--extractor-retries", "3" if is_youtube else "0",
+            "--max-filesize", f"{MAX_FILESIZE_MB}M",
+            "--match-filter", "!duration",
+            "--match-filter", f"duration <= {MAX_DURATION_SECONDS}",
+            "-o", output_template,
+        ]
 
-    if is_instagram and instagram_playlist_item is not None:
-        cmd += ["--playlist-items", str(instagram_playlist_item)]
-    else:
-        cmd.append("--no-playlist")
+        if is_instagram and instagram_playlist_item is not None:
+            cmd += ["--playlist-items", str(instagram_playlist_item)]
+        else:
+            cmd.append("--no-playlist")
 
-    if should_use_aria2c(url):
-        cmd += ["--downloader", "aria2c", "--downloader-args", "aria2c:-x16 -s16 -k1M"]
-    elif is_reddit:
-        cmd += ["--http-chunk-size", "10M"]
+        if should_use_aria2c(url):
+            cmd += ["--downloader", "aria2c", "--downloader-args", "aria2c:-x16 -s16 -k1M"]
+        elif is_reddit:
+            cmd += ["--http-chunk-size", "10M"]
 
-    if COOKIES_EXIST:
-        cmd.extend(["--cookies", COOKIES_FILE])
-        _log.append("[INFO] Using cookies.")
-    else:
-        _log.append("[WARN] No cookies.txt — some sites may fail.")
+        if COOKIES_EXIST:
+            cmd.extend(["--cookies", COOKIES_FILE])
+            _log.append("[INFO] Using cookies.")
+        else:
+            _log.append("[WARN] No cookies.txt — some sites may fail.")
 
-    if is_reddit:
-        cmd.extend(reddit_impersonation_args())
+        if is_reddit:
+            cmd.extend(reddit_impersonation_args())
 
-    cmd.append(url)
+        cmd.append(url)
 
-    log.info("[yt-dlp] Running: %s", ' '.join(cmd))
-    _log.append("[INFO] Downloading...")
+        log.info("[yt-dlp] Running: %s", ' '.join(cmd))
+        _log.append("[INFO] Downloading...")
 
-    code, out = await _run_ytdlp_with_info_cache(
-        url,
-        cmd,
-        tmp,
-        REDDIT_YTDLP_TIMEOUT if is_reddit else SUBPROCESS_TIMEOUT,
-        kind="video",
-    )
-    timer.mark("download")
-
-    if code != 0 and is_youtube and (
-        "Sign in to confirm" in out or "confirm you're not a bot" in out.lower()
-    ):
-        log.info("[yt-dlp] YouTube bot detection - retrying in 8s...")
-        _log.append("[INFO] YouTube bot check - retrying...")
-        await asyncio.sleep(8)
         code, out = await _run_ytdlp_with_info_cache(
             url,
             cmd,
             tmp,
-            SUBPROCESS_TIMEOUT,
+            REDDIT_YTDLP_TIMEOUT if is_reddit else SUBPROCESS_TIMEOUT,
             kind="video",
-            use_cache=False,
         )
-        timer.mark("download_retry")
+        timer.mark("download")
 
-    log.info("[yt-dlp] Exit code: %d", code)
-    log.debug("[yt-dlp] Output:\n%s", out)
+        if code != 0 and is_youtube and (
+            "Sign in to confirm" in out or "confirm you're not a bot" in out.lower()
+        ):
+            log.info("[yt-dlp] YouTube bot detection - retrying in 8s...")
+            _log.append("[INFO] YouTube bot check - retrying...")
+            await asyncio.sleep(8)
+            code, out = await _run_ytdlp_with_info_cache(
+                url,
+                cmd,
+                tmp,
+                SUBPROCESS_TIMEOUT,
+                kind="video",
+                use_cache=False,
+            )
+            timer.mark("download_retry")
+
+        log.info("[yt-dlp] Exit code: %d", code)
+        log.debug("[yt-dlp] Output:\n%s", out)
     _log.append(out.strip())
 
     if "does not pass filter" in out:

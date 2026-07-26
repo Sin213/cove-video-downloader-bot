@@ -250,7 +250,6 @@ INSTAGRAM_IMAGE_MARKER = "[INSTAGRAM_IMAGE]"
 INFLIGHT_MARKER = "[INFLIGHT]"
 REDDIT_GIF_MARKER = "[REDDIT_GIF]"
 REDDIT_IMAGE_MARKER = "[REDDIT_IMAGE]"
-TWITTER_IMAGE_MARKER = "[TWITTER_IMAGE]"
 REDDIT_VXREDDIT_MARKER = "[REDDIT_VXREDDIT]"
 REDDIT_GALLERY_MARKER = "[REDDIT_GALLERY]"
 REDDIT_GALLERY_MAX_IMAGES = 20
@@ -1211,14 +1210,6 @@ async def send_instagram_image_rewrite(message: discord.Message, url: str, log_t
     except discord.HTTPException as e:
         log.warning("[cove] Failed to delete original Instagram image/text message: %s", e)
     return True
-
-
-def twitter_fxtwitter_url_from_log(log_text: str) -> str | None:
-    lines = log_text.splitlines()
-    for i, line in enumerate(lines):
-        if line.strip() == TWITTER_IMAGE_MARKER and i + 1 < len(lines):
-            return lines[i + 1].strip()
-    return None
 
 
 def reddit_vxreddit_url_from_log(log_text: str) -> str | None:
@@ -2269,6 +2260,20 @@ async def instagram_post_probe(url: str) -> tuple[bool, int | None, str | None]:
         _cache_set(_instagram_probe_cache, cache_key, result, INSTAGRAM_PROBE_CACHE_TTL)
         return result
 
+    # Last resort: yt-dlp can return a carousel with empty formats on every entry
+    # while the media-info API still serves the images. Mirrors being dead must
+    # not turn that into a false "unavailable".
+    gallery_urls = await fetch_instagram_gallery_image_urls(url)
+    if len(gallery_urls) >= 2:
+        log.info(
+            "[instagram-probe] Media-info API confirms %d-image gallery: %s",
+            len(gallery_urls),
+            cache_key,
+        )
+        result = (True, None, None)
+        _cache_set(_instagram_probe_cache, cache_key, result, INSTAGRAM_PROBE_CACHE_TTL)
+        return result
+
     reason = (
         "This post is unavailable. The account may be banned, private, "
         "restricted, or the post may have been deleted or hidden."
@@ -3247,10 +3252,7 @@ async def download_and_compress(
         has_vid = await twitter_has_video(url)
         timer.mark("twitter_probe")
         if not has_vid:
-            fx_url = replace_hostname(url, "fxtwitter.com")
-            log.info("[cove] Twitter image-only post detected, sending fxtwitter rewrite.")
-            _log.append(TWITTER_IMAGE_MARKER)
-            _log.append(fx_url)
+            log.info("[cove] Twitter image-only post detected, skipping (native embed).")
             _log.append("[NOVIDEO]")
             return None, "\n".join(_log)
 
@@ -4562,18 +4564,6 @@ class CoveBot(discord.Client):
                 pass
             if await send_instagram_image_rewrite(message, url, log_text):
                 return
-            fx_url = twitter_fxtwitter_url_from_log(log_text)
-            if fx_url:
-                try:
-                    await message.channel.send(fx_url)
-                except discord.HTTPException as e:
-                    log.warning("[cove] Failed to send fxtwitter rewrite: %s", e)
-                else:
-                    try:
-                        await message.delete()
-                    except discord.HTTPException:
-                        pass
-                return
             vx_url = reddit_vxreddit_url_from_log(log_text)
             if vx_url:
                 try:
@@ -4808,10 +4798,6 @@ async def download_cmd(
         instagram_rewrite = rewrite_instagram_image_url(url, log_text)
         if instagram_rewrite:
             await interaction.followup.send(instagram_rewrite)
-            return
-        fx_url = twitter_fxtwitter_url_from_log(log_text)
-        if fx_url:
-            await interaction.followup.send(fx_url)
             return
         vx_url = reddit_vxreddit_url_from_log(log_text)
         if vx_url:

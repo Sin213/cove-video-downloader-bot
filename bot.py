@@ -670,6 +670,21 @@ def _get_http_session() -> aiohttp.ClientSession:
     return _http_session
 
 
+async def read_capped_body(resp: aiohttp.ClientResponse, cap: int = MAX_HTTP_RESPONSE_BYTES) -> bytes:
+    # StreamReader.read(n) returns whatever is already buffered (often just the
+    # first network chunk), not n bytes. Loop until EOF or the cap is reached so
+    # markup further down the page is not silently truncated away.
+    chunks: list[bytes] = []
+    total = 0
+    while total < cap:
+        chunk = await resp.content.read(cap - total)
+        if not chunk:
+            break
+        chunks.append(chunk)
+        total += len(chunk)
+    return b"".join(chunks)
+
+
 _COOKIE_HEADER_TTL = 60
 
 
@@ -2286,7 +2301,7 @@ async def _instagram_mirror_media_from_host(url: str, host: str) -> tuple[str | 
             if resp.status != 200:
                 log.info("[instagram-mirror] HTTP %d from %s for %s", resp.status, host, url)
                 return "error", None
-            body = await resp.content.read(MAX_HTTP_RESPONSE_BYTES)
+            body = await read_capped_body(resp)
     except Exception as e:
         log.warning("[instagram-mirror] Probe failed (%s) via %s for %s", e, host, url)
         return "error", None
@@ -2831,7 +2846,7 @@ async def resolve_arazu(url: str) -> str:
             headers={"User-Agent": "Mozilla/5.0 (compatible; CoveBot/1.0)"},
             timeout=aiohttp.ClientTimeout(total=10),
         ) as resp:
-            body = await resp.content.read(MAX_HTTP_RESPONSE_BYTES)
+            body = await read_capped_body(resp)
             html = body.decode(errors="replace")
         match = REDDIT_RE.search(html)
         if match:

@@ -3,6 +3,8 @@ from pathlib import Path
 
 import pytest
 
+import bot
+
 from bot import (
     extract_supported_url,
     validate_manual_url,
@@ -30,6 +32,7 @@ from bot import (
     _check_user_rate_limit,
     USER_RATE_LIMIT,
     _user_request_times,
+    youtube_cookie_player_args,
 )
 
 
@@ -413,6 +416,85 @@ def test_reddit_image_url_from_preview_source():
 def test_user_facing_download_error_cookie_and_private_cases():
     assert "expired" in user_facing_download_error("ERROR: cookies expired, login required").lower()
     assert "private" in user_facing_download_error("ERROR: this post is private").lower()
+
+
+def test_youtube_cookie_player_args_avoid_broken_authenticated_client(monkeypatch):
+    monkeypatch.setattr(bot, "COOKIES_EXIST", True)
+    assert youtube_cookie_player_args("https://youtu.be/IYnsfV5N2n8") == [
+        "--extractor-args",
+        "youtube:player_client=default,web_embedded,-tv_downgraded",
+    ]
+    assert youtube_cookie_player_args("https://vimeo.com/123") == []
+
+    monkeypatch.setattr(bot, "COOKIES_EXIST", False)
+    assert youtube_cookie_player_args("https://youtu.be/IYnsfV5N2n8") == []
+
+
+def test_youtube_quality_probe_uses_authenticated_player_fallback(monkeypatch):
+    commands = []
+
+    async def fake_run(cmd, timeout=None):
+        commands.append(cmd)
+        return 0, '{"filesize_approx": 1024}'
+
+    monkeypatch.setattr(bot, "COOKIES_EXIST", True)
+    monkeypatch.setattr(bot, "COOKIES_FILE", "/tmp/cookies.txt")
+    monkeypatch.setattr(bot, "_ytdlp_info_cache", {})
+    monkeypatch.setattr(bot, "run_subprocess", fake_run)
+
+    quality = asyncio.run(
+        bot._probe_youtube_quality(
+            "https://youtu.be/IYnsfV5N2n8", "1080", 10 * 1024 * 1024
+        )
+    )
+
+    assert quality == "1080"
+    assert len(commands) == 1
+    assert ["--cookies", "/tmp/cookies.txt"] == commands[0][
+        commands[0].index("--cookies") : commands[0].index("--cookies") + 2
+    ]
+    assert [
+        "--extractor-args",
+        "youtube:player_client=default,web_embedded,-tv_downgraded",
+    ] == commands[0][
+        commands[0].index("--extractor-args") : commands[0].index("--extractor-args")
+        + 2
+    ]
+
+
+def test_youtube_download_command_uses_authenticated_player_fallback(
+    monkeypatch, tmp_path
+):
+    commands = []
+    job_tmp = tmp_path / "job"
+    job_tmp.mkdir()
+
+    async def fake_run(url, cmd, tmp, timeout, **kwargs):
+        commands.append(cmd)
+        return 1, "ERROR: [youtube] IYnsfV5N2n8: unavailable"
+
+    monkeypatch.setattr(bot, "COOKIES_EXIST", True)
+    monkeypatch.setattr(bot, "COOKIES_FILE", "/tmp/cookies.txt")
+    monkeypatch.setattr(bot, "get_youtube_quality", lambda: "720")
+    monkeypatch.setattr(bot, "_make_job_tmpdir", lambda: str(job_tmp))
+    monkeypatch.setattr(bot, "_run_ytdlp_with_info_cache", fake_run)
+
+    path, _log = asyncio.run(
+        bot.download_and_compress("https://youtu.be/IYnsfV5N2n8", None)
+    )
+
+    assert path is None
+    assert len(commands) == 1
+    assert ["--cookies", "/tmp/cookies.txt"] == commands[0][
+        commands[0].index("--cookies") : commands[0].index("--cookies") + 2
+    ]
+    assert [
+        "--extractor-args",
+        "youtube:player_client=default,web_embedded,-tv_downgraded",
+    ] == commands[0][
+        commands[0].index("--extractor-args") : commands[0].index("--extractor-args")
+        + 2
+    ]
 
 
 def test_user_facing_upload_error_large_file():

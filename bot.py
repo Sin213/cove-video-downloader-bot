@@ -1111,6 +1111,18 @@ def youtube_quality_format(url: str, quality: str | None = None) -> str | None:
     return YOUTUBE_QUALITY_FORMATS[selected_quality]
 
 
+def youtube_cookie_player_args(url: str) -> list[str]:
+    """Exclude yt-dlp's broken authenticated YouTube TV client."""
+    if not COOKIES_EXIST or not host_matches(
+        hostname_for(url), {"youtube.com", "youtu.be"}
+    ):
+        return []
+    return [
+        "--extractor-args",
+        "youtube:player_client=default,web_embedded,-tv_downgraded",
+    ]
+
+
 async def _probe_youtube_quality(url: str, requested_quality: str, target_size: int) -> str:
     """Estimate YouTube download size and step down if it likely exceeds target.
 
@@ -1134,8 +1146,11 @@ async def _probe_youtube_quality(url: str, requested_quality: str, target_size: 
             "--no-playlist",
             "--dump-json",
             "-f", fmt,
-            url,
         ]
+        if COOKIES_EXIST:
+            cmd.extend(["--cookies", COOKIES_FILE])
+        cmd.extend(youtube_cookie_player_args(url))
+        cmd.append(url)
         code, out = await run_subprocess(cmd, timeout=SUBPROCESS_TIMEOUT)
         if code != 0:
             return requested_quality
@@ -3321,6 +3336,8 @@ async def download_and_compress(
         else:
             _log.append("[WARN] No cookies.txt — some sites may fail.")
 
+        cmd.extend(youtube_cookie_player_args(url))
+
         if is_reddit:
             cmd.extend(reddit_impersonation_args())
 
@@ -3511,6 +3528,7 @@ async def download_and_compress(
         ]
         if COOKIES_EXIST:
             cmd_720.extend(["--cookies", COOKIES_FILE])
+        cmd_720.extend(youtube_cookie_player_args(url))
         cmd_720.append(url)
         code2, out2 = await _run_ytdlp_with_info_cache(
             url, cmd_720, tmp2, SUBPROCESS_TIMEOUT, kind="video_720p",
@@ -3637,6 +3655,8 @@ async def download_and_clip(
 
     if COOKIES_EXIST:
         cmd.extend(["--cookies", COOKIES_FILE])
+
+    cmd.extend(youtube_cookie_player_args(url))
 
     if is_reddit:
         cmd.extend(reddit_impersonation_args())
@@ -3789,6 +3809,8 @@ async def download_and_gif(url: str, guild: discord.Guild | None) -> tuple:
     if COOKIES_EXIST:
         cmd.extend(["--cookies", COOKIES_FILE])
 
+    cmd.extend(youtube_cookie_player_args(url))
+
     if is_reddit:
         cmd.extend(reddit_impersonation_args())
 
@@ -3926,6 +3948,8 @@ async def download_audio(url: str, guild: discord.Guild | None) -> tuple:
             _log.append("[INFO] Using cookies.")
         else:
             _log.append("[WARN] No cookies.txt — some sites may fail.")
+
+        cmd.extend(youtube_cookie_player_args(url))
 
         if is_reddit:
             cmd.extend(reddit_impersonation_args())

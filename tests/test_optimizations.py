@@ -262,8 +262,8 @@ def test_gif_max_duration():
 
 
 def test_boost_tier_limits_correct():
-    assert BOOST_TIER_LIMITS_MB[0] == 9.5
-    assert BOOST_TIER_LIMITS_MB[1] == 9.5
+    assert BOOST_TIER_LIMITS_MB[0] == 19.5
+    assert BOOST_TIER_LIMITS_MB[1] == 19.5
     assert BOOST_TIER_LIMITS_MB[2] == 49.0
     assert BOOST_TIER_LIMITS_MB[3] == 99.0
 

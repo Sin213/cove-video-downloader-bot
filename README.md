@@ -59,9 +59,11 @@ Automatically adjusts based on your server's Nitro boost tier:
 
 | Boost Tier | Upload Limit |
 |---|---|
-| Tier 0 / 1 | 9.5 MB |
+| Tier 0 / 1 | 19.5 MB |
 | Tier 2 (7 boosts) | 49 MB |
 | Tier 3 (14 boosts) | 99 MB |
+
+Limits keep a small headroom under Discord's published caps (free/default **20 MB** as of August 2026; previously 10 MB). Tier 2/3 stay under the 50 MB / 100 MB boost caps.
 
 If the file is already under the limit, compression is skipped. Videos over 10 minutes are rejected outright.
 

@@ -130,8 +130,8 @@ YT_DLP_UA = (
 )
 
 BOOST_TIER_LIMITS_MB = {
-    0: 9.5,
-    1: 9.5,
+    0: 19.5,
+    1: 19.5,
     2: 49.0,
     3: 99.0,
 }
@@ -1675,7 +1675,7 @@ def is_friend_server(guild: discord.Guild | None) -> bool:
 def get_target_mb(guild: discord.Guild | None) -> float:
     if guild is None:
         return BOOST_TIER_LIMITS_MB[0]
-    return BOOST_TIER_LIMITS_MB.get(guild.premium_tier, 9.5)
+    return BOOST_TIER_LIMITS_MB.get(guild.premium_tier, 19.5)
 
 
 def is_admin_interaction(interaction: discord.Interaction) -> bool:

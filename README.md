@@ -191,6 +191,8 @@ Friend server mode pings users who were tagged in the original message, adds the
 - Use Slash Commands
 - **Manage Messages** *(friend server only — for deleting the original message)*
 
+See [`DISCORD_SETUP.md`](DISCORD_SETUP.md) for the Developer Portal intent checklist and invite URL template.
+
 ---
 
 ## Recent Changes (July 2026)

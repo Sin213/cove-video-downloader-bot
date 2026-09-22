@@ -1,0 +1,6 @@
+discord.py>=2.4,<3
+python-dotenv>=1.0,<2
+yt-dlp>=2026.7.4
+yt-dlp-ejs>=0.1
+curl_cffi>=0.7
+aiohttp>=3.9

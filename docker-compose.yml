@@ -1,0 +1,55 @@
+# Upstream-friendly Compose for self-hosting Cove.
+# Copy .env.example → .env, set DISCORD_TOKEN + GUILD_ID, then:
+#   docker compose up -d --build
+
+name: cove
+
+services:
+  cove:
+    build:
+      context: .
+      target: runtime
+      args:
+        APP_VERSION: ${APP_VERSION:-dev}
+        GIT_SHA: ${GIT_SHA:-local}
+    image: cove-video-downloader-bot:local
+    container_name: cove
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      COVE_DATA_DIR: /data
+      TMPDIR: /tmp/cove
+      # Docker's default /dev/shm is often 64MB; Cove prefers /dev/shm when present.
+      # Raise shm so large downloads do not OOM mid-job. Override if needed.
+      USE_NVENC: ${USE_NVENC:-0}
+      USE_HWACCEL: ${USE_HWACCEL:-0}
+      USE_ARIA2C: ${USE_ARIA2C:-1}
+      PERSISTENT_CACHE: ${PERSISTENT_CACHE:-1}
+      YOUTUBE_QUALITY: ${YOUTUBE_QUALITY:-1080}
+      MAX_CONCURRENT_JOBS: ${MAX_CONCURRENT_JOBS:-4}
+    volumes:
+      - ./data:/data
+      # Optional: mount browser cookies for Instagram/Reddit auth walls
+      # - ./cookies.txt:/data/cookies.txt:ro
+    # Enough shared memory for yt-dlp/ffmpeg scratch when /dev/shm is used.
+    shm_size: ${COVE_SHM_SIZE:-1gb}
+    # Uncomment on NVIDIA hosts with the Container Toolkit installed:
+    # deploy:
+    #   resources:
+    #     reservations:
+    #       devices:
+    #         - driver: nvidia
+    #           count: 1
+    #           capabilities: [gpu]
+
+  cove-tests:
+    profiles: ["test"]
+    build:
+      context: .
+      target: test
+    environment:
+      DISCORD_TOKEN: test-token-not-real
+      GUILD_ID: "1"
+      FRIEND_GUILD_ID: "0"
+      PERSISTENT_CACHE: "0"

@@ -3,7 +3,8 @@
 A self-hosted Discord bot that automatically detects video links in chat and downloads, compresses, and re-uploads them directly — no embeds, no external services.
 
 ![Python](https://img.shields.io/badge/python-3.10%2B-orange?style=flat-square&logo=python)
-![Platform](https://img.shields.io/badge/platform-Linux%20%28Arch%2FEOS%29-blue?style=flat-square&logo=archlinux)
+![Platform](https://img.shields.io/badge/platform-Linux-blue?style=flat-square&logo=linux)
+![Docker](https://img.shields.io/badge/docker-compose-blue?style=flat-square&logo=docker)
 ![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
 
 ---
@@ -102,13 +103,38 @@ For sites that require a logged-in session (Reddit, Instagram, etc.), export you
 cookies.txt  ← same directory as bot.py
 ```
 
+Or, when using Docker / `COVE_DATA_DIR`, place it in that data directory (Compose defaults to `./data/cookies.txt`).
+
 ### 4. Run the bot
+
+#### Docker Compose (recommended for always-on)
+
+Requires Docker Engine with Compose v2. Privileged Discord intent **Message Content** must be enabled on the bot application.
+
+```bash
+cp .env.example .env   # set DISCORD_TOKEN and GUILD_ID
+mkdir -p data
+docker compose up -d --build
+docker compose logs -f cove
+```
+
+Persistent files (`cache.db`, `runtime_settings.json`, optional `cookies.txt`) live in `./data` via `COVE_DATA_DIR=/data`. Compose raises `shm_size` to 1GB because Cove prefers `/dev/shm` for temp downloads when available.
+
+Run the upstream test suite inside the same image:
+
+```bash
+docker compose --profile test run --rm --build cove-tests
+```
+
+Optional GPU encode: set `USE_NVENC=1` / `USE_HWACCEL=1` in `.env` and uncomment the NVIDIA `deploy.resources` block in `docker-compose.yml` on hosts with the NVIDIA Container Toolkit.
+
+#### Bare metal
 
 ```bash
 python bot.py
 ```
 
-#### Running as a systemd service (recommended for always-on)
+#### Running as a systemd service
 
 ```bash
 mkdir -p ~/.config/systemd/user

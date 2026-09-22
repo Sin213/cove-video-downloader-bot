@@ -4,6 +4,7 @@ cookies.txt.*
 __pycache__/
 *.pyc
 tmp/
+data/
 dist/
 build/
 codex-reviews/
@@ -14,5 +15,6 @@ cache.db-shm
 cache.db-wal
 .git/
 .claude/
+.cursor/
 AGENTS.md
 runtime_settings.json

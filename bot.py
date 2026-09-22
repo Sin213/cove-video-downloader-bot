@@ -82,7 +82,15 @@ WHITELIST_IDS = {
     if uid.strip().isdigit()
 }
 
-COOKIES_FILE  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
+# Optional data directory for cookies, SQLite cache, and runtime settings.
+# Defaults to the directory containing bot.py (existing behaviour). Set
+# COVE_DATA_DIR when running in Docker so those files can live on a volume.
+_APP_DIR = os.path.dirname(os.path.abspath(__file__))
+_DATA_DIR = os.path.abspath((os.getenv("COVE_DATA_DIR") or _APP_DIR).strip() or _APP_DIR)
+if _DATA_DIR != _APP_DIR:
+    os.makedirs(_DATA_DIR, exist_ok=True)
+
+COOKIES_FILE  = os.path.join(_DATA_DIR, "cookies.txt")
 COOKIES_EXIST = os.path.exists(COOKIES_FILE)
 if COOKIES_EXIST:
     try:
@@ -575,7 +583,7 @@ def canonical_url_for_key(url: str) -> str:
 def _inflight_key(kind: str, url: str) -> str:
     return f"{kind}:{canonical_url_for_key(url)}"
 
-CACHE_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache.db")
+CACHE_DB_PATH = os.path.join(_DATA_DIR, "cache.db")
 _cache_db_conn: sqlite3.Connection | None = None
 
 
@@ -1050,7 +1058,7 @@ def host_matches(host: str, domains: set[str]) -> bool:
     return host in domains or any(host.endswith(f".{d}") for d in domains)
 
 
-RUNTIME_SETTINGS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "runtime_settings.json")
+RUNTIME_SETTINGS_PATH = os.path.join(_DATA_DIR, "runtime_settings.json")
 
 
 def _load_runtime_settings() -> dict:

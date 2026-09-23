@@ -5,6 +5,8 @@ import sqlite3
 import sys
 import tempfile
 import time
+from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import discord
@@ -262,10 +264,88 @@ def test_gif_max_duration():
 
 
 def test_boost_tier_limits_correct():
-    assert BOOST_TIER_LIMITS_MB[0] == 9.5
-    assert BOOST_TIER_LIMITS_MB[1] == 9.5
+    assert BOOST_TIER_LIMITS_MB[0] == 19.5
+    assert BOOST_TIER_LIMITS_MB[1] == 19.5
     assert BOOST_TIER_LIMITS_MB[2] == 49.0
     assert BOOST_TIER_LIMITS_MB[3] == 99.0
+    for tier, limit in {0: 19.5, 1: 19.5, 2: 49.0, 3: 99.0}.items():
+        assert bot.get_target_mb(SimpleNamespace(premium_tier=tier)) == limit
+
+
+def test_unknown_boost_tier_uses_default_limit():
+    for tier in (None, 99):
+        assert bot.get_target_mb(SimpleNamespace(premium_tier=tier)) == BOOST_TIER_LIMITS_MB[0]
+
+
+def _fake_video_pipeline(monkeypatch, tmp_path, source_size):
+    source = tmp_path / "source.mp4"
+    compression_calls = []
+
+    async def fake_download(url, cmd, tmp, timeout, **kwargs):
+        assert tmp == str(tmp_path)
+        with source.open("wb") as output:
+            output.truncate(source_size)
+        return 0, "downloaded"
+
+    async def fake_media_info(filepath):
+        assert filepath == str(source)
+        return {"format": {"duration": "10.0"}, "streams": []}
+
+    async def fake_compress(src, dest, target_mb, duration=None):
+        compression_calls.append((src, dest, target_mb))
+        Path(dest).write_bytes(b"compressed")
+        return True, "0.01 MB"
+
+    monkeypatch.setattr(bot, "_make_job_tmpdir", lambda: str(tmp_path))
+    monkeypatch.setattr(bot, "_run_ytdlp_with_info_cache", fake_download)
+    monkeypatch.setattr(bot, "get_media_info", fake_media_info)
+    monkeypatch.setattr(bot, "discord_mp4_compatibility", lambda info, path: (False, "fake"))
+    monkeypatch.setattr(bot, "compress_to_target", fake_compress)
+    return source, compression_calls
+
+
+def test_default_limit_15_mib_uploads_original_without_compression(monkeypatch, tmp_path):
+    source, compression_calls = _fake_video_pipeline(monkeypatch, tmp_path, 15 * 1024 * 1024)
+
+    delivered, _ = asyncio.run(bot.download_and_compress("https://example.com/video", None))
+
+    assert compression_calls == []
+    assert delivered == str(source)
+    assert Path(delivered).name != "compressed.mp4"
+
+
+def test_default_limit_20_mib_compresses_to_19_5_mb(monkeypatch, tmp_path):
+    source, compression_calls = _fake_video_pipeline(monkeypatch, tmp_path, 20 * 1024 * 1024)
+
+    delivered, _ = asyncio.run(bot.download_and_compress("https://example.com/video", None))
+
+    assert compression_calls == [(str(source), str(tmp_path / "compressed.mp4"), 19.5)]
+    assert delivered == str(tmp_path / "compressed.mp4")
+
+
+def test_default_limit_gif_uses_eight_seconds_and_380px(monkeypatch, tmp_path):
+    commands = []
+    source = tmp_path / "source.mp4"
+    destination = tmp_path / "converted.gif"
+    source.write_bytes(b"video")
+
+    async def fake_run_subprocess(cmd, **kwargs):
+        commands.append(cmd)
+        Path(cmd[-1]).write_bytes(b"gif")
+        return 0, "converted"
+
+    async def fake_duration(filepath):
+        assert filepath == str(source)
+        return 10.0
+
+    monkeypatch.setattr(bot, "get_duration", fake_duration)
+    monkeypatch.setattr(bot, "run_subprocess", fake_run_subprocess)
+
+    ok, _ = asyncio.run(bot.convert_to_gif(str(source), str(destination), bot.get_target_mb(None)))
+
+    assert ok
+    assert commands[0][commands[0].index("-t") + 1] == "8.0"
+    assert "fps=12,scale=380" in commands[0][commands[0].index("-vf") + 1]
 
 
 # ── PR B: release job slot before upload ─────────────────────────────────────

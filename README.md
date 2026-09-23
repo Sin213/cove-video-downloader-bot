@@ -59,7 +59,7 @@ Automatically adjusts based on your server's Nitro boost tier:
 
 | Boost Tier | Upload Limit |
 |---|---|
-| Tier 0 / 1 | 9.5 MB |
+| Tier 0 / 1 | 19.5 MB |
 | Tier 2 (7 boosts) | 49 MB |
 | Tier 3 (14 boosts) | 99 MB |
 

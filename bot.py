@@ -68,6 +68,29 @@ def _env_bool(name: str, default: str = "0") -> bool:
     return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _resolve_data_dir() -> str:
+    raw = os.getenv("COVE_DATA_DIR", "")
+    if not raw.strip():
+        return os.path.dirname(os.path.abspath(__file__))
+    value = raw
+    if not os.path.isabs(value):
+        sys.exit(f"[Cove] COVE_DATA_DIR must be an absolute path (got: {value!r}).")
+    if not os.path.isdir(value):
+        try:
+            os.stat(value)
+        except FileNotFoundError:
+            sys.exit(f"[Cove] COVE_DATA_DIR does not exist: {value!r}. Cove will not create it.")
+        except OSError as e:
+            sys.exit(f"[Cove] COVE_DATA_DIR cannot be accessed: {value!r} ({e}).")
+        sys.exit(f"[Cove] COVE_DATA_DIR exists but is not a directory: {value!r}.")
+    try:
+        with tempfile.NamedTemporaryFile(dir=value, delete=True) as probe:
+            probe.write(b"cove")
+    except OSError as e:
+        sys.exit(f"[Cove] COVE_DATA_DIR is not writable: {value!r} ({e}).")
+    return value
+
+
 TOKEN           = os.getenv("DISCORD_TOKEN")
 if not TOKEN:
     sys.exit("[Cove] Required env var DISCORD_TOKEN is missing.")
@@ -82,7 +105,8 @@ WHITELIST_IDS = {
     if uid.strip().isdigit()
 }
 
-COOKIES_FILE  = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cookies.txt")
+_DATA_DIR = _resolve_data_dir()
+COOKIES_FILE  = os.path.join(_DATA_DIR, "cookies.txt")
 COOKIES_EXIST = os.path.exists(COOKIES_FILE)
 if COOKIES_EXIST:
     try:
@@ -575,7 +599,7 @@ def canonical_url_for_key(url: str) -> str:
 def _inflight_key(kind: str, url: str) -> str:
     return f"{kind}:{canonical_url_for_key(url)}"
 
-CACHE_DB_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache.db")
+CACHE_DB_PATH = os.path.join(_DATA_DIR, "cache.db")
 _cache_db_conn: sqlite3.Connection | None = None
 
 
@@ -1050,7 +1074,7 @@ def host_matches(host: str, domains: set[str]) -> bool:
     return host in domains or any(host.endswith(f".{d}") for d in domains)
 
 
-RUNTIME_SETTINGS_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "runtime_settings.json")
+RUNTIME_SETTINGS_PATH = os.path.join(_DATA_DIR, "runtime_settings.json")
 
 
 def _load_runtime_settings() -> dict:

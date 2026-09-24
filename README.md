@@ -99,8 +99,13 @@ To get a Guild ID: enable Developer Mode in Discord → right-click your server 
 For sites that require a logged-in session (Reddit, Instagram, etc.), export your browser cookies using a tool like [cookies.txt](https://github.com/kairi003/Get-cookies.txt-LOCALLY) and place the file at:
 
 ```
-cookies.txt  ← same directory as bot.py
+cookies.txt  ← same directory as bot.py (default)
 ```
+
+By default, `cookies.txt`, `cache.db`, and `runtime_settings.json` live beside `bot.py`.
+Set `COVE_DATA_DIR` to move all three into one directory that already exists and is writable.
+The path must be absolute; Cove will not create the directory.
+Cookies need write access because downloader tools may update them, and SQLite state should live on a normal local filesystem rather than a network or unusual filesystem.
 
 ### 4. Run the bot
 

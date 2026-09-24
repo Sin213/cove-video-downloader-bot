@@ -88,11 +88,12 @@ Edit `.env` and fill in your values:
 DISCORD_TOKEN=your_token_here
 GUILD_ID=your_main_guild_id_here
 FRIEND_GUILD_ID=your_friend_guild_id_here  # optional
+FRIEND_GUILD_IDS=111,222  # optional — additional friend guilds (comma-separated; unioned with FRIEND_GUILD_ID)
 ```
 
 To get a Guild ID: enable Developer Mode in Discord → right-click your server → **Copy Server ID**.
 
-`FRIEND_GUILD_ID` is optional. If omitted or set to `0`, the bot behaves identically on all servers.
+`FRIEND_GUILD_ID` / `FRIEND_GUILD_IDS` are optional. If both are unset/empty/`0`, the bot behaves identically on all servers. When set, friend mode applies to **every** id in the combined set.
 
 ### 3. (Optional) Add cookies
 
@@ -143,7 +144,7 @@ systemctl --user enable --now cove-bot.service
 
 ## Friend Server Mode
 
-When `FRIEND_GUILD_ID` is set, the bot activates a special mode in that server only:
+When `FRIEND_GUILD_ID` and/or `FRIEND_GUILD_IDS` is set, the bot activates a special mode in those servers only:
 
 | Behavior | Main Server | Friend Server |
 |---|---|---|

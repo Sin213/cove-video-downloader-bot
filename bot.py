@@ -68,12 +68,52 @@ def _env_bool(name: str, default: str = "0") -> bool:
     return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
 
 
+def parse_friend_guild_ids(
+    *,
+    friend_guild_id: str | int | None = "0",
+    friend_guild_ids: str | None = "",
+) -> frozenset[int]:
+    """Build the friend-guild set from singular and/or comma-separated env values.
+
+    ``FRIEND_GUILD_ID`` remains supported for back-compat and is unioned with
+    ``FRIEND_GUILD_IDS``. Zeros and non-integer tokens are ignored.
+    """
+    ids: set[int] = set()
+    raw_list = (friend_guild_ids or "").strip()
+    if raw_list:
+        for part in raw_list.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            try:
+                value = int(part)
+            except ValueError:
+                continue
+            if value != 0:
+                ids.add(value)
+    if friend_guild_id is None or friend_guild_id == "":
+        singular = 0
+    else:
+        try:
+            singular = int(friend_guild_id)
+        except (TypeError, ValueError):
+            singular = 0
+    if singular != 0:
+        ids.add(singular)
+    return frozenset(ids)
+
+
 TOKEN           = os.getenv("DISCORD_TOKEN")
 if not TOKEN:
     sys.exit("[Cove] Required env var DISCORD_TOKEN is missing.")
 
 GUILD_ID        = _require_int_env("GUILD_ID", allow_zero=False)
+# Singular env kept for back-compat; FRIEND_GUILD_IDS is the canonical set.
 FRIEND_GUILD_ID = _require_int_env("FRIEND_GUILD_ID", allow_zero=True, default="0")
+FRIEND_GUILD_IDS = parse_friend_guild_ids(
+    friend_guild_id=FRIEND_GUILD_ID,
+    friend_guild_ids=os.getenv("FRIEND_GUILD_IDS", ""),
+)
 
 _WHITELIST_RAW = os.getenv("WHITELIST_USER_IDS", "")
 WHITELIST_IDS = {
@@ -1669,7 +1709,7 @@ async def validate_manual_url(url: str) -> tuple[bool, str]:
 
 
 def is_friend_server(guild: discord.Guild | None) -> bool:
-    return FRIEND_GUILD_ID != 0 and guild is not None and guild.id == FRIEND_GUILD_ID
+    return bool(FRIEND_GUILD_IDS) and guild is not None and guild.id in FRIEND_GUILD_IDS
 
 
 def get_target_mb(guild: discord.Guild | None) -> float:
@@ -4401,10 +4441,14 @@ class CoveBot(discord.Client):
         guild = discord.Object(id=GUILD_ID)
         self.tree.copy_global_to(guild=guild)
         await self._sync_tree_with_timeout(guild, "Primary")
-        if FRIEND_GUILD_ID != 0:
-            friend_guild = discord.Object(id=FRIEND_GUILD_ID)
+        # Sync each additional friend guild. Skip GUILD_ID — already synced above
+        # (avoids a second PUT to the same guild that often 429/times out).
+        for friend_id in sorted(FRIEND_GUILD_IDS):
+            if friend_id == GUILD_ID:
+                continue
+            friend_guild = discord.Object(id=friend_id)
             self.tree.copy_global_to(guild=friend_guild)
-            await self._sync_tree_with_timeout(friend_guild, "Friend")
+            await self._sync_tree_with_timeout(friend_guild, f"Friend:{friend_id}")
 
     async def on_ready(self):
         global _ytdlp_admin_warning_sent
@@ -5163,7 +5207,7 @@ async def help_cmd(interaction: discord.Interaction):
         "`/quality [resolution]` - admin YouTube default quality",
         "`/health` - admin runtime self-check",
     ]
-    if FRIEND_GUILD_ID != 0 and is_friend_server(interaction.guild):
+    if is_friend_server(interaction.guild):
         commands.append("`/neet` - friend-server cooldown")
     await interaction.response.send_message("\n".join(commands), ephemeral=True)
 
@@ -5236,12 +5280,14 @@ async def quality_cmd_error(interaction: discord.Interaction, error: app_command
     raise error
 
 
-if FRIEND_GUILD_ID != 0:
+if FRIEND_GUILD_IDS:
+    _neet_guilds = [discord.Object(id=gid) for gid in sorted(FRIEND_GUILD_IDS)]
+
     @client.tree.command(
         name="neet",
         description="Ignore your next message in the friend server",
-        guild=discord.Object(id=FRIEND_GUILD_ID),
     )
+    @app_commands.guilds(*_neet_guilds)
     async def neet_cmd(interaction: discord.Interaction):
         if not is_friend_server(interaction.guild):
             await interaction.response.send_message(

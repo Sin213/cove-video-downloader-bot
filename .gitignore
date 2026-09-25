@@ -16,3 +16,4 @@ cache.db-wal
 .claude/
 AGENTS.md
 runtime_settings.json
+data/

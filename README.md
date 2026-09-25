@@ -144,6 +144,31 @@ Then enable and start it:
 systemctl --user enable --now cove-bot.service
 ```
 
+### Docker Compose (optional)
+
+Docker Compose is another deployment option. The bare-metal and systemd instructions above remain valid.
+
+Create `.env` as described above, then create the data directory before starting Cove:
+
+```bash
+mkdir -p data
+docker compose up -d --build cove
+```
+
+Before running the host test suite in this checkout, remove or avoid creating `./data`, or use a separate checkout for the Docker deployment.
+
+The container runs as uid/gid 1000. The host `./data` directory must be writable by uid 1000. Put cookies at `./data/cookies.txt` and keep that file writable by uid 1000; Cove and its downloader tools may update it. Compose mounts the whole directory at `/data` and sets `COVE_DATA_DIR=/data`.
+
+Compose raises `/dev/shm` to 1 GB by default because Cove uses shared memory for temporary media processing. Set `COVE_SHM_SIZE` when running Compose to choose another size. The container uses CPU encoding by default.
+
+`.env` must exist first; a copy of `.env.example` with placeholder values is sufficient because Compose validates it for the whole project.
+
+Run the existing test suite in the isolated test image with:
+
+```bash
+docker compose --profile test run --build --rm cove-tests
+```
+
 ---
 
 ## Friend Server Mode

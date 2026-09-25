@@ -1,0 +1,29 @@
+services:
+  cove:
+    image: cove-video-downloader-bot:local
+    build:
+      context: .
+      target: runtime
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      COVE_DATA_DIR: /data
+      USE_NVENC: "0"
+      USE_HWACCEL: "0"
+    volumes:
+      - ./data:/data
+    shm_size: ${COVE_SHM_SIZE:-1gb}
+
+  cove-tests:
+    profiles: ["test"]
+    build:
+      context: .
+      target: test
+    environment:
+      DISCORD_TOKEN: test-token-not-real
+      GUILD_ID: "1"
+      FRIEND_GUILD_ID: "0"
+      PERSISTENT_CACHE: "0"
+      COVE_DATA_DIR: ""
+    network_mode: none
+    command: ["pytest", "-q"]

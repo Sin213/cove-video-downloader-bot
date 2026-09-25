@@ -1,0 +1,8 @@
+*
+!bot.py
+!cove_attribution.py
+!conftest.py
+!tests/
+!tests/**
+!requirements.txt
+!requirements-dev.txt

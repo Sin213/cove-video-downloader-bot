@@ -192,7 +192,7 @@ Friend server mode pings users who were tagged in the original message, adds the
 - Attach Files
 - Add Reactions
 - Read Message History
-- Use Slash Commands
+- Use Application Commands
 - **Manage Messages** *(friend server only — for deleting the original message)*
 
 ---

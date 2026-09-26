@@ -156,8 +156,6 @@ mkdir -p data
 docker compose up -d --build cove
 ```
 
-Before running the host test suite in this checkout, remove or avoid creating `./data`, or use a separate checkout for the Docker deployment.
-
 The container runs as uid/gid 1000. The host `./data` directory must be writable by uid 1000. Put cookies at `./data/cookies.txt` and keep that file writable by uid 1000; Cove and its downloader tools may update it. Compose mounts the whole directory at `/data` and sets `COVE_DATA_DIR=/data`.
 
 Compose raises `/dev/shm` to 1 GB by default because Cove uses shared memory for temporary media processing. Set `COVE_SHM_SIZE` when running Compose to choose another size. The container uses CPU encoding by default.

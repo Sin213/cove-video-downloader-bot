@@ -1,9 +1,21 @@
 import sys
 import os
+import tempfile
 
 import pytest
 
 sys.path.insert(0, os.path.dirname(__file__))
+
+_TEST_DATA_DIR = tempfile.TemporaryDirectory(prefix="cove-pytest-data-")
+os.environ.update(
+    PYTHON_DOTENV_DISABLED="1",
+    DISCORD_TOKEN="test-token-not-real",
+    GUILD_ID="1",
+    FRIEND_GUILD_ID="0",
+    FRIEND_GUILD_IDS="",
+    PERSISTENT_CACHE="0",
+    COVE_DATA_DIR=_TEST_DATA_DIR.name,
+)
 
 _BOT_STATE_ATTRS = (
     "_instagram_probe_cache",

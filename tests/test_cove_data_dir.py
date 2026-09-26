@@ -2,6 +2,7 @@
 
 import json
 import os
+import shutil
 import subprocess
 import sys
 import tempfile
@@ -17,7 +18,12 @@ PATHS_SCRIPT = (
 )
 
 
-def _run_bot(script, data_dir, *, persistent_cache="0"):
+def _copy_app(app_dir):
+    for name in ("bot.py", "cove_attribution.py"):
+        shutil.copy2(REPO_ROOT / name, app_dir / name)
+
+
+def _run_bot(script, data_dir, *, persistent_cache="0", cwd=REPO_ROOT):
     env = {key: os.environ[key] for key in ("PATH", "HOME") if key in os.environ}
     env.update(
         DISCORD_TOKEN="test-token-not-real",
@@ -29,7 +35,7 @@ def _run_bot(script, data_dir, *, persistent_cache="0"):
     )
     return subprocess.run(
         [sys.executable, "-c", script],
-        cwd=REPO_ROOT,
+        cwd=cwd,
         env=env,
         capture_output=True,
         text=True,
@@ -46,13 +52,21 @@ def _assert_config_error(result):
     assert "Traceback" not in output
 
 
-def test_blank_config_preserves_current_locations():
-    result = _run_bot(PATHS_SCRIPT, "")
+def test_blank_config_preserves_current_locations(tmp_path):
+    _copy_app(tmp_path)
+    result = _run_bot(PATHS_SCRIPT, "", cwd=tmp_path)
     assert result.returncode == 0, result.stderr
     assert result.stdout.splitlines() == [
-        str(REPO_ROOT / name)
+        str(tmp_path / name)
         for name in ("cookies.txt", "cache.db", "runtime_settings.json")
     ]
+
+
+def test_host_import_uses_sealed_data_dir():
+    import bot
+
+    assert Path(bot._DATA_DIR) != REPO_ROOT
+    assert bot.PERSISTENT_CACHE is False
 
 
 def test_configured_directory_relocates_all_three():
@@ -108,13 +122,12 @@ def test_configured_cookies_are_discovered():
 
 
 @pytest.mark.parametrize("relative_path", ["data", "./data"])
-def test_relative_path_rejected_without_creating_directory(relative_path):
-    root_data = REPO_ROOT / "data"
-    assert not root_data.exists()
-    result = _run_bot("import bot", relative_path)
+def test_relative_path_rejected_without_creating_directory(relative_path, tmp_path):
+    _copy_app(tmp_path)
+    result = _run_bot("import bot", relative_path, cwd=tmp_path)
     _assert_config_error(result)
-    assert "must be an absolute path" in result.stderr
-    assert not root_data.exists()
+    assert "must be an absolute path" in result.stdout + result.stderr
+    assert not (tmp_path / "data").exists()
 
 
 def test_missing_absolute_path_rejected_without_creation():

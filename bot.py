@@ -562,7 +562,8 @@ async def _run_ytdlp_with_info_cache(
     return code, out
 
 
-_inflight_urls: set[str] = set()
+_InflightKey = tuple[str, str, int | None, float, str | None, float | None, float | None]
+_inflight_urls: set[_InflightKey] = set()
 SOURCE_MESSAGE_DEDUP_TTL_SECONDS = max(DELETE_TTL_SECONDS, FRIEND_POST_TTL_SECONDS)
 
 
@@ -616,8 +617,27 @@ def canonical_url_for_key(url: str) -> str:
     return urlunparse((scheme, host, path, "", query, ""))
 
 
-def _inflight_key(kind: str, url: str) -> str:
-    return f"{kind}:{canonical_url_for_key(url)}"
+def _inflight_key(
+    kind: str,
+    url: str,
+    guild: discord.Guild | None,
+    *,
+    youtube_quality: str | None = None,
+    clip_start: float | None = None,
+    clip_end: float | None = None,
+) -> _InflightKey:
+    quality = None
+    if kind == "video" and host_matches(hostname_for(url), {"youtube.com", "youtu.be"}):
+        quality = youtube_quality if youtube_quality is not None else get_youtube_quality()
+    return (
+        kind,
+        canonical_url_for_key(url),
+        guild.id if guild is not None else None,
+        get_target_mb(guild),
+        quality,
+        clip_start if kind == "clip" else None,
+        clip_end if kind == "clip" else None,
+    )
 
 CACHE_DB_PATH = os.path.join(_DATA_DIR, "cache.db")
 _cache_db_conn: sqlite3.Connection | None = None
@@ -4177,7 +4197,10 @@ async def process_url(
     on_no_video=None,
     youtube_quality: str | None = None,
 ):
-    canonical = _inflight_key("video", url)
+    effective_quality = youtube_quality
+    if host_matches(hostname_for(url), {"youtube.com", "youtu.be"}):
+        effective_quality = youtube_quality if youtube_quality is not None else get_youtube_quality()
+    canonical = _inflight_key("video", url, guild, youtube_quality=effective_quality)
     if canonical in _inflight_urls:
         log.info("[dedup] Skipping already-in-flight URL: %s", url)
         if on_no_video:
@@ -4194,7 +4217,7 @@ async def process_url(
         log.info("[queue] Accepted video job running=%d waiting=%d", running, waiting)
 
         result = await _run_download_phase(
-            download_and_compress(url, guild, youtube_quality),
+            download_and_compress(url, guild, youtube_quality=effective_quality),
             on_error,
             on_no_video,
             on_too_big=on_too_big,
@@ -4228,7 +4251,7 @@ async def process_audio_url(
     on_too_big=None,
     on_no_video=None,
 ):
-    canonical = _inflight_key("audio", url)
+    canonical = _inflight_key("audio", url, guild)
     if canonical in _inflight_urls:
         log.info("[dedup] Skipping already-in-flight audio URL: %s", url)
         if on_no_video:
@@ -4279,7 +4302,7 @@ async def process_clip_url(
     on_error,
     on_no_video=None,
 ):
-    canonical = _inflight_key("clip", f"{url}:{start}:{end}")
+    canonical = _inflight_key("clip", url, guild, clip_start=start, clip_end=end)
     if canonical in _inflight_urls:
         log.info("[dedup] Skipping already-in-flight clip URL: %s", url)
         if on_no_video:
@@ -4326,7 +4349,7 @@ async def process_gif_url(
     on_error,
     on_no_video=None,
 ):
-    canonical = _inflight_key("gif", url)
+    canonical = _inflight_key("gif", url, guild)
     if canonical in _inflight_urls:
         log.info("[dedup] Skipping already-in-flight GIF URL: %s", url)
         if on_no_video:

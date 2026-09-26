@@ -89,17 +89,209 @@ def test_ffmpeg_args_libx265_software():
 
 def test_inflight_url_dedup():
     _inflight_urls.clear()
-    _inflight_urls.add("https://example.com/video")
-    assert "https://example.com/video" in _inflight_urls
-    _inflight_urls.discard("https://example.com/video")
-    assert "https://example.com/video" not in _inflight_urls
+    key = _inflight_key("video", "https://example.com/video", None)
+    _inflight_urls.add(key)
+    assert key in _inflight_urls
+    _inflight_urls.discard(key)
+    assert key not in _inflight_urls
 
 
 def test_inflight_key_normalizes_url_and_namespaces_kind():
     # Scheme and host are case-insensitive; path case is preserved (only
     # reddit paths are lowercased, since reddit is case-insensitive).
-    assert _inflight_key("video", "HTTPS://Example.com/Video/") == "video:https://example.com/Video"
-    assert _inflight_key("audio", "https://example.com/video") != _inflight_key("video", "https://example.com/video")
+    normalized = _inflight_key("video", "HTTPS://Example.com/Video/", None)
+    assert isinstance(normalized, tuple)
+    assert normalized[0:2] == ("video", "https://example.com/Video")
+    assert normalized == _inflight_key("video", "https://example.com/Video", None)
+    keys = {_inflight_key(kind, "https://example.com/video", None) for kind in ("video", "audio", "clip", "gif")}
+    assert len(keys) == 4
+
+
+def test_inflight_key_all_dimensions(monkeypatch):
+    url = "https://www.youtube.com/watch?v=abc&utm_source=share"
+    guild_a = SimpleNamespace(id=1, premium_tier=0)
+    guild_b = SimpleNamespace(id=2, premium_tier=0)
+    guild_a_boosted = SimpleNamespace(id=1, premium_tier=3)
+    first = _inflight_key("video", url, guild_a, youtube_quality="720")
+    assert first == _inflight_key("video", "https://youtube.com/watch?v=abc", guild_a, youtube_quality="720")
+    assert first != _inflight_key("video", url, guild_b, youtube_quality="720")
+    assert first != _inflight_key("video", url, guild_a_boosted, youtube_quality="720")
+    assert first != _inflight_key("video", url, guild_a, youtube_quality="1080")
+    assert _inflight_key("clip", url, guild_a, clip_start=1.0, clip_end=2.0) != _inflight_key(
+        "clip", url, guild_a, clip_start=2.0, clip_end=3.0
+    )
+    non_youtube = "https://example.com/video"
+    monkeypatch.setattr(bot, "get_youtube_quality", lambda: "720")
+    before = _inflight_key("video", non_youtube, guild_a)
+    monkeypatch.setattr(bot, "get_youtube_quality", lambda: "1080")
+    assert before == _inflight_key("video", non_youtube, guild_a)
+
+
+def _inflight_callbacks(events):
+    async def on_success(filepath):
+        events.append(("success", filepath))
+
+    async def on_error(message):
+        events.append(("error", message))
+
+    async def on_no_video(message):
+        events.append(("no_video", message))
+
+    return on_success, on_error, None, on_no_video
+
+
+def test_inflight_same_url_different_guilds_both_succeed(monkeypatch, tmp_path):
+    guild_a = SimpleNamespace(id=1, premium_tier=0)
+    guild_b = SimpleNamespace(id=2, premium_tier=0)
+    assert bot.get_target_mb(guild_a) == bot.get_target_mb(guild_b)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = []
+    events_a, events_b = [], []
+
+    async def fake_download(url, guild, youtube_quality):
+        with tempfile.NamedTemporaryFile(dir=tmp_path, delete=False) as file:
+            filepath = file.name
+        calls.append((guild.id, filepath))
+        started.set()
+        await release.wait()
+        return filepath, ""
+
+    async def no_cleanup(filepath):
+        pass
+
+    monkeypatch.setattr(bot, "download_and_compress", fake_download)
+    monkeypatch.setattr(bot, "cleanup_tmp", no_cleanup)
+
+    async def runner():
+        first = asyncio.create_task(bot.process_url("https://example.com/video", guild_a, *_inflight_callbacks(events_a)))
+        await started.wait()
+        second = asyncio.create_task(bot.process_url("https://example.com/video", guild_b, *_inflight_callbacks(events_b)))
+        try:
+            await asyncio.sleep(0)
+            assert len(calls) == 2
+        finally:
+            release.set()
+            await asyncio.gather(first, second)
+        assert [event[0] for event in events_a] == ["success"]
+        assert [event[0] for event in events_b] == ["success"]
+        assert events_a[0][1] != events_b[0][1]
+
+    asyncio.run(runner())
+
+
+def test_inflight_explicit_youtube_qualities_both_succeed(monkeypatch, tmp_path):
+    guild = SimpleNamespace(id=1, premium_tier=0)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = []
+    events_a, events_b = [], []
+
+    async def fake_download(url, guild, youtube_quality):
+        with tempfile.NamedTemporaryFile(dir=tmp_path, delete=False) as file:
+            filepath = file.name
+        calls.append(youtube_quality)
+        started.set()
+        await release.wait()
+        return filepath, ""
+
+    async def no_cleanup(filepath):
+        pass
+
+    monkeypatch.setattr(bot, "download_and_compress", fake_download)
+    monkeypatch.setattr(bot, "cleanup_tmp", no_cleanup)
+
+    async def runner():
+        url = "https://youtube.com/watch?v=abc"
+        first = asyncio.create_task(bot.process_url(url, guild, *_inflight_callbacks(events_a), youtube_quality="720"))
+        await started.wait()
+        second = asyncio.create_task(bot.process_url(url, guild, *_inflight_callbacks(events_b), youtube_quality="1080"))
+        try:
+            await asyncio.sleep(0)
+            assert calls == ["720", "1080"]
+        finally:
+            release.set()
+            await asyncio.gather(first, second)
+        assert [event[0] for event in events_a] == ["success"]
+        assert [event[0] for event in events_b] == ["success"]
+
+    asyncio.run(runner())
+
+
+def test_inflight_default_youtube_quality_captured_at_admission(monkeypatch, tmp_path):
+    guild = SimpleNamespace(id=1, premium_tier=0)
+    current_quality = ["720"]
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = []
+    events = []
+    monkeypatch.setattr(bot, "get_youtube_quality", lambda: current_quality[0])
+
+    async def fake_download(url, guild, youtube_quality):
+        with tempfile.NamedTemporaryFile(dir=tmp_path, delete=False) as file:
+            filepath = file.name
+        calls.append(youtube_quality)
+        started.set()
+        await release.wait()
+        return filepath, ""
+
+    async def no_cleanup(filepath):
+        pass
+
+    monkeypatch.setattr(bot, "download_and_compress", fake_download)
+    monkeypatch.setattr(bot, "cleanup_tmp", no_cleanup)
+
+    async def runner():
+        task = asyncio.create_task(bot.process_url("https://youtube.com/watch?v=abc", guild, *_inflight_callbacks(events)))
+        await started.wait()
+        current_quality[0] = "1080"
+        release.set()
+        await task
+        assert calls == ["720"]
+        assert [event[0] for event in events] == ["success"]
+
+    asyncio.run(runner())
+
+
+def test_inflight_exact_duplicate_rejected_then_admitted(monkeypatch, tmp_path):
+    guild = SimpleNamespace(id=1, premium_tier=0)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = []
+    events_a, events_b, events_c = [], [], []
+
+    async def fake_download(url, guild, youtube_quality):
+        with tempfile.NamedTemporaryFile(dir=tmp_path, delete=False) as file:
+            filepath = file.name
+        calls.append(filepath)
+        started.set()
+        await release.wait()
+        return filepath, ""
+
+    async def no_cleanup(filepath):
+        pass
+
+    monkeypatch.setattr(bot, "download_and_compress", fake_download)
+    monkeypatch.setattr(bot, "cleanup_tmp", no_cleanup)
+
+    async def runner():
+        url = "https://youtube.com/watch?v=abc"
+        first = asyncio.create_task(bot.process_url(url, guild, *_inflight_callbacks(events_a), youtube_quality="720"))
+        await started.wait()
+        second = asyncio.create_task(bot.process_url(url, guild, *_inflight_callbacks(events_b), youtube_quality="720"))
+        try:
+            await second
+            assert len(calls) == 1
+            assert events_b == [("no_video", bot.INFLIGHT_MARKER)]
+        finally:
+            release.set()
+            await first
+        assert [event[0] for event in events_a] == ["success"]
+        await bot.process_url(url, guild, *_inflight_callbacks(events_c), youtube_quality="720")
+        assert len(calls) == 2
+        assert [event[0] for event in events_c] == ["success"]
+
+    asyncio.run(runner())
 
 
 def test_canonical_url_removes_tracking_params():

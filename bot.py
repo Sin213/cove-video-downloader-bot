@@ -637,7 +637,7 @@ def _inflight_key(
     clip_end: float | None = None,
 ) -> _InflightKey:
     quality = None
-    if kind == "video" and host_matches(hostname_for(url), {"youtube.com", "youtu.be"}):
+    if kind in {"video", "clip", "gif"} and host_matches(hostname_for(url), {"youtube.com", "youtu.be"}):
         quality = youtube_quality if youtube_quality is not None else get_youtube_quality()
     return (
         kind,
@@ -3673,6 +3673,7 @@ async def download_and_compress(
 
 async def download_and_clip(
     url: str, guild: discord.Guild | None, start: float, end: float,
+    *, youtube_quality: str | None = None,
 ) -> tuple:
     _log = []
     timer = PipelineTimer("clip")
@@ -3705,7 +3706,7 @@ async def download_and_clip(
         fmt = FORMAT_REDDIT_FAST if FAST_SOURCE_MODE else FORMAT_REDDIT
     else:
         fmt = FORMAT_DEFAULT
-        yt_fmt = youtube_quality_format(url)
+        yt_fmt = youtube_quality_format(url, youtube_quality)
         if yt_fmt is not None:
             fmt = yt_fmt
 
@@ -3829,7 +3830,9 @@ async def download_and_clip(
     return src_path, "\n".join(_log)
 
 
-async def download_and_gif(url: str, guild: discord.Guild | None) -> tuple:
+async def download_and_gif(
+    url: str, guild: discord.Guild | None, *, youtube_quality: str | None = None,
+) -> tuple:
     _log = []
     timer = PipelineTimer("gif")
     target_mb = get_target_mb(guild)
@@ -3857,7 +3860,7 @@ async def download_and_gif(url: str, guild: discord.Guild | None) -> tuple:
         fmt = FORMAT_REDDIT_FAST if FAST_SOURCE_MODE else FORMAT_REDDIT
     else:
         fmt = FORMAT_DEFAULT
-        yt_fmt = youtube_quality_format(url)
+        yt_fmt = youtube_quality_format(url, youtube_quality)
         if yt_fmt is not None:
             fmt = yt_fmt
 
@@ -4393,7 +4396,12 @@ async def process_clip_url(
     on_error,
     on_no_video=None,
 ):
-    canonical = _inflight_key("clip", url, guild, clip_start=start, clip_end=end)
+    effective_quality = None
+    if host_matches(hostname_for(url), {"youtube.com", "youtu.be"}):
+        effective_quality = get_youtube_quality()
+    canonical = _inflight_key(
+        "clip", url, guild, youtube_quality=effective_quality, clip_start=start, clip_end=end
+    )
     if canonical in _inflight_urls:
         log.info("[dedup] Skipping already-in-flight clip URL: %s", url)
         if on_no_video:
@@ -4410,7 +4418,7 @@ async def process_clip_url(
         log.info("[queue] Accepted clip job running=%d waiting=%d", running, waiting)
 
         result = await _run_download_phase(
-            download_and_clip(url, guild, start, end),
+            download_and_clip(url, guild, start, end, youtube_quality=effective_quality),
             on_error,
             on_no_video,
             no_file_msg="Clip failed.",
@@ -4440,7 +4448,10 @@ async def process_gif_url(
     on_error,
     on_no_video=None,
 ):
-    canonical = _inflight_key("gif", url, guild)
+    effective_quality = None
+    if host_matches(hostname_for(url), {"youtube.com", "youtu.be"}):
+        effective_quality = get_youtube_quality()
+    canonical = _inflight_key("gif", url, guild, youtube_quality=effective_quality)
     if canonical in _inflight_urls:
         log.info("[dedup] Skipping already-in-flight GIF URL: %s", url)
         if on_no_video:
@@ -4457,7 +4468,7 @@ async def process_gif_url(
         log.info("[queue] Accepted gif job running=%d waiting=%d", running, waiting)
 
         result = await _run_download_phase(
-            download_and_gif(url, guild),
+            download_and_gif(url, guild, youtube_quality=effective_quality),
             on_error,
             on_no_video,
             too_big_msg="Source video too long ({toobig_str}, max {max_min}min)",

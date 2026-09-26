@@ -128,6 +128,162 @@ def test_inflight_key_all_dimensions(monkeypatch):
     assert before == _inflight_key("video", non_youtube, guild_a)
 
 
+@pytest.mark.parametrize("kind", ["clip", "gif"])
+def test_clip_gif_request_key_uses_youtube_quality_only_for_youtube(kind):
+    youtube = "https://youtube.com/watch?v=abc"
+    other = "https://example.com/media"
+    bounds = {"clip_start": 1.0, "clip_end": 2.0} if kind == "clip" else {}
+    key_720 = _inflight_key(kind, youtube, None, youtube_quality="720", **bounds)
+    key_1080 = _inflight_key(kind, youtube, None, youtube_quality="1080", **bounds)
+    assert key_720 != key_1080
+    assert _inflight_key(kind, other, None, youtube_quality="720", **bounds) == _inflight_key(
+        kind, other, None, youtube_quality="1080", **bounds
+    )
+    if kind == "clip":
+        assert key_720 != _inflight_key(
+            kind, youtube, None, youtube_quality="720", clip_start=2.0, clip_end=3.0
+        )
+
+
+@pytest.mark.parametrize(
+    ("kind", "download_name"),
+    [("clip", "download_and_clip"), ("gif", "download_and_gif")],
+)
+def test_clip_gif_admission_captures_youtube_quality(monkeypatch, kind, download_name):
+    calls = []
+    monkeypatch.setattr(bot, "get_youtube_quality", lambda: "720")
+    monkeypatch.setattr(bot, "_work_key", lambda *args: pytest.fail("clip/GIF entered shared work"))
+
+    async def fake_download(*args, youtube_quality=None):
+        calls.append(youtube_quality)
+        return None, ""
+
+    monkeypatch.setattr(bot, download_name, fake_download)
+
+    async def noop(*args):
+        pass
+
+    async def runner():
+        url = "https://youtube.com/watch?v=abc"
+        if kind == "clip":
+            await bot.process_clip_url(url, None, 1.0, 2.0, noop, noop)
+        else:
+            await bot.process_gif_url(url, None, noop, noop)
+
+    asyncio.run(runner())
+    assert calls == ["720"]
+    assert bot._shared_jobs == {}
+
+
+@pytest.mark.parametrize(
+    ("kind", "download_name"),
+    [("clip", "download_and_clip"), ("gif", "download_and_gif")],
+)
+def test_clip_gif_admission_quality_survives_setting_change(monkeypatch, kind, download_name):
+    quality = ["720"]
+    admitted = asyncio.Event()
+    release = asyncio.Event()
+    calls = []
+    monkeypatch.setattr(bot, "get_youtube_quality", lambda: quality[0])
+    real_phase = bot._run_download_phase
+
+    async def delayed_phase(*args, **kwargs):
+        admitted.set()
+        await release.wait()
+        return await real_phase(*args, **kwargs)
+
+    async def fake_download(*args, youtube_quality=None):
+        calls.append(youtube_quality)
+        return None, ""
+
+    monkeypatch.setattr(bot, "_run_download_phase", delayed_phase)
+    monkeypatch.setattr(bot, download_name, fake_download)
+
+    async def noop(*args):
+        pass
+
+    async def runner():
+        url = "https://youtube.com/watch?v=abc"
+        if kind == "clip":
+            job = bot.process_clip_url(url, None, 1.0, 2.0, noop, noop)
+        else:
+            job = bot.process_gif_url(url, None, noop, noop)
+        task = asyncio.create_task(job)
+        try:
+            await admitted.wait()
+            quality[0] = "1080"
+        finally:
+            release.set()
+        await task
+
+    asyncio.run(runner())
+    assert calls == ["720"]
+
+
+@pytest.mark.parametrize(
+    ("kind", "download_name"),
+    [("clip", "download_and_clip"), ("gif", "download_and_gif")],
+)
+def test_clip_gif_downloader_uses_passed_quality(monkeypatch, tmp_path, kind, download_name):
+    url = "https://youtube.com/watch?v=abc"
+    calls = []
+    monkeypatch.setattr(bot, "get_youtube_quality", lambda: "1080")
+    monkeypatch.setattr(bot, "resolve_fixup_url", lambda value: value)
+
+    async def identity(value):
+        return value
+
+    async def fake_ytdlp(*args, **kwargs):
+        return 1, "offline test failure"
+
+    def fake_format(value, quality=None):
+        calls.append((value, quality))
+        return None
+
+    monkeypatch.setattr(bot, "resolve_arazu", identity)
+    monkeypatch.setattr(bot, "resolve_reddit_shortlink", identity)
+    monkeypatch.setattr(bot, "_make_job_tmpdir", lambda: str(tmp_path / "download"))
+    monkeypatch.setattr(bot, "_run_ytdlp_with_info_cache", fake_ytdlp)
+    monkeypatch.setattr(bot, "youtube_quality_format", fake_format)
+
+    async def runner():
+        if kind == "clip":
+            await bot.download_and_clip(url, None, 1.0, 2.0, youtube_quality="720")
+        else:
+            await bot.download_and_gif(url, None, youtube_quality="720")
+
+    asyncio.run(runner())
+    assert calls == [(url, "720")]
+
+
+@pytest.mark.parametrize(
+    ("kind", "download_name"),
+    [("clip", "download_and_clip"), ("gif", "download_and_gif")],
+)
+def test_clip_gif_non_youtube_admission_ignores_quality(monkeypatch, kind, download_name):
+    calls = []
+    monkeypatch.setattr(bot, "get_youtube_quality", lambda: pytest.fail("quality read for non-YouTube"))
+
+    async def fake_download(*args, youtube_quality=None):
+        calls.append(youtube_quality)
+        return None, ""
+
+    monkeypatch.setattr(bot, download_name, fake_download)
+
+    async def noop(*args):
+        pass
+
+    async def runner():
+        url = "https://example.com/media"
+        if kind == "clip":
+            await bot.process_clip_url(url, None, 1.0, 2.0, noop, noop)
+        else:
+            await bot.process_gif_url(url, None, noop, noop)
+
+    asyncio.run(runner())
+    assert calls == [None]
+
+
 def test_work_key_uses_media_settings_but_not_guild_id():
     guild_a = SimpleNamespace(id=1, premium_tier=0)
     guild_b = SimpleNamespace(id=2, premium_tier=0)
@@ -299,7 +455,7 @@ def test_clip_and_gif_only_reject_exact_duplicate_requests(monkeypatch, tmp_path
     cleaned = []
     events_a, events_b, duplicate_events = [], [], []
 
-    async def fake_download(*args):
+    async def fake_download(*args, **kwargs):
         path = tmp_path / f"{len(calls)}.mp4"
         path.write_bytes(b"media")
         calls.append(args)
@@ -397,7 +553,7 @@ def test_different_clip_bounds_use_separate_jobs(monkeypatch, tmp_path):
     bounds = []
     events_a, events_b = [], []
 
-    async def fake_download(url, guild, start, end):
+    async def fake_download(url, guild, start, end, youtube_quality=None):
         path = tmp_path / f"{end}.mp4"
         path.write_bytes(b"video")
         bounds.append((start, end))

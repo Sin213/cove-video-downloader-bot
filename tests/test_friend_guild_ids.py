@@ -176,3 +176,116 @@ print(json.dumps(asyncio.run(check(222)) and asyncio.run(check(333))
 
 def test_help_shows_neet_for_each_plural_friend():
     assert _json_result(HELP_SCRIPT, plural="222,333") is True
+
+
+NEET_SCRIPT = """
+import asyncio
+import bot
+import json
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
+
+async def arm(guild_id, user_id):
+    interaction = SimpleNamespace(
+        guild=SimpleNamespace(id=guild_id),
+        user=SimpleNamespace(id=user_id),
+        response=SimpleNamespace(send_message=AsyncMock()),
+    )
+    await bot.neet_cmd.callback(interaction)
+
+def message(guild_id, user_id):
+    return SimpleNamespace(
+        author=SimpleNamespace(id=user_id, bot=False),
+        guild=SimpleNamespace(id=guild_id),
+        reference=None,
+        content='hello',
+    )
+
+def armed():
+    return sorted([list(key) for key in bot._friend_neet_skip_users])
+"""
+
+
+def test_neet_skip_consumed_by_next_message_in_same_guild():
+    script = NEET_SCRIPT + """
+async def check():
+    await arm(222, 9001)
+    before = armed()
+    await bot.client.on_message(message(222, 9001))
+    return [before, armed()]
+
+print(json.dumps(asyncio.run(check())))
+"""
+    assert _json_result(script, plural="222,333") == [[[222, 9001]], []]
+
+
+def test_neet_skip_survives_message_in_other_friend_guild():
+    script = NEET_SCRIPT + """
+async def check():
+    await arm(222, 9001)
+    before = armed()
+    await bot.client.on_message(message(333, 9001))
+    after_other_guild = armed()
+    await bot.client.on_message(message(222, 9001))
+    return [before, after_other_guild, armed()]
+
+print(json.dumps(asyncio.run(check())))
+"""
+    assert _json_result(script, plural="222,333") == [
+        [[222, 9001]], [[222, 9001]], []
+    ]
+
+
+def test_neet_skips_for_same_user_in_two_guilds_are_independent():
+    script = NEET_SCRIPT + """
+async def check():
+    await arm(222, 9001)
+    await arm(333, 9001)
+    before = armed()
+    await bot.client.on_message(message(222, 9001))
+    after_first = armed()
+    await bot.client.on_message(message(333, 9001))
+    return [before, after_first, armed()]
+
+print(json.dumps(asyncio.run(check())))
+"""
+    assert _json_result(script, plural="222,333") == [
+        [[222, 9001], [333, 9001]], [[333, 9001]], []
+    ]
+
+
+def test_neet_skips_for_two_users_in_same_guild_are_independent():
+    script = NEET_SCRIPT + """
+async def check():
+    await arm(222, 9001)
+    await arm(222, 9002)
+    before = armed()
+    await bot.client.on_message(message(222, 9001))
+    after_first = armed()
+    await bot.client.on_message(message(222, 9002))
+    return [before, after_first, armed()]
+
+print(json.dumps(asyncio.run(check())))
+"""
+    assert _json_result(script, plural="222,333") == [
+        [[222, 9001], [222, 9002]], [[222, 9002]], []
+    ]
+
+
+def test_prune_neet_skips_removes_only_expired_guild_user_entry():
+    script = NEET_SCRIPT + """
+async def check():
+    await arm(222, 9001)
+    await arm(333, 9002)
+    bot._friend_neet_skip_users[(222, 9001)] = bot.monotonic() - 1
+    before = armed()
+    bot.prune_neet_skips()
+    after_prune = armed()
+    await bot.client.on_message(message(333, 9002))
+    return [before, after_prune, armed()]
+
+print(json.dumps(asyncio.run(check())))
+"""
+    assert _json_result(script, plural="222,333") == [
+        [[222, 9001], [333, 9002]], [[333, 9002]], []
+    ]

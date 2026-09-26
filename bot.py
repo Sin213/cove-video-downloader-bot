@@ -391,7 +391,7 @@ YOUTUBE_QUALITY_FORMATS = {
 
 _deletable: dict[int, tuple[int, float]] = {}
 _friend_posts: dict[int, tuple[int, float]] = {}
-_friend_neet_skip_users: dict[int, float] = {}
+_friend_neet_skip_users: dict[tuple[int, int], float] = {}
 _processed_source_messages: dict[int, float] = {}
 _user_request_times: dict[int, list[float]] = {}
 _active_tasks: set[asyncio.Task] = set()
@@ -973,9 +973,9 @@ def prune_friend_posts() -> None:
 
 def prune_neet_skips() -> None:
     now = monotonic()
-    expired = [uid for uid, expires_at in _friend_neet_skip_users.items() if expires_at <= now]
-    for uid in expired:
-        _friend_neet_skip_users.pop(uid, None)
+    expired = [key for key, expires_at in _friend_neet_skip_users.items() if expires_at <= now]
+    for key in expired:
+        _friend_neet_skip_users.pop(key, None)
 
 
 def prune_processed_source_messages() -> None:
@@ -4506,8 +4506,8 @@ class CoveBot(discord.Client):
 
         if is_friend_server(message.guild):
             prune_neet_skips()
-        if is_friend_server(message.guild) and message.author.id in _friend_neet_skip_users:
-            _friend_neet_skip_users.pop(message.author.id, None)
+        if is_friend_server(message.guild) and (message.guild.id, message.author.id) in _friend_neet_skip_users:
+            _friend_neet_skip_users.pop((message.guild.id, message.author.id), None)
             log.info("[Cove] /neet skipped next friend message from %s", message.author)
             return
 
@@ -5295,7 +5295,7 @@ if EFFECTIVE_FRIEND_GUILD_IDS:
             return
 
         prune_neet_skips()
-        _friend_neet_skip_users[interaction.user.id] = monotonic() + NEET_TTL_SECONDS
+        _friend_neet_skip_users[(interaction.guild.id, interaction.user.id)] = monotonic() + NEET_TTL_SECONDS
         await interaction.response.send_message(
             "Got it. I will ignore your next message.",
             ephemeral=True,

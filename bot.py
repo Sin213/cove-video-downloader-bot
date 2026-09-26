@@ -564,6 +564,16 @@ async def _run_ytdlp_with_info_cache(
 
 _InflightKey = tuple[str, str, int | None, float, str | None, float | None, float | None]
 _inflight_urls: set[_InflightKey] = set()
+WorkKey = tuple[str, str, float, str | None, float | None, float | None]
+
+
+class SharedJob:
+    def __init__(self, task: asyncio.Task):
+        self.task = task
+        self.subscribers = 0
+
+
+_shared_jobs: dict[WorkKey, SharedJob] = {}
 SOURCE_MESSAGE_DEDUP_TTL_SECONDS = max(DELETE_TTL_SECONDS, FRIEND_POST_TTL_SECONDS)
 
 
@@ -638,6 +648,12 @@ def _inflight_key(
         clip_start if kind == "clip" else None,
         clip_end if kind == "clip" else None,
     )
+
+
+def _work_key(request_key: _InflightKey) -> WorkKey:
+    # Delivery is guild-specific, but equivalent media work is not.
+    kind, url, _guild_id, target_mb, quality, clip_start, clip_end = request_key
+    return kind, url, target_mb, quality, clip_start, clip_end
 
 CACHE_DB_PATH = os.path.join(_DATA_DIR, "cache.db")
 _cache_db_conn: sqlite3.Connection | None = None
@@ -3260,10 +3276,11 @@ async def download_and_compress(
     url: str,
     guild: discord.Guild | None,
     youtube_quality: str | None = None,
+    target_mb: float | None = None,
 ) -> tuple:
     _log = []
     timer = PipelineTimer("video")
-    target_mb   = get_target_mb(guild)
+    target_mb = get_target_mb(guild) if target_mb is None else target_mb
     target_size = int(target_mb * 1024 * 1024)
 
     _log.append(f"[INFO] Boost tier: {guild.premium_tier if guild else 0} — limit: {target_mb}MB")
@@ -3949,10 +3966,12 @@ async def download_and_gif(url: str, guild: discord.Guild | None) -> tuple:
     return None, "\n".join(_log)
 
 
-async def download_audio(url: str, guild: discord.Guild | None) -> tuple:
+async def download_audio(
+    url: str, guild: discord.Guild | None, target_mb: float | None = None,
+) -> tuple:
     _log = []
     timer = PipelineTimer("audio")
-    target_mb = get_target_mb(guild)
+    target_mb = get_target_mb(guild) if target_mb is None else target_mb
     target_size = int(target_mb * 1024 * 1024)
 
     _log.append(f"[INFO] Boost tier: {guild.premium_tier if guild else 0} — limit: {target_mb}MB")
@@ -4188,6 +4207,140 @@ async def _run_download_phase(
         return filepath, log_text
 
 
+async def _run_shared_download(download_coro_factory, *, kind, too_big_msg, no_file_msg):
+    notices = []
+
+    async def record_error(message):
+        notices.append(("error", message))
+
+    async def record_no_video(message):
+        notices.append(("no_video", message))
+
+    async def record_too_big(message):
+        notices.append(("too_big", message))
+
+    result = await _run_download_phase(
+        download_coro_factory(),
+        record_error,
+        record_no_video,
+        on_too_big=record_too_big if too_big_msg else None,
+        too_big_msg=too_big_msg,
+        no_file_msg=no_file_msg,
+        kind=kind,
+    )
+    return result, notices
+
+
+def _finalize_shared_job(work_key: WorkKey, job: SharedJob) -> str | None:
+    if _shared_jobs.get(work_key) is not job or job.subscribers or not job.task.done():
+        return None
+    _shared_jobs.pop(work_key)
+    try:
+        try:
+            outcome, _notices = job.task.result()
+        except (Exception, asyncio.CancelledError):
+            return None
+        else:
+            if outcome is not None:
+                return outcome[0]
+            return None
+    finally:
+        _release_job_slot()
+
+
+def _on_shared_job_done(work_key: WorkKey, job: SharedJob) -> None:
+    if _shared_jobs.get(work_key) is job and job.subscribers == 0:
+        filepath = _finalize_shared_job(work_key, job)
+        if filepath is not None:
+            spawn_tracked(cleanup_tmp(filepath))
+
+
+async def _process_shared_url(
+    request_key: _InflightKey,
+    url: str,
+    download_coro_factory,
+    on_success,
+    on_error,
+    on_too_big,
+    on_no_video,
+    *,
+    too_big_msg: str | None,
+    no_file_msg: str,
+    busy_msg,
+):
+    kind = request_key[0]
+    if request_key in _inflight_urls:
+        log.info("[dedup] Skipping already-in-flight %s URL: %s", kind, url)
+        if on_no_video:
+            await _safe_notify(on_no_video, kind, INFLIGHT_MARKER)
+        return
+
+    _inflight_urls.add(request_key)
+    work_key = _work_key(request_key)
+    job = None
+    try:
+        job = _shared_jobs.get(work_key)
+        if job is None:
+            if not _try_reserve_job_slot():
+                await _safe_notify(on_error, kind, busy_msg() if callable(busy_msg) else busy_msg)
+                return
+            try:
+                task = spawn_tracked(
+                    _run_shared_download(
+                        download_coro_factory,
+                        kind=kind,
+                        too_big_msg=too_big_msg,
+                        no_file_msg=no_file_msg,
+                    )
+                )
+            except BaseException:
+                _release_job_slot()
+                raise
+            job = SharedJob(task)
+            _shared_jobs[work_key] = job
+            task.add_done_callback(lambda _task: _on_shared_job_done(work_key, job))
+            running, waiting = _job_queue_status()
+            log.info("[queue] Accepted %s job running=%d waiting=%d", kind, running, waiting)
+        job.subscribers += 1
+        try:
+            result, notices = await asyncio.shield(job.task)
+        except Exception as e:
+            log.exception("Unhandled exception in shared %s job", kind)
+            await _safe_notify(on_error, kind, f"Unexpected error: {e}")
+            return
+        for notice, message in notices:
+            if notice == "no_video":
+                if on_no_video:
+                    await _safe_notify(on_no_video, kind, message)
+            elif notice == "too_big":
+                if on_too_big:
+                    await _safe_notify(on_too_big, kind, message)
+                elif too_big_msg:
+                    await _safe_notify(
+                        on_error, kind,
+                        too_big_msg.format(toobig_str=message, max_min=MAX_DURATION_SECONDS // 60),
+                    )
+            else:
+                await _safe_notify(on_error, kind, message)
+        if result is not None:
+            filepath, _log_text = result
+            try:
+                await on_success(filepath)
+            except Exception as e:
+                log.exception("Unhandled exception in %s on_success", kind)
+                await _safe_notify(on_error, "upload", user_facing_upload_error(e))
+    finally:
+        try:
+            if job is not None and job.subscribers:
+                job.subscribers -= 1
+                if job.subscribers == 0 and job.task.done():
+                    filepath = _finalize_shared_job(work_key, job)
+                    if filepath is not None:
+                        await cleanup_tmp(filepath)
+        finally:
+            _inflight_urls.discard(request_key)
+
+
 async def process_url(
     url: str,
     guild: discord.Guild | None,
@@ -4201,46 +4354,15 @@ async def process_url(
     if host_matches(hostname_for(url), {"youtube.com", "youtu.be"}):
         effective_quality = youtube_quality if youtube_quality is not None else get_youtube_quality()
     canonical = _inflight_key("video", url, guild, youtube_quality=effective_quality)
-    if canonical in _inflight_urls:
-        log.info("[dedup] Skipping already-in-flight URL: %s", url)
-        if on_no_video:
-            await _safe_notify(on_no_video, "video", INFLIGHT_MARKER)
-        return
-    _inflight_urls.add(canonical)
-    reserved_slot = False
-    try:
-        if not _try_reserve_job_slot():
-            await _safe_notify(on_error, "video", busy_message())
-            return
-        reserved_slot = True
-        running, waiting = _job_queue_status()
-        log.info("[queue] Accepted video job running=%d waiting=%d", running, waiting)
-
-        result = await _run_download_phase(
-            download_and_compress(url, guild, youtube_quality=effective_quality),
-            on_error,
-            on_no_video,
-            on_too_big=on_too_big,
-            too_big_msg=f"Video too big {NYO_EMOJI} ({{toobig_str}}, max {{max_min}}min)",
-            no_file_msg="Download failed.",
-            kind="video",
-        )
-        if result is None:
-            return
-        filepath, log_text = result
-
-        # JOB_SEMAPHORE is released; upload can overlap with new downloads.
-        try:
-            await on_success(filepath)
-        except Exception as e:
-            log.exception("Unhandled exception in on_success")
-            await _safe_notify(on_error, "upload", user_facing_upload_error(e))
-        finally:
-            await cleanup_tmp(filepath)
-    finally:
-        if reserved_slot:
-            _release_job_slot()
-        _inflight_urls.discard(canonical)
+    target_mb = canonical[3]
+    await _process_shared_url(
+        canonical, url,
+        lambda: download_and_compress(url, guild, youtube_quality=effective_quality, target_mb=target_mb),
+        on_success, on_error, on_too_big, on_no_video,
+        too_big_msg=f"Video too big {NYO_EMOJI} ({{toobig_str}}, max {{max_min}}min)",
+        no_file_msg="Download failed.",
+        busy_msg=busy_message,
+    )
 
 
 async def process_audio_url(
@@ -4252,45 +4374,14 @@ async def process_audio_url(
     on_no_video=None,
 ):
     canonical = _inflight_key("audio", url, guild)
-    if canonical in _inflight_urls:
-        log.info("[dedup] Skipping already-in-flight audio URL: %s", url)
-        if on_no_video:
-            await _safe_notify(on_no_video, "audio", INFLIGHT_MARKER)
-        return
-    _inflight_urls.add(canonical)
-    reserved_slot = False
-    try:
-        if not _try_reserve_job_slot():
-            await _safe_notify(on_error, "audio", BUSY_MESSAGE)
-            return
-        reserved_slot = True
-        running, waiting = _job_queue_status()
-        log.info("[queue] Accepted audio job running=%d waiting=%d", running, waiting)
-
-        result = await _run_download_phase(
-            download_audio(url, guild),
-            on_error,
-            on_no_video,
-            on_too_big=on_too_big,
-            too_big_msg=f"Audio too big {NYO_EMOJI} ({{toobig_str}})",
-            no_file_msg="Audio download failed.",
-            kind="audio",
-        )
-        if result is None:
-            return
-        filepath, log_text = result
-
-        try:
-            await on_success(filepath)
-        except Exception as e:
-            log.exception("Unhandled exception in audio on_success")
-            await _safe_notify(on_error, "upload", user_facing_upload_error(e))
-        finally:
-            await cleanup_tmp(filepath)
-    finally:
-        if reserved_slot:
-            _release_job_slot()
-        _inflight_urls.discard(canonical)
+    target_mb = canonical[3]
+    await _process_shared_url(
+        canonical, url, lambda: download_audio(url, guild, target_mb=target_mb),
+        on_success, on_error, on_too_big, on_no_video,
+        too_big_msg=f"Audio too big {NYO_EMOJI} ({{toobig_str}})",
+        no_file_msg="Audio download failed.",
+        busy_msg=BUSY_MESSAGE,
+    )
 
 
 async def process_clip_url(

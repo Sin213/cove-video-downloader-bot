@@ -10,6 +10,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock
 
 import discord
+import pytest
 
 import bot
 from bot import (
@@ -127,6 +128,21 @@ def test_inflight_key_all_dimensions(monkeypatch):
     assert before == _inflight_key("video", non_youtube, guild_a)
 
 
+def test_work_key_uses_media_settings_but_not_guild_id():
+    guild_a = SimpleNamespace(id=1, premium_tier=0)
+    guild_b = SimpleNamespace(id=2, premium_tier=0)
+    boosted = SimpleNamespace(id=3, premium_tier=3)
+    url = "https://youtube.com/watch?v=abc"
+    key = bot._work_key(_inflight_key("video", url, guild_a, youtube_quality="720"))
+    assert key == bot._work_key(_inflight_key("video", url, guild_b, youtube_quality="720"))
+    assert key != bot._work_key(_inflight_key("video", url, boosted, youtube_quality="720"))
+    assert key != bot._work_key(_inflight_key("video", url, guild_b, youtube_quality="1080"))
+    plain_url = "https://example.com/media"
+    assert bot._work_key(_inflight_key("video", plain_url, guild_a)) != bot._work_key(
+        _inflight_key("audio", plain_url, guild_b)
+    )
+
+
 def _inflight_callbacks(events):
     async def on_success(filepath):
         events.append(("success", filepath))
@@ -140,7 +156,7 @@ def _inflight_callbacks(events):
     return on_success, on_error, None, on_no_video
 
 
-def test_inflight_same_url_different_guilds_both_succeed(monkeypatch, tmp_path):
+def test_equivalent_video_work_cross_guild_shares_one_job(monkeypatch, tmp_path):
     guild_a = SimpleNamespace(id=1, premium_tier=0)
     guild_b = SimpleNamespace(id=2, premium_tier=0)
     assert bot.get_target_mb(guild_a) == bot.get_target_mb(guild_b)
@@ -149,10 +165,10 @@ def test_inflight_same_url_different_guilds_both_succeed(monkeypatch, tmp_path):
     calls = []
     events_a, events_b = [], []
 
-    async def fake_download(url, guild, youtube_quality):
+    async def fake_download(url, guild, youtube_quality, target_mb=None):
         with tempfile.NamedTemporaryFile(dir=tmp_path, delete=False) as file:
             filepath = file.name
-        calls.append((guild.id, filepath))
+        calls.append((guild.id, youtube_quality, filepath))
         started.set()
         await release.wait()
         return filepath, ""
@@ -164,18 +180,540 @@ def test_inflight_same_url_different_guilds_both_succeed(monkeypatch, tmp_path):
     monkeypatch.setattr(bot, "cleanup_tmp", no_cleanup)
 
     async def runner():
-        first = asyncio.create_task(bot.process_url("https://example.com/video", guild_a, *_inflight_callbacks(events_a)))
+        url = "https://youtube.com/watch?v=abc"
+        first = asyncio.create_task(bot.process_url(url, guild_a, *_inflight_callbacks(events_a), youtube_quality="720"))
         await started.wait()
-        second = asyncio.create_task(bot.process_url("https://example.com/video", guild_b, *_inflight_callbacks(events_b)))
+        second = asyncio.create_task(bot.process_url(url, guild_b, *_inflight_callbacks(events_b), youtube_quality="720"))
         try:
             await asyncio.sleep(0)
-            assert len(calls) == 2
+            assert len(calls) == 1
+            assert calls[0][1] == "720"
         finally:
             release.set()
             await asyncio.gather(first, second)
         assert [event[0] for event in events_a] == ["success"]
         assert [event[0] for event in events_b] == ["success"]
-        assert events_a[0][1] != events_b[0][1]
+        assert events_a[0][1] == events_b[0][1]
+
+    asyncio.run(runner())
+
+
+def test_equivalent_audio_work_cross_guild_shares_one_job(monkeypatch, tmp_path):
+    guild_a = SimpleNamespace(id=1, premium_tier=0)
+    guild_b = SimpleNamespace(id=2, premium_tier=0)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    path = tmp_path / "shared"
+    path.write_bytes(b"media")
+    calls = []
+    events_a, events_b = [], []
+
+    async def fake_download(*args, **kwargs):
+        calls.append(args)
+        started.set()
+        await release.wait()
+        return str(path), ""
+
+    async def no_cleanup(filepath):
+        pass
+
+    monkeypatch.setattr(bot, "download_audio", fake_download)
+    monkeypatch.setattr(bot, "cleanup_tmp", no_cleanup)
+
+    def process(guild, events):
+        callbacks = _inflight_callbacks(events)
+        return bot.process_audio_url("https://example.com/media", guild, *callbacks)
+
+    async def runner():
+        first = asyncio.create_task(process(guild_a, events_a))
+        await started.wait()
+        second = asyncio.create_task(process(guild_b, events_b))
+        await asyncio.sleep(0)
+        assert len(calls) == 1
+        release.set()
+        await asyncio.gather(first, second)
+        assert events_a == [("success", str(path))]
+        assert events_b == [("success", str(path))]
+
+    asyncio.run(runner())
+
+
+def test_shared_video_uses_admission_target_after_creator_tier_changes(monkeypatch, tmp_path):
+    guild_a = SimpleNamespace(id=1, premium_tier=0)
+    guild_b = SimpleNamespace(id=2, premium_tier=0)
+    admitted_mb = bot.get_target_mb(guild_a)
+    source, compression_calls = _fake_video_pipeline(monkeypatch, tmp_path, 20 * 1024 * 1024)
+    real_download = bot.download_and_compress
+    used_targets = []
+    events_a, events_b = [], []
+
+    async def record_download(url, guild, youtube_quality, target_mb):
+        used_targets.append(target_mb)
+        return await real_download(url, guild, youtube_quality, target_mb=target_mb)
+
+    async def no_cleanup(filepath):
+        pass
+
+    monkeypatch.setattr(bot, "download_and_compress", record_download)
+    monkeypatch.setattr(bot, "cleanup_tmp", no_cleanup)
+
+    async def runner():
+        permits = bot.JOB_SEMAPHORE._value
+        for _ in range(permits):
+            await bot.JOB_SEMAPHORE.acquire()
+        first = second = None
+        try:
+            first = asyncio.create_task(bot.process_url("https://example.com/video", guild_a, *_inflight_callbacks(events_a)))
+            second = asyncio.create_task(bot.process_url("https://example.com/video", guild_b, *_inflight_callbacks(events_b)))
+            for _ in range(100):
+                if len(bot._shared_jobs) == 1 and next(iter(bot._shared_jobs.values())).subscribers == 2:
+                    break
+                await asyncio.sleep(0)
+            assert len(bot._shared_jobs) == 1
+            assert next(iter(bot._shared_jobs.values())).subscribers == 2
+            assert used_targets == []
+            guild_a.premium_tier = 3
+        finally:
+            for _ in range(permits):
+                bot.JOB_SEMAPHORE.release()
+        await asyncio.gather(first, second)
+
+    asyncio.run(runner())
+    assert used_targets == [admitted_mb]
+    assert compression_calls == [(str(source), str(tmp_path / "compressed.mp4"), admitted_mb)]
+    assert [event[0] for event in events_a] == ["success"]
+    assert [event[0] for event in events_b] == ["success"]
+
+
+@pytest.mark.parametrize(
+    ("kind", "download_name"),
+    [("clip", "download_and_clip"), ("gif", "download_and_gif")],
+)
+def test_clip_and_gif_only_reject_exact_duplicate_requests(monkeypatch, tmp_path, kind, download_name):
+    guild_a = SimpleNamespace(id=1, premium_tier=0)
+    guild_b = SimpleNamespace(id=2, premium_tier=0)
+    started = asyncio.Event()
+    both_started = asyncio.Event()
+    release = asyncio.Event()
+    calls = []
+    cleaned = []
+    events_a, events_b, duplicate_events = [], [], []
+
+    async def fake_download(*args):
+        path = tmp_path / f"{len(calls)}.mp4"
+        path.write_bytes(b"media")
+        calls.append(args)
+        started.set()
+        if len(calls) == 2:
+            both_started.set()
+        await release.wait()
+        return str(path), ""
+
+    async def cleanup(filepath):
+        cleaned.append(filepath)
+
+    monkeypatch.setattr(bot, download_name, fake_download)
+    monkeypatch.setattr(bot, "cleanup_tmp", cleanup)
+
+    def process(guild, events):
+        callbacks = _inflight_callbacks(events)
+        if kind == "clip":
+            return bot.process_clip_url("https://example.com/media", guild, 1.0, 2.0,
+                                        callbacks[0], callbacks[1], callbacks[3])
+        return bot.process_gif_url("https://example.com/media", guild,
+                                   callbacks[0], callbacks[1], callbacks[3])
+
+    async def runner():
+        before = bot._queued_jobs
+        first = asyncio.create_task(process(guild_a, events_a))
+        await started.wait()
+        second = asyncio.create_task(process(guild_b, events_b))
+        duplicate = asyncio.create_task(process(guild_a, duplicate_events))
+        try:
+            await asyncio.wait_for(both_started.wait(), timeout=1)
+            await asyncio.wait_for(duplicate, timeout=1)
+            assert len(calls) == 2
+            assert bot._queued_jobs == before + 2
+            assert bot._shared_jobs == {}
+            assert duplicate_events == [("no_video", bot.INFLIGHT_MARKER)]
+        finally:
+            release.set()
+            await asyncio.gather(first, second)
+        assert [event[0] for event in events_a] == ["success"]
+        assert [event[0] for event in events_b] == ["success"]
+        assert len(cleaned) == 2
+        assert bot._queued_jobs == before
+
+    asyncio.run(runner())
+
+
+def test_different_target_mb_uses_separate_video_jobs(monkeypatch, tmp_path):
+    guild_a = SimpleNamespace(id=1, premium_tier=0)
+    guild_b = SimpleNamespace(id=2, premium_tier=3)
+    assert bot.get_target_mb(guild_a) != bot.get_target_mb(guild_b)
+    started = asyncio.Event()
+    both_started = asyncio.Event()
+    release = asyncio.Event()
+    calls = []
+    events_a, events_b = [], []
+
+    async def fake_download(url, guild, youtube_quality, target_mb=None):
+        path = tmp_path / f"{guild.id}.mp4"
+        path.write_bytes(b"video")
+        calls.append(bot.get_target_mb(guild))
+        started.set()
+        if len(calls) == 2:
+            both_started.set()
+        await release.wait()
+        return str(path), ""
+
+    async def no_cleanup(filepath):
+        pass
+
+    monkeypatch.setattr(bot, "download_and_compress", fake_download)
+    monkeypatch.setattr(bot, "cleanup_tmp", no_cleanup)
+
+    async def runner():
+        first = asyncio.create_task(bot.process_url("https://example.com/media", guild_a, *_inflight_callbacks(events_a)))
+        await started.wait()
+        second = asyncio.create_task(bot.process_url("https://example.com/media", guild_b, *_inflight_callbacks(events_b)))
+        try:
+            await asyncio.wait_for(both_started.wait(), timeout=1)
+        finally:
+            release.set()
+            await asyncio.gather(first, second)
+        assert calls == [bot.get_target_mb(guild_a), bot.get_target_mb(guild_b)]
+        assert [event[0] for event in events_a] == ["success"]
+        assert [event[0] for event in events_b] == ["success"]
+
+    asyncio.run(runner())
+
+
+def test_different_clip_bounds_use_separate_jobs(monkeypatch, tmp_path):
+    guild = SimpleNamespace(id=1, premium_tier=0)
+    started = asyncio.Event()
+    both_started = asyncio.Event()
+    release = asyncio.Event()
+    bounds = []
+    events_a, events_b = [], []
+
+    async def fake_download(url, guild, start, end):
+        path = tmp_path / f"{end}.mp4"
+        path.write_bytes(b"video")
+        bounds.append((start, end))
+        started.set()
+        if len(bounds) == 2:
+            both_started.set()
+        await release.wait()
+        return str(path), ""
+
+    async def no_cleanup(filepath):
+        pass
+
+    monkeypatch.setattr(bot, "download_and_clip", fake_download)
+    monkeypatch.setattr(bot, "cleanup_tmp", no_cleanup)
+
+    async def runner():
+        cb_a = _inflight_callbacks(events_a)
+        cb_b = _inflight_callbacks(events_b)
+        first = asyncio.create_task(bot.process_clip_url("https://example.com/media", guild, 1, 2,
+                                                          cb_a[0], cb_a[1], cb_a[3]))
+        await started.wait()
+        second = asyncio.create_task(bot.process_clip_url("https://example.com/media", guild, 1, 3,
+                                                           cb_b[0], cb_b[1], cb_b[3]))
+        try:
+            await asyncio.wait_for(both_started.wait(), timeout=1)
+        finally:
+            release.set()
+            await asyncio.gather(first, second)
+        assert bounds == [(1, 2), (1, 3)]
+        assert [event[0] for event in events_a] == ["success"]
+        assert [event[0] for event in events_b] == ["success"]
+
+    asyncio.run(runner())
+
+
+def test_shared_video_waits_for_both_deliveries_before_cleanup(monkeypatch, tmp_path):
+    guild_a = SimpleNamespace(id=1, premium_tier=0)
+    guild_b = SimpleNamespace(id=2, premium_tier=0)
+    path = tmp_path / "shared.mp4"
+    path.write_bytes(b"video")
+    started = asyncio.Event()
+    release_download = asyncio.Event()
+    release_upload = asyncio.Event()
+    cleaned = []
+    calls = []
+    errors = []
+
+    async def fake_download(*args, **kwargs):
+        calls.append(args)
+        started.set()
+        await release_download.wait()
+        return str(path), ""
+
+    async def first_success(filepath):
+        assert filepath == str(path)
+        await release_upload.wait()
+
+    async def second_success(filepath):
+        assert filepath == str(path)
+        raise RuntimeError("upload failed")
+
+    async def on_error(message):
+        errors.append(message)
+
+    async def cleanup(filepath):
+        cleaned.append(filepath)
+
+    monkeypatch.setattr(bot, "download_and_compress", fake_download)
+    monkeypatch.setattr(bot, "cleanup_tmp", cleanup)
+
+    async def runner():
+        before = bot._queued_jobs
+        first = asyncio.create_task(bot.process_url("https://example.com/media", guild_a, first_success, on_error))
+        await started.wait()
+        second = asyncio.create_task(bot.process_url("https://example.com/media", guild_b, second_success, on_error))
+        await asyncio.sleep(0)
+        assert len(calls) == 1
+        assert bot._queued_jobs == before + 1
+        assert next(iter(bot._shared_jobs.values())).task in bot._active_tasks
+        release_download.set()
+        await second
+        assert errors and "upload failed" in errors[0]
+        assert cleaned == []
+        assert bot._queued_jobs == before + 1
+        release_upload.set()
+        await first
+        assert cleaned == [str(path)]
+        assert bot._queued_jobs == before
+
+    asyncio.run(runner())
+
+
+@pytest.mark.parametrize(
+    ("log_text", "expected"),
+    [
+        ("[NOVIDEO]", "no_video"),
+        ("[TOOBIG] 25MB", "too_big"),
+        ("[ERROR] Access denied", "error"),
+    ],
+)
+def test_shared_video_failure_notifies_each_guild(monkeypatch, log_text, expected):
+    guild_a = SimpleNamespace(id=1, premium_tier=0)
+    guild_b = SimpleNamespace(id=2, premium_tier=0)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = []
+    events_a, events_b = [], []
+
+    async def fake_download(*args, **kwargs):
+        calls.append(args)
+        started.set()
+        await release.wait()
+        return None, log_text
+
+    monkeypatch.setattr(bot, "download_and_compress", fake_download)
+
+    async def runner():
+        callbacks_a = list(_inflight_callbacks(events_a))
+        if expected == "too_big":
+            async def on_too_big(message):
+                events_a.append(("too_big", message))
+            callbacks_a[2] = on_too_big
+        first = asyncio.create_task(bot.process_url("https://example.com/media", guild_a, *callbacks_a))
+        await started.wait()
+        second = asyncio.create_task(bot.process_url("https://example.com/media", guild_b, *_inflight_callbacks(events_b)))
+        await asyncio.sleep(0)
+        assert len(calls) == 1
+        release.set()
+        await asyncio.gather(first, second)
+        assert [event[0] for event in events_a] == [expected]
+        assert [event[0] for event in events_b] == ["error" if expected == "too_big" else expected]
+        assert bot._shared_jobs == {}
+
+    asyncio.run(runner())
+
+
+def test_shared_video_join_does_not_reserve_another_queue_slot(monkeypatch, tmp_path):
+    guild_a = SimpleNamespace(id=1, premium_tier=0)
+    guild_b = SimpleNamespace(id=2, premium_tier=0)
+    path = tmp_path / "shared.mp4"
+    path.write_bytes(b"video")
+    started = asyncio.Event()
+    release = asyncio.Event()
+    reservations = []
+    events_a, events_b = [], []
+
+    async def fake_download(*args, **kwargs):
+        started.set()
+        await release.wait()
+        return str(path), ""
+
+    def reserve():
+        reservations.append(True)
+        return len(reservations) == 1
+
+    async def no_cleanup(filepath):
+        pass
+
+    monkeypatch.setattr(bot, "download_and_compress", fake_download)
+    monkeypatch.setattr(bot, "_try_reserve_job_slot", reserve)
+    monkeypatch.setattr(bot, "_release_job_slot", lambda: None)
+    monkeypatch.setattr(bot, "cleanup_tmp", no_cleanup)
+
+    async def runner():
+        first = asyncio.create_task(bot.process_url("https://example.com/media", guild_a, *_inflight_callbacks(events_a)))
+        await started.wait()
+        second = asyncio.create_task(bot.process_url("https://example.com/media", guild_b, *_inflight_callbacks(events_b)))
+        await asyncio.sleep(0)
+        assert len(reservations) == 1
+        release.set()
+        await asyncio.gather(first, second)
+        assert [event[0] for event in events_a] == ["success"]
+        assert [event[0] for event in events_b] == ["success"]
+
+    asyncio.run(runner())
+
+
+def test_shared_video_survives_one_subscriber_cancellation(monkeypatch, tmp_path):
+    guild_a = SimpleNamespace(id=1, premium_tier=0)
+    guild_b = SimpleNamespace(id=2, premium_tier=0)
+    path = tmp_path / "shared.mp4"
+    path.write_bytes(b"video")
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = []
+    cleaned = []
+    events_b = []
+
+    async def fake_download(*args, **kwargs):
+        calls.append(args)
+        started.set()
+        await release.wait()
+        return str(path), ""
+
+    async def cleanup(filepath):
+        cleaned.append(filepath)
+
+    monkeypatch.setattr(bot, "download_and_compress", fake_download)
+    monkeypatch.setattr(bot, "cleanup_tmp", cleanup)
+
+    async def runner():
+        first = asyncio.create_task(bot.process_url("https://example.com/media", guild_a, *_inflight_callbacks([])))
+        await started.wait()
+        second = asyncio.create_task(bot.process_url("https://example.com/media", guild_b, *_inflight_callbacks(events_b)))
+        await asyncio.sleep(0)
+        first.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await first
+        assert cleaned == []
+        release.set()
+        await second
+        assert len(calls) == 1
+        assert events_b == [("success", str(path))]
+        assert cleaned == [str(path)]
+
+    asyncio.run(runner())
+
+
+def test_shared_video_finishes_after_all_subscribers_cancel(monkeypatch, tmp_path):
+    guild_a = SimpleNamespace(id=1, premium_tier=0)
+    guild_b = SimpleNamespace(id=2, premium_tier=0)
+    path = tmp_path / "shared.mp4"
+    path.write_bytes(b"video")
+    started = asyncio.Event()
+    release = asyncio.Event()
+    cleaned = asyncio.Event()
+    cleanup_calls = []
+    calls = []
+
+    async def fake_download(*args, **kwargs):
+        calls.append(args)
+        started.set()
+        await release.wait()
+        return str(path), ""
+
+    async def cleanup(filepath):
+        cleanup_calls.append(filepath)
+        cleaned.set()
+
+    monkeypatch.setattr(bot, "download_and_compress", fake_download)
+    monkeypatch.setattr(bot, "cleanup_tmp", cleanup)
+
+    async def runner():
+        before = bot._queued_jobs
+        first = asyncio.create_task(bot.process_url("https://example.com/media", guild_a, *_inflight_callbacks([])))
+        await started.wait()
+        second = asyncio.create_task(bot.process_url("https://example.com/media", guild_b, *_inflight_callbacks([])))
+        await asyncio.sleep(0)
+        assert len(bot._shared_jobs) == 1
+        job = next(iter(bot._shared_jobs.values()))
+        assert job.task in bot._active_tasks
+        assert job.subscribers == 2
+        first.cancel()
+        second.cancel()
+        results = await asyncio.gather(first, second, return_exceptions=True)
+        assert all(isinstance(result, asyncio.CancelledError) for result in results)
+        assert job.subscribers == 0
+        assert not job.task.done()
+        assert not job.task.cancelled()
+        assert bot._shared_jobs
+        assert bot._queued_jobs == before + 1
+        assert cleanup_calls == []
+        release.set()
+        await asyncio.wait_for(job.task, timeout=1)
+        await asyncio.wait_for(cleaned.wait(), timeout=1)
+        assert cleanup_calls == [str(path)]
+        assert bot._shared_jobs == {}
+        assert bot._queued_jobs == before
+        assert len(calls) == 1
+
+    asyncio.run(runner())
+
+
+def test_shared_job_releases_slot_before_pending_finalizer_is_cancelled(monkeypatch, tmp_path):
+    guild = SimpleNamespace(id=1, premium_tier=0)
+    path = tmp_path / "shared.mp4"
+    path.write_bytes(b"video")
+    started = asyncio.Event()
+    release = asyncio.Event()
+    cancelled_finalizers = []
+    original_spawn = bot.spawn_tracked
+    spawned = 0
+
+    async def fake_download(*args, **kwargs):
+        started.set()
+        await release.wait()
+        return str(path), ""
+
+    def cancel_pending_finalizer(coro):
+        nonlocal spawned
+        spawned += 1
+        task = original_spawn(coro)
+        if spawned == 2:
+            cancelled_finalizers.append(task)
+            task.cancel()
+        return task
+
+    monkeypatch.setattr(bot, "download_and_compress", fake_download)
+    monkeypatch.setattr(bot, "spawn_tracked", cancel_pending_finalizer)
+
+    async def runner():
+        before = bot._queued_jobs
+        subscriber = asyncio.create_task(bot.process_url("https://example.com/video", guild, *_inflight_callbacks([])))
+        await started.wait()
+        job = next(iter(bot._shared_jobs.values()))
+        subscriber.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await subscriber
+        assert job.subscribers == 0
+        release.set()
+        await job.task
+        await asyncio.sleep(0)
+        assert len(cancelled_finalizers) == 1
+        await asyncio.gather(*cancelled_finalizers, return_exceptions=True)
+        assert bot._shared_jobs == {}
+        assert bot._queued_jobs == before
 
     asyncio.run(runner())
 
@@ -183,15 +721,18 @@ def test_inflight_same_url_different_guilds_both_succeed(monkeypatch, tmp_path):
 def test_inflight_explicit_youtube_qualities_both_succeed(monkeypatch, tmp_path):
     guild = SimpleNamespace(id=1, premium_tier=0)
     started = asyncio.Event()
+    both_started = asyncio.Event()
     release = asyncio.Event()
     calls = []
     events_a, events_b = [], []
 
-    async def fake_download(url, guild, youtube_quality):
+    async def fake_download(url, guild, youtube_quality, target_mb=None):
         with tempfile.NamedTemporaryFile(dir=tmp_path, delete=False) as file:
             filepath = file.name
         calls.append(youtube_quality)
         started.set()
+        if len(calls) == 2:
+            both_started.set()
         await release.wait()
         return filepath, ""
 
@@ -207,7 +748,7 @@ def test_inflight_explicit_youtube_qualities_both_succeed(monkeypatch, tmp_path)
         await started.wait()
         second = asyncio.create_task(bot.process_url(url, guild, *_inflight_callbacks(events_b), youtube_quality="1080"))
         try:
-            await asyncio.sleep(0)
+            await asyncio.wait_for(both_started.wait(), timeout=1)
             assert calls == ["720", "1080"]
         finally:
             release.set()
@@ -227,7 +768,7 @@ def test_inflight_default_youtube_quality_captured_at_admission(monkeypatch, tmp
     events = []
     monkeypatch.setattr(bot, "get_youtube_quality", lambda: current_quality[0])
 
-    async def fake_download(url, guild, youtube_quality):
+    async def fake_download(url, guild, youtube_quality, target_mb=None):
         with tempfile.NamedTemporaryFile(dir=tmp_path, delete=False) as file:
             filepath = file.name
         calls.append(youtube_quality)
@@ -260,7 +801,7 @@ def test_inflight_exact_duplicate_rejected_then_admitted(monkeypatch, tmp_path):
     calls = []
     events_a, events_b, events_c = [], [], []
 
-    async def fake_download(url, guild, youtube_quality):
+    async def fake_download(url, guild, youtube_quality, target_mb=None):
         with tempfile.NamedTemporaryFile(dir=tmp_path, delete=False) as file:
             filepath = file.name
         calls.append(filepath)
@@ -280,7 +821,7 @@ def test_inflight_exact_duplicate_rejected_then_admitted(monkeypatch, tmp_path):
         await started.wait()
         second = asyncio.create_task(bot.process_url(url, guild, *_inflight_callbacks(events_b), youtube_quality="720"))
         try:
-            await second
+            await asyncio.wait_for(second, timeout=0.5)
             assert len(calls) == 1
             assert events_b == [("no_video", bot.INFLIGHT_MARKER)]
         finally:

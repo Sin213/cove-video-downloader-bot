@@ -18,7 +18,7 @@ A self-hosted Discord bot that automatically detects video links in chat and dow
 - **Silent ignore** — if a link has no video (image posts, text posts, rate limits), the bot removes the ⏳ and does nothing
 - **Slash commands** — `/download`, `/audio` (MP3), `/clip` (time range), `/gif` (max 10s), `/status`, `/help`, plus admin-only `/health` and `/quality`
 - **Cookie support** — place a `cookies.txt` next to `bot.py` for sites that require authentication
-- **Friend server mode** — optional second server where the bot deletes the original message and posts plain-text attribution (with a `/neet` command to exempt your next message)
+- **Friend server mode** - optional friend servers where the bot deletes the original message and posts plain-text attribution (with a `/neet` command to exempt your next message)
 
 ---
 
@@ -88,11 +88,12 @@ Edit `.env` and fill in your values:
 DISCORD_TOKEN=your_token_here
 GUILD_ID=your_main_guild_id_here
 FRIEND_GUILD_ID=your_friend_guild_id_here  # optional
+FRIEND_GUILD_IDS=111,222                    # optional comma-separated IDs
 ```
 
 To get a Guild ID: enable Developer Mode in Discord → right-click your server → **Copy Server ID**.
 
-`FRIEND_GUILD_ID` is optional. If omitted or set to `0`, the bot behaves identically on all servers.
+`FRIEND_GUILD_ID` remains supported. `FRIEND_GUILD_IDS` accepts comma-separated IDs, and both settings are unioned. If neither is set, friend server mode is disabled.
 
 ### 3. (Optional) Add cookies
 
@@ -173,7 +174,7 @@ docker compose --profile test run --build --rm cove-tests
 
 ## Friend Server Mode
 
-When `FRIEND_GUILD_ID` is set, the bot activates a special mode in that server only:
+Friend server mode applies to every guild configured through `FRIEND_GUILD_ID` or `FRIEND_GUILD_IDS`. The settings are unioned; if neither is set, the mode is disabled.
 
 | Behavior | Main Server | Friend Server |
 |---|---|---|

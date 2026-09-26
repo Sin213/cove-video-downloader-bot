@@ -64,6 +64,23 @@ def _require_int_env(name: str, *, allow_zero: bool = True, default: str | None 
     return value
 
 
+def _parse_friend_guild_ids() -> set[int]:
+    guild_ids = set()
+    for raw_id in os.getenv("FRIEND_GUILD_IDS", "").split(","):
+        token = raw_id.strip()
+        if not token:
+            continue
+        try:
+            guild_id = int(token)
+        except ValueError:
+            sys.exit("[Cove] Env var FRIEND_GUILD_IDS must contain only non-negative integers.")
+        if guild_id < 0:
+            sys.exit("[Cove] Env var FRIEND_GUILD_IDS must contain only non-negative integers.")
+        if guild_id:
+            guild_ids.add(guild_id)
+    return guild_ids
+
+
 def _env_bool(name: str, default: str = "0") -> bool:
     return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
 
@@ -97,6 +114,9 @@ if not TOKEN:
 
 GUILD_ID        = _require_int_env("GUILD_ID", allow_zero=False)
 FRIEND_GUILD_ID = _require_int_env("FRIEND_GUILD_ID", allow_zero=True, default="0")
+EFFECTIVE_FRIEND_GUILD_IDS: frozenset[int] = frozenset(
+    _parse_friend_guild_ids() | ({FRIEND_GUILD_ID} if FRIEND_GUILD_ID else set())
+)
 
 _WHITELIST_RAW = os.getenv("WHITELIST_USER_IDS", "")
 WHITELIST_IDS = {
@@ -1693,7 +1713,7 @@ async def validate_manual_url(url: str) -> tuple[bool, str]:
 
 
 def is_friend_server(guild: discord.Guild | None) -> bool:
-    return FRIEND_GUILD_ID != 0 and guild is not None and guild.id == FRIEND_GUILD_ID
+    return guild is not None and guild.id in EFFECTIVE_FRIEND_GUILD_IDS
 
 
 def get_target_mb(guild: discord.Guild | None) -> float:
@@ -4425,8 +4445,8 @@ class CoveBot(discord.Client):
         guild = discord.Object(id=GUILD_ID)
         self.tree.copy_global_to(guild=guild)
         await self._sync_tree_with_timeout(guild, "Primary")
-        if FRIEND_GUILD_ID != 0:
-            friend_guild = discord.Object(id=FRIEND_GUILD_ID)
+        for friend_guild_id in sorted(EFFECTIVE_FRIEND_GUILD_IDS - {GUILD_ID}):
+            friend_guild = discord.Object(id=friend_guild_id)
             self.tree.copy_global_to(guild=friend_guild)
             await self._sync_tree_with_timeout(friend_guild, "Friend")
 
@@ -5187,7 +5207,7 @@ async def help_cmd(interaction: discord.Interaction):
         "`/quality [resolution]` - admin YouTube default quality",
         "`/health` - admin runtime self-check",
     ]
-    if FRIEND_GUILD_ID != 0 and is_friend_server(interaction.guild):
+    if is_friend_server(interaction.guild):
         commands.append("`/neet` - friend-server cooldown")
     await interaction.response.send_message("\n".join(commands), ephemeral=True)
 
@@ -5260,11 +5280,11 @@ async def quality_cmd_error(interaction: discord.Interaction, error: app_command
     raise error
 
 
-if FRIEND_GUILD_ID != 0:
+if EFFECTIVE_FRIEND_GUILD_IDS:
     @client.tree.command(
         name="neet",
         description="Ignore your next message in the friend server",
-        guild=discord.Object(id=FRIEND_GUILD_ID),
+        guilds=[discord.Object(id=g) for g in sorted(EFFECTIVE_FRIEND_GUILD_IDS)],
     )
     async def neet_cmd(interaction: discord.Interaction):
         if not is_friend_server(interaction.guild):

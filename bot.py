@@ -6,6 +6,7 @@ from discord import app_commands
 import asyncio
 import ipaddress
 import logging
+import math
 import os
 import re
 import shutil
@@ -146,6 +147,17 @@ DELETE_TTL_SECONDS     = _require_int_env("DELETE_TTL_SECONDS", default="21600")
 FRIEND_POST_TTL_SECONDS = _require_int_env("FRIEND_POST_TTL_SECONDS", default="86400")
 YT_DLP_FRAGMENTS       = _require_int_env("YT_DLP_FRAGMENTS", default="16")
 MAX_FILESIZE_MB        = _require_int_env("MAX_FILESIZE_MB", default="500")
+MAX_TEMP_USAGE_MB      = _require_int_env("MAX_TEMP_USAGE_MB", default="0")
+MIN_TEMP_FREE_MB       = _require_int_env("MIN_TEMP_FREE_MB", default="0")
+TEMP_JOB_RESERVE_MB    = _require_int_env("TEMP_JOB_RESERVE_MB", default="0")
+for _temp_config_name, _temp_config_value in (
+    ("MAX_TEMP_USAGE_MB", MAX_TEMP_USAGE_MB),
+    ("MIN_TEMP_FREE_MB", MIN_TEMP_FREE_MB),
+    ("TEMP_JOB_RESERVE_MB", TEMP_JOB_RESERVE_MB),
+):
+    if _temp_config_value < 0:
+        sys.exit(f"[Cove] Env var {_temp_config_name} must be non-negative.")
+TEMP_JOB_AMPLIFICATION_FACTOR = 2.2
 MAX_URL_LENGTH         = _require_int_env("MAX_URL_LENGTH", allow_zero=False, default="2048")
 NEET_TTL_SECONDS       = _require_int_env("NEET_TTL_SECONDS", allow_zero=False, default="600")
 FAST_SOURCE_MODE       = _env_bool("FAST_SOURCE_MODE", "0")
@@ -164,6 +176,7 @@ ADMIN_HEALTH_COMMAND   = _env_bool("ADMIN_HEALTH_COMMAND", "1")
 REDDIT_PRECHECK_TIMEOUT = _require_int_env("REDDIT_PRECHECK_TIMEOUT", allow_zero=False, default="3")
 
 JOB_SEMAPHORE = asyncio.Semaphore(MAX_CONCURRENT_JOBS)
+_temp_reserved_mb = 0
 ENCODE_SEMAPHORE = asyncio.Semaphore(NVENC_MAX_SESSIONS)
 GIF_SEMAPHORE = asyncio.Semaphore(max(1, MAX_CONCURRENT_JOBS // 2))
 
@@ -1892,6 +1905,33 @@ def _command_version(command: str, args: list[str]) -> tuple[bool, str]:
     return True, version[:120]
 
 
+def _temp_storage_policy(usage) -> tuple[int, int, int, int, int, int]:
+    """Return total, free, budget, free floor, job estimate, and admission weight in MB."""
+    mb = 1024 * 1024
+    total_mb, free_mb = usage.total // mb, usage.free // mb
+    budget_mb = MAX_TEMP_USAGE_MB if MAX_TEMP_USAGE_MB > 0 else round(total_mb * 0.75)
+    floor_mb = MIN_TEMP_FREE_MB if MIN_TEMP_FREE_MB > 0 else min(512, round(total_mb * 0.10))
+    estimated_job_mb = math.ceil(MAX_FILESIZE_MB * TEMP_JOB_AMPLIFICATION_FACTOR)
+    reserve_mb = TEMP_JOB_RESERVE_MB if TEMP_JOB_RESERVE_MB > 0 else min(estimated_job_mb, budget_mb)
+    return total_mb, free_mb, budget_mb, floor_mb, estimated_job_mb, reserve_mb
+
+
+def _try_reserve_temp_storage() -> int | None:
+    """Atomically check both admission gates and charge one processing job."""
+    global _temp_reserved_mb
+    tmp_root = TMP_BASE or tempfile.gettempdir()
+    try:
+        usage = shutil.disk_usage(tmp_root)
+    except OSError as e:
+        log.warning("[temp] Could not inspect temporary storage: %s", e)
+        return None
+    _, free_mb, budget_mb, floor_mb, _, reserve_mb = _temp_storage_policy(usage)
+    if free_mb < floor_mb or _temp_reserved_mb + reserve_mb > budget_mb:
+        return None
+    _temp_reserved_mb += reserve_mb
+    return reserve_mb
+
+
 def build_health_report() -> str:
     checks = []
     ytdlp_ok, ytdlp_message = _check_ytdlp_version()
@@ -1920,7 +1960,13 @@ def build_health_report() -> str:
         free_gb = usage.free / (1024 ** 3)
         total_gb = usage.total / (1024 ** 3)
         disk_ok = usage.free > 512 * 1024 * 1024
-        disk_message = f"{free_gb:.1f} GB free / {total_gb:.1f} GB total at {tmp_root}"
+        total_mb, free_mb, budget_mb, floor_mb, estimated_job_mb, reserve_mb = _temp_storage_policy(usage)
+        disk_message = (
+            f"{free_gb:.1f} GB free / {total_gb:.1f} GB total at {tmp_root}; "
+            f"total_mb={total_mb}, free_mb={free_mb}, budget_mb={budget_mb}, "
+            f"reserved_mb={_temp_reserved_mb}, floor_mb={floor_mb}, "
+            f"reserve_mb={reserve_mb}, estimated_job_mb={estimated_job_mb}"
+        )
     except OSError as e:
         disk_ok = False
         disk_message = f"failed: {e}"
@@ -4171,43 +4217,52 @@ async def _run_download_phase(
     Returns (filepath, log_text) on success, or None if an error/no-video callback
     handled the result.
     """
+    global _temp_reserved_mb
     async with JOB_SEMAPHORE:
+        charged_mb = _try_reserve_temp_storage()
+        if charged_mb is None:
+            download_coro.close()
+            await _safe_notify(on_error, kind, BUSY_MESSAGE)
+            return None
         try:
-            filepath, log_text = await download_coro
-        except Exception as e:
-            log.exception("Unhandled exception during %s", kind)
-            await _safe_notify(on_error, kind, f"Unexpected error: {e}")
-            return None
-
-        novideo, toobig_str, error_str = _parse_log_markers(log_text)
-
-        if novideo:
-            if on_no_video:
-                await _safe_notify(on_no_video, kind, log_text)
-            return None
-
-        if toobig_str:
-            if on_too_big:
-                await _safe_notify(on_too_big, kind, toobig_str)
+            try:
+                filepath, log_text = await download_coro
+            except Exception as e:
+                log.exception("Unhandled exception during %s", kind)
+                await _safe_notify(on_error, kind, f"Unexpected error: {e}")
                 return None
-            if too_big_msg:
-                await _safe_notify(
-                    on_error,
-                    kind,
-                    too_big_msg.format(toobig_str=toobig_str, max_min=MAX_DURATION_SECONDS // 60),
-                )
+
+            novideo, toobig_str, error_str = _parse_log_markers(log_text)
+
+            if novideo:
+                if on_no_video:
+                    await _safe_notify(on_no_video, kind, log_text)
                 return None
-            # otherwise fall through, matching legacy clip behavior
 
-        if not filepath or not os.path.exists(filepath):
-            msg = error_str or no_file_msg
-            log.error("%s failed. Full log:\n%s", kind.capitalize(), log_text)
-            if error_str and "cookies" in error_str.lower():
-                spawn_tracked(_maybe_send_cookie_warning(client))
-            await _safe_notify(on_error, kind, msg)
-            return None
+            if toobig_str:
+                if on_too_big:
+                    await _safe_notify(on_too_big, kind, toobig_str)
+                    return None
+                if too_big_msg:
+                    await _safe_notify(
+                        on_error,
+                        kind,
+                        too_big_msg.format(toobig_str=toobig_str, max_min=MAX_DURATION_SECONDS // 60),
+                    )
+                    return None
+                # otherwise fall through, matching legacy clip behavior
 
-        return filepath, log_text
+            if not filepath or not os.path.exists(filepath):
+                msg = error_str or no_file_msg
+                log.error("%s failed. Full log:\n%s", kind.capitalize(), log_text)
+                if error_str and "cookies" in error_str.lower():
+                    spawn_tracked(_maybe_send_cookie_warning(client))
+                await _safe_notify(on_error, kind, msg)
+                return None
+
+            return filepath, log_text
+        finally:
+            _temp_reserved_mb = max(0, _temp_reserved_mb - charged_mb)
 
 
 async def _run_shared_download(download_coro_factory, *, kind, too_big_msg, no_file_msg):

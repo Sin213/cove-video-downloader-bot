@@ -1,10 +1,13 @@
 import asyncio
+import gc
 import json
 import os
 import sqlite3
+import subprocess
 import sys
 import tempfile
 import time
+import warnings
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import MagicMock
@@ -1238,6 +1241,415 @@ def test_default_limit_gif_uses_eight_seconds_and_380px(monkeypatch, tmp_path):
 
 
 # ── PR B: release job slot before upload ─────────────────────────────────────
+
+
+def test_temp_admission_rejects_low_free_space(monkeypatch):
+    mb = 1024 * 1024
+    monkeypatch.setattr(bot.shutil, "disk_usage", lambda root: SimpleNamespace(total=1024 * mb, free=50 * mb))
+    monkeypatch.setattr(bot, "MAX_TEMP_USAGE_MB", 0, raising=False)
+    monkeypatch.setattr(bot, "MIN_TEMP_FREE_MB", 0, raising=False)
+    monkeypatch.setattr(bot, "TEMP_JOB_RESERVE_MB", 0, raising=False)
+    called, errors = [], []
+    make_tmpdir = MagicMock()
+    monkeypatch.setattr(bot, "_make_job_tmpdir", make_tmpdir)
+
+    async def download():
+        called.append(True)
+        make_tmpdir()
+        return None, ""
+
+    async def on_error(message):
+        errors.append(message)
+
+    async def runner():
+        before = bot.JOB_SEMAPHORE._value
+        result = await bot._run_download_phase(download(), on_error, None)
+        assert result is None
+        assert called == []
+        make_tmpdir.assert_not_called()
+        assert errors == [bot.BUSY_MESSAGE]
+        assert bot.JOB_SEMAPHORE._value == before
+        assert getattr(bot, "_temp_reserved_mb", 0) == 0
+
+    asyncio.run(runner())
+
+
+def test_temp_admission_blocks_burst_with_stale_free_space(monkeypatch):
+    mb = 1024 * 1024
+    monkeypatch.setattr(bot.shutil, "disk_usage", lambda root: SimpleNamespace(total=1024 * mb, free=1000 * mb))
+    monkeypatch.setattr(bot, "MAX_TEMP_USAGE_MB", 0, raising=False)
+    monkeypatch.setattr(bot, "MIN_TEMP_FREE_MB", 0, raising=False)
+    monkeypatch.setattr(bot, "TEMP_JOB_RESERVE_MB", 0, raising=False)
+    started, release = asyncio.Event(), asyncio.Event()
+    called, errors = [], []
+
+    async def download_a():
+        called.append("A")
+        started.set()
+        await release.wait()
+        return None, ""
+
+    async def download_b():
+        called.append("B")
+        return None, ""
+
+    async def on_error(message):
+        errors.append(message)
+
+    async def runner():
+        first = asyncio.create_task(bot._run_download_phase(download_a(), on_error, None))
+        await started.wait()
+        try:
+            assert getattr(bot, "_temp_reserved_mb", 0) == 768
+            await bot._run_download_phase(download_b(), on_error, None)
+            assert called == ["A"]
+            assert bot.BUSY_MESSAGE in errors
+        finally:
+            release.set()
+            await first
+
+    asyncio.run(runner())
+
+
+def _mock_temp_capacity(monkeypatch, total_mb=1024, free_mb=1000, **config):
+    mb = 1024 * 1024
+    disk_usage = MagicMock(return_value=SimpleNamespace(total=total_mb * mb, free=free_mb * mb))
+    monkeypatch.setattr(bot.shutil, "disk_usage", disk_usage)
+    for name, value in {
+        "MAX_TEMP_USAGE_MB": 0,
+        "MIN_TEMP_FREE_MB": 0,
+        "TEMP_JOB_RESERVE_MB": 0,
+        "MAX_FILESIZE_MB": 500,
+        **config,
+    }.items():
+        monkeypatch.setattr(bot, name, value)
+    monkeypatch.setattr(bot, "_temp_reserved_mb", 0)
+    return disk_usage
+
+
+def test_temp_policy_first_docker_job_and_bare_metal_capacity(monkeypatch):
+    disk_usage = _mock_temp_capacity(monkeypatch)
+    assert bot._temp_storage_policy(disk_usage.return_value) == (1024, 1000, 768, 102, 1100, 768)
+    assert bot._try_reserve_temp_storage() == 768
+    assert bot._temp_reserved_mb == 768
+    assert bot._try_reserve_temp_storage() is None
+    monkeypatch.setattr(bot, "_temp_reserved_mb", 0)
+
+    disk_usage = _mock_temp_capacity(monkeypatch, total_mb=31719, free_mb=31000)
+    assert bot._temp_storage_policy(disk_usage.return_value) == (31719, 31000, 23789, 512, 1100, 1100)
+    for _ in range(8):
+        assert bot._try_reserve_temp_storage() == 1100
+    assert bot._temp_reserved_mb == 8800
+    assert disk_usage.call_count == 8
+
+
+def test_temp_reserve_independent_of_concurrency_and_limited_by_filesize(monkeypatch):
+    disk_usage = _mock_temp_capacity(monkeypatch, total_mb=31719, free_mb=31000)
+    for concurrency in (8, 32):
+        monkeypatch.setattr(bot, "MAX_CONCURRENT_JOBS", concurrency)
+        assert bot._temp_storage_policy(disk_usage.return_value)[-1] == 1100
+    for _ in range(21):
+        assert bot._try_reserve_temp_storage() == 1100
+    assert bot._temp_reserved_mb == 23100
+    assert bot._try_reserve_temp_storage() is None
+
+    monkeypatch.setattr(bot, "_temp_reserved_mb", 0)
+    monkeypatch.setattr(bot, "MAX_FILESIZE_MB", 2000)
+    assert bot._temp_storage_policy(disk_usage.return_value)[-2:] == (4400, 4400)
+    for _ in range(5):
+        assert bot._try_reserve_temp_storage() == 4400
+    assert bot._try_reserve_temp_storage() is None
+
+
+def test_temp_policy_explicit_overrides(monkeypatch):
+    usage = _mock_temp_capacity(
+        monkeypatch, MAX_TEMP_USAGE_MB=1300, MIN_TEMP_FREE_MB=1100, TEMP_JOB_RESERVE_MB=600
+    ).return_value
+    assert bot._temp_storage_policy(usage) == (1024, 1000, 1300, 1100, 1100, 600)
+    assert bot._try_reserve_temp_storage() is None
+
+
+def test_temp_queued_job_has_no_reservation(monkeypatch):
+    disk_usage = _mock_temp_capacity(monkeypatch)
+    semaphore = asyncio.Semaphore(1)
+    monkeypatch.setattr(bot, "JOB_SEMAPHORE", semaphore)
+    started = asyncio.Event()
+
+    async def download():
+        started.set()
+        assert bot._temp_reserved_mb == 768
+        return None, "[ERROR] done"
+
+    async def on_error(message):
+        pass
+
+    async def runner():
+        await semaphore.acquire()
+        task = asyncio.create_task(bot._run_download_phase(download(), on_error, None))
+        await asyncio.sleep(0)
+        assert not started.is_set()
+        assert bot._temp_reserved_mb == 0
+        assert disk_usage.call_count == 0
+        semaphore.release()
+        await task
+        assert started.is_set()
+        assert bot._temp_reserved_mb == 0
+        assert semaphore._value == 1
+
+    asyncio.run(runner())
+
+
+def test_temp_rejection_closes_unawaited_coroutine(monkeypatch):
+    _mock_temp_capacity(monkeypatch, free_mb=50)
+    called = []
+
+    async def download():
+        called.append(True)
+
+    async def on_error(message):
+        assert message == bot.BUSY_MESSAGE
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", RuntimeWarning)
+        asyncio.run(bot._run_download_phase(download(), on_error, None))
+        gc.collect()
+    assert not called
+    assert not [warning for warning in caught if "never awaited" in str(warning.message)]
+
+
+def test_temp_shared_job_reserves_once(monkeypatch):
+    _mock_temp_capacity(monkeypatch)
+    guild_a = SimpleNamespace(id=1, premium_tier=0)
+    guild_b = SimpleNamespace(id=2, premium_tier=0)
+    started, release = asyncio.Event(), asyncio.Event()
+    events_a, events_b = [], []
+    calls = []
+
+    async def fake_download(*args, **kwargs):
+        calls.append(True)
+        started.set()
+        await release.wait()
+        return None, "[ERROR] done"
+
+    monkeypatch.setattr(bot, "download_and_compress", fake_download)
+
+    async def runner():
+        url = "https://example.com/shared-temp"
+        first = asyncio.create_task(bot.process_url(url, guild_a, *_inflight_callbacks(events_a)))
+        await started.wait()
+        second = asyncio.create_task(bot.process_url(url, guild_b, *_inflight_callbacks(events_b)))
+        try:
+            await asyncio.sleep(0)
+            assert len(bot._shared_jobs) == 1
+            assert next(iter(bot._shared_jobs.values())).subscribers == 2
+            assert bot._temp_reserved_mb == 768
+            assert calls == [True]
+        finally:
+            release.set()
+            await asyncio.gather(first, second)
+        assert bot._temp_reserved_mb == 0
+        assert [event[0] for event in events_a] == ["error"]
+        assert [event[0] for event in events_b] == ["error"]
+        assert bot._shared_jobs == {}
+
+    asyncio.run(runner())
+
+
+def test_temp_shared_admission_rejection_notifies_all_subscribers(monkeypatch):
+    _mock_temp_capacity(monkeypatch)
+    guild_a = SimpleNamespace(id=1, premium_tier=0)
+    guild_b = SimpleNamespace(id=2, premium_tier=0)
+    started, release = asyncio.Event(), asyncio.Event()
+    events_a, events_b = [], []
+    calls = []
+
+    async def holder():
+        started.set()
+        await release.wait()
+        return None, "[ERROR] done"
+
+    async def fake_download(*args, **kwargs):
+        calls.append(True)
+        return None, "[ERROR] should not run"
+
+    async def on_error(message):
+        pass
+
+    monkeypatch.setattr(bot, "download_and_compress", fake_download)
+
+    async def runner():
+        first = asyncio.create_task(bot._run_download_phase(holder(), on_error, None))
+        await started.wait()
+        try:
+            url = "https://example.com/rejected-shared-temp"
+            second = asyncio.create_task(bot.process_url(url, guild_a, *_inflight_callbacks(events_a)))
+            third = asyncio.create_task(bot.process_url(url, guild_b, *_inflight_callbacks(events_b)))
+            await asyncio.gather(second, third)
+            assert calls == []
+            assert events_a == [("error", bot.BUSY_MESSAGE)]
+            assert events_b == [("error", bot.BUSY_MESSAGE)]
+            assert bot._temp_reserved_mb == 768
+            assert bot._shared_jobs == {}
+        finally:
+            release.set()
+            await first
+        assert bot._temp_reserved_mb == 0
+
+    asyncio.run(runner())
+
+
+def test_temp_clip_and_gif_reserve_independently(monkeypatch):
+    _mock_temp_capacity(monkeypatch, total_mb=31719, free_mb=31000)
+    guild = SimpleNamespace(id=1, premium_tier=0)
+    started = asyncio.Event()
+    release = asyncio.Event()
+    calls = []
+
+    async def fake_download(*args, **kwargs):
+        calls.append(True)
+        if len(calls) == 2:
+            started.set()
+        await release.wait()
+        return None, "[ERROR] done"
+
+    async def on_success(filepath):
+        pytest.fail("unexpected upload")
+
+    async def on_error(message):
+        pass
+
+    monkeypatch.setattr(bot, "download_and_clip", fake_download)
+    monkeypatch.setattr(bot, "download_and_gif", fake_download)
+
+    async def runner():
+        clip = asyncio.create_task(bot.process_clip_url("https://example.com/clip", guild, 0, 1, on_success, on_error))
+        gif = asyncio.create_task(bot.process_gif_url("https://example.com/gif", guild, on_success, on_error))
+        try:
+            await started.wait()
+            assert bot._temp_reserved_mb == 2200
+        finally:
+            release.set()
+            await asyncio.gather(clip, gif)
+        assert bot._temp_reserved_mb == 0
+
+    asyncio.run(runner())
+
+
+@pytest.mark.parametrize("outcome", ["success", "error", "no_video", "too_big", "exception", "cancelled"])
+def test_temp_reservation_released_on_every_terminal_path(monkeypatch, tmp_path, outcome):
+    _mock_temp_capacity(monkeypatch, total_mb=31719, free_mb=31000)
+    monkeypatch.setattr(bot, "_temp_reserved_mb", 123)
+    path = tmp_path / "media.mp4"
+    path.write_bytes(b"small")
+    started, release = asyncio.Event(), asyncio.Event()
+    notices = []
+
+    async def download():
+        assert bot._temp_reserved_mb == 1223
+        if outcome == "cancelled":
+            started.set()
+            await release.wait()
+        if outcome == "exception":
+            raise RuntimeError("boom")
+        return {
+            "success": (str(path), ""),
+            "error": (None, "[ERROR] done"),
+            "no_video": (None, "[NOVIDEO]"),
+            "too_big": (None, "[TOOBIG] huge"),
+        }.get(outcome, (None, ""))
+
+    async def on_notice(message):
+        notices.append(message)
+
+    async def runner():
+        if outcome == "cancelled":
+            task = asyncio.create_task(bot._run_download_phase(download(), on_notice, on_notice, on_too_big=on_notice))
+            await started.wait()
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            result = await bot._run_download_phase(download(), on_notice, on_notice, on_too_big=on_notice)
+            assert (result is not None) == (outcome == "success")
+        assert bot._temp_reserved_mb == 123
+
+    asyncio.run(runner())
+    if outcome not in ("success", "cancelled"):
+        assert notices
+
+
+def test_temp_release_uses_charged_weight_and_clamps(monkeypatch):
+    _mock_temp_capacity(monkeypatch, total_mb=31719, free_mb=31000)
+    monkeypatch.setattr(bot, "_temp_reserved_mb", 123)
+
+    async def download():
+        assert bot._temp_reserved_mb == 1223
+        monkeypatch.setattr(bot, "MAX_FILESIZE_MB", 2000)
+        return None, "[ERROR] done"
+
+    async def on_error(message):
+        pass
+
+    asyncio.run(bot._run_download_phase(download(), on_error, None))
+    assert bot._temp_reserved_mb == 123
+
+    async def reset_counter():
+        bot._temp_reserved_mb = 0
+        return None, "[ERROR] done"
+
+    asyncio.run(bot._run_download_phase(reset_counter(), on_error, None))
+    assert bot._temp_reserved_mb == 0
+
+
+def test_temp_disk_usage_failure_fails_closed(monkeypatch, caplog):
+    disk_usage = _mock_temp_capacity(monkeypatch)
+    disk_usage.side_effect = OSError("unavailable")
+    called, errors = [], []
+
+    async def download():
+        called.append(True)
+
+    async def on_error(message):
+        errors.append(message)
+
+    async def runner():
+        before = bot.JOB_SEMAPHORE._value
+        assert await bot._run_download_phase(download(), on_error, None) is None
+        assert bot.JOB_SEMAPHORE._value == before
+
+    asyncio.run(runner())
+    assert called == []
+    assert errors == [bot.BUSY_MESSAGE]
+    assert bot._temp_reserved_mb == 0
+    assert "Could not inspect temporary storage" in caplog.text
+    assert disk_usage.call_count == 1
+
+
+def test_health_includes_temp_policy_and_reservation(monkeypatch):
+    disk_usage = _mock_temp_capacity(monkeypatch)
+    monkeypatch.setattr(bot, "_temp_reserved_mb", 768)
+    monkeypatch.setattr(bot, "_command_version", lambda *args: (True, "mock"))
+    report = bot.build_health_report()
+    for field in ("total_mb=1024", "free_mb=1000", "budget_mb=768", "reserved_mb=768",
+                  "floor_mb=102", "reserve_mb=768", "estimated_job_mb=1100"):
+        assert field in report
+    assert disk_usage.call_count == 1
+
+
+@pytest.mark.parametrize("config_name", ["MAX_TEMP_USAGE_MB", "MIN_TEMP_FREE_MB", "TEMP_JOB_RESERVE_MB"])
+def test_temp_negative_config_rejected_at_startup(config_name):
+    env = {
+        **os.environ,
+        "PYTHON_DOTENV_DISABLED": "1",
+        "DISCORD_TOKEN": "test-token-not-real",
+        "GUILD_ID": "1",
+        config_name: "-1",
+    }
+    result = subprocess.run(
+        [sys.executable, "-c", "import bot"], env=env, capture_output=True, text=True, timeout=10
+    )
+    assert result.returncode != 0
+    assert f"Env var {config_name} must be non-negative" in result.stderr
 
 
 def test_run_download_phase_releases_semaphore_before_return():

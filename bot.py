@@ -1741,25 +1741,18 @@ def _check_bot_permissions(channel: discord.abc.GuildChannel, bot_member: discor
     return True, ""
 
 
-def clean_env():
-    blocked_prefixes = (
-        "LD_",
-        "PYTHON",
-        "SSLKEYLOGFILE",
-        "GIT_",
-    )
-    blocked_names = {
-        "DYLD_LIBRARY_PATH",
-        "DYLD_INSERT_LIBRARIES",
-        "FFREPORT",
-        "AV_LOG_FORCE_COLOR",
-    }
-    env = {
+_SUBPROCESS_ENV_NAMES = {
+    "PATH", "HOME", "LANG", "SSL_CERT_FILE", "SSL_CERT_DIR",
+    "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
+}
+
+
+def clean_env() -> dict[str, str]:
+    return {
         key: value
         for key, value in os.environ.items()
-        if key not in blocked_names and not any(key.startswith(prefix) for prefix in blocked_prefixes)
+        if key in _SUBPROCESS_ENV_NAMES or key.startswith("LC_")
     }
-    return env
 
 
 ENV = clean_env()

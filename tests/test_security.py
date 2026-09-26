@@ -126,13 +126,84 @@ def test_clean_env_strips_injection_hooks(monkeypatch):
     monkeypatch.setenv("PYTHONHOME", "/tmp/evil")
     monkeypatch.setenv("LD_PRELOAD", "/tmp/evil.so")
     monkeypatch.setenv("SSLKEYLOGFILE", "/tmp/keys.log")
-    monkeypatch.setenv("PATH", "/usr/bin")
+    monkeypatch.setenv("GIT_CONFIG_COUNT", "1")
     env = clean_env()
     assert "PYTHONPATH" not in env
     assert "PYTHONHOME" not in env
     assert "LD_PRELOAD" not in env
     assert "SSLKEYLOGFILE" not in env
-    assert env["PATH"] == "/usr/bin"
+    assert "GIT_CONFIG_COUNT" not in env
+
+
+def test_clean_env_blocks_unknown_secrets(monkeypatch):
+    monkeypatch.setenv("DISCORD_TOKEN", "synthetic-discord-secret")
+    monkeypatch.setenv("COVE_SYNTHETIC_SECRET", "synthetic-unknown-secret")
+    env = clean_env()
+    assert "DISCORD_TOKEN" not in env
+    assert "COVE_SYNTHETIC_SECRET" not in env
+
+
+def test_clean_env_preserves_path_and_home(monkeypatch):
+    monkeypatch.setenv("PATH", "/synthetic/bin:/other/bin")
+    monkeypatch.setenv("HOME", "/synthetic/home")
+    env = clean_env()
+    assert env["PATH"] == "/synthetic/bin:/other/bin"
+    assert env["HOME"] == "/synthetic/home"
+
+
+def test_clean_env_preserves_locale(monkeypatch):
+    monkeypatch.setenv("LANG", "en_US.UTF-8")
+    monkeypatch.setenv("LC_CTYPE", "fr_FR.UTF-8")
+    env = clean_env()
+    assert env["LANG"] == "en_US.UTF-8"
+    assert env["LC_CTYPE"] == "fr_FR.UTF-8"
+
+
+def test_clean_env_preserves_certificate_paths(monkeypatch):
+    paths = {
+        "SSL_CERT_FILE": "/synthetic/cert.pem",
+        "SSL_CERT_DIR": "/synthetic/certs",
+        "REQUESTS_CA_BUNDLE": "/synthetic/requests.pem",
+        "CURL_CA_BUNDLE": "/synthetic/curl.pem",
+    }
+    for key, value in paths.items():
+        monkeypatch.setenv(key, value)
+    env = clean_env()
+    for key, value in paths.items():
+        assert env[key] == value
+
+
+def test_clean_env_blocks_cove_config_and_proxies(monkeypatch):
+    blocked = (
+        "GUILD_ID", "COVE_DATA_DIR", "YOUTUBE_QUALITY",
+        "HTTPS_PROXY", "HTTP_PROXY", "NO_PROXY", "https_proxy",
+    )
+    for key in blocked:
+        monkeypatch.setenv(key, "synthetic-value")
+    env = clean_env()
+    assert all(key not in env for key in blocked)
+
+
+def test_module_env_excludes_discord_token():
+    assert "DISCORD_TOKEN" not in bot.ENV
+
+
+def test_run_subprocess_passes_shared_env(monkeypatch):
+    class SubprocessIntercepted(Exception):
+        pass
+
+    captured = {}
+
+    async def fake_create_subprocess_exec(*args, **kwargs):
+        captured.update(kwargs)
+        raise SubprocessIntercepted
+
+    monkeypatch.setenv("COVE_SYNTHETIC_SECRET", "synthetic-unknown-secret")
+    monkeypatch.setattr(bot.asyncio, "create_subprocess_exec", fake_create_subprocess_exec)
+    with pytest.raises(SubprocessIntercepted):
+        asyncio.run(bot.run_subprocess(["synthetic-command"]))
+    assert captured["env"] is bot.ENV
+    assert "COVE_SYNTHETIC_SECRET" not in captured["env"]
 
 
 def test_filename_strips_path_traversal():

@@ -2001,3 +2001,265 @@ def test_run_subprocess_truncation_seam_cannot_synthesize_403():
     code, out = asyncio.run(runner())
     assert code == 0
     assert "HTTP Error 403" not in out
+
+
+@pytest.mark.parametrize(("kind", "process_name", "download_name"), [
+    ("video", "process_url", "download_and_compress"),
+    ("audio", "process_audio_url", "download_audio"),
+])
+def test_shared_work_job_tracks_processing_not_delivery(monkeypatch, tmp_path, kind, process_name, download_name):
+    monkeypatch.setattr(bot, "_work_jobs", {})
+    monkeypatch.setattr(bot, "JOB_SEMAPHORE", asyncio.Semaphore(bot.MAX_CONCURRENT_JOBS))
+    path = tmp_path / "shared.mp4"
+    path.write_bytes(b"media")
+    downloading, finish_download = asyncio.Event(), asyncio.Event()
+    delivering, finish_delivery = asyncio.Event(), asyncio.Event()
+    cleaned = []
+
+    async def download(*args, **kwargs):
+        downloading.set()
+        await finish_download.wait()
+        return str(path), ""
+
+    async def success(filepath):
+        assert filepath == str(path)
+        delivering.set()
+        await finish_delivery.wait()
+
+    async def error(*args):
+        pytest.fail("unexpected download error")
+
+    async def cleanup(filepath):
+        cleaned.append(filepath)
+        path.unlink()
+
+    monkeypatch.setattr(bot, download_name, download)
+    monkeypatch.setattr(bot, "cleanup_tmp", cleanup)
+
+    async def runner():
+        guild_a = SimpleNamespace(id=81001, premium_tier=0)
+        guild_b = SimpleNamespace(id=81002, premium_tier=0)
+        url = "https://example.com/private-media"
+        process = getattr(bot, process_name)
+        permits = bot.JOB_SEMAPHORE._value
+        for _ in range(permits):
+            await bot.JOB_SEMAPHORE.acquire()
+        before_slots = bot._queued_jobs
+        first = second = None
+        try:
+            first = asyncio.create_task(process(url, guild_a, success, error))
+            second = asyncio.create_task(process(url, guild_b, success, error))
+            for _ in range(100):
+                if bot._shared_jobs and next(iter(bot._shared_jobs.values())).subscribers == 2:
+                    break
+                await asyncio.sleep(0)
+            assert len(bot._shared_jobs) == 1
+            shared = next(iter(bot._shared_jobs.values()))
+            assert shared.subscribers == 2
+            await asyncio.sleep(0)  # Let the processing task reach the held semaphore.
+            assert len(bot._work_jobs) == 1
+            work = next(iter(bot._work_jobs.values()))
+            job_id = work.job_id
+            assert shared.job_id == job_id
+            assert (work.kind, work.state, work.started_at) == (kind, "queued", None)
+            assert bot._queued_jobs == before_slots + 1
+            bot._active_tasks.clear()
+            assert bot._work_jobs[job_id] is work
+        finally:
+            for _ in range(permits):
+                bot.JOB_SEMAPHORE.release()
+        try:
+            await asyncio.wait_for(downloading.wait(), 1)
+            assert len(bot._work_jobs) == 1
+            assert bot._work_jobs[job_id] is work
+            assert work.state == "running" and work.started_at is not None
+            finish_download.set()
+            await asyncio.wait_for(delivering.wait(), 1)
+            assert job_id not in bot._work_jobs
+            assert bot._shared_jobs and next(iter(bot._shared_jobs.values())) is shared
+            assert shared.subscribers > 0
+            assert bot._queued_jobs == before_slots + 1
+            assert path.exists() and cleaned == []
+        finally:
+            finish_download.set()
+            finish_delivery.set()
+            await asyncio.gather(first, second)
+        assert bot._shared_jobs == {}
+        assert bot._queued_jobs == before_slots
+        assert cleaned == [str(path)]
+        assert bot._work_jobs == {}
+
+    asyncio.run(runner())
+
+
+@pytest.mark.parametrize(("kind", "process_name", "download_name"), [
+    ("clip", "process_clip_url", "download_and_clip"),
+    ("gif", "process_gif_url", "download_and_gif"),
+])
+def test_clip_gif_work_job_ends_before_delivery(monkeypatch, tmp_path, kind, process_name, download_name):
+    monkeypatch.setattr(bot, "_work_jobs", {})
+    path = tmp_path / "result.mp4"
+    path.write_bytes(b"media")
+    downloading, finish_download = asyncio.Event(), asyncio.Event()
+    delivering, finish_delivery = asyncio.Event(), asyncio.Event()
+    cleaned = []
+
+    async def download(*args, **kwargs):
+        downloading.set()
+        await finish_download.wait()
+        return str(path), ""
+
+    async def success(filepath):
+        delivering.set()
+        await finish_delivery.wait()
+
+    async def error(*args):
+        pytest.fail("unexpected download error")
+
+    async def cleanup(filepath):
+        cleaned.append(filepath)
+        path.unlink()
+
+    monkeypatch.setattr(bot, download_name, download)
+    monkeypatch.setattr(bot, "cleanup_tmp", cleanup)
+
+    async def runner():
+        before_slots = bot._queued_jobs
+        args = ("https://example.com/private-media", None)
+        if kind == "clip":
+            args += (0, 1)
+        task = asyncio.create_task(getattr(bot, process_name)(*args, success, error))
+        try:
+            await asyncio.wait_for(downloading.wait(), 1)
+            assert len(bot._work_jobs) == 1
+            work = next(iter(bot._work_jobs.values()))
+            assert (work.kind, work.state) == (kind, "running")
+            assert work.started_at is not None
+            assert bot._queued_jobs == before_slots + 1
+            finish_download.set()
+            await asyncio.wait_for(delivering.wait(), 1)
+            assert work.job_id not in bot._work_jobs
+            assert bot._queued_jobs == before_slots + 1
+            assert path.exists() and cleaned == []
+        finally:
+            finish_download.set()
+            finish_delivery.set()
+            await task
+        assert bot._queued_jobs == before_slots
+        assert cleaned == [str(path)]
+
+    asyncio.run(runner())
+
+
+def test_work_job_transition_uses_exact_id(monkeypatch, tmp_path):
+    monkeypatch.setattr(bot, "_work_jobs", {})
+    first_id, second_id = 900001, 900002
+    first = bot.WorkJob(first_id, "video", "queued", time.monotonic())
+    second = bot.WorkJob(second_id, "video", "queued", time.monotonic())
+    bot._work_jobs.update({first_id: first, second_id: second})
+    semaphore = asyncio.Semaphore(1)
+    monkeypatch.setattr(bot, "JOB_SEMAPHORE", semaphore)
+    entered, release = asyncio.Event(), asyncio.Event()
+    path = tmp_path / "result.mp4"
+    path.write_bytes(b"media")
+
+    async def download():
+        entered.set()
+        await release.wait()
+        return str(path), ""
+
+    async def error(*args):
+        pytest.fail("unexpected download error")
+
+    async def runner():
+        await semaphore.acquire()
+        task = asyncio.create_task(bot._run_download_phase(download(), error, None, job_id=second_id))
+        try:
+            await asyncio.sleep(0)
+            assert first.state == second.state == "queued"
+            semaphore.release()
+            await asyncio.wait_for(entered.wait(), 1)
+            assert first.state == "queued" and first.started_at is None
+            assert second.state == "running" and second.started_at is not None
+        finally:
+            release.set()
+            if semaphore.locked():
+                semaphore.release()
+            await task
+
+    asyncio.run(runner())
+
+
+@pytest.mark.parametrize("kind", ["clip", "gif"])
+@pytest.mark.parametrize("outcome", ["exception", "cancelled"])
+def test_clip_gif_work_job_removed_on_failed_processing(monkeypatch, kind, outcome):
+    monkeypatch.setattr(bot, "_work_jobs", {})
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def download(*args, **kwargs):
+        entered.set()
+        await release.wait()
+        raise RuntimeError("download failed")
+
+    async def noop(*args):
+        pass
+
+    monkeypatch.setattr(bot, "download_and_clip" if kind == "clip" else "download_and_gif", download)
+
+    async def runner():
+        before_slots = bot._queued_jobs
+        if kind == "clip":
+            process = bot.process_clip_url("https://example.com/failure", None, 0, 1, noop, noop)
+        else:
+            process = bot.process_gif_url("https://example.com/failure", None, noop, noop)
+        task = asyncio.create_task(process)
+        await asyncio.wait_for(entered.wait(), 1)
+        assert len(bot._work_jobs) == 1
+        if outcome == "cancelled":
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        else:
+            release.set()
+            await task
+        assert bot._work_jobs == {}
+        assert bot._queued_jobs == before_slots
+
+    asyncio.run(runner())
+
+
+def test_status_reports_work_snapshot_without_private_identity(monkeypatch):
+    jobs = {
+        98765401: bot.WorkJob(98765401, "video", "queued", 1),
+        98765402: bot.WorkJob(98765402, "video", "queued", 1),
+        98765403: bot.WorkJob(98765403, "video", "running", 1, 2),
+        98765404: bot.WorkJob(98765404, "audio", "running", 1, 2),
+        98765405: bot.WorkJob(98765405, "clip", "queued", 1),
+        98765406: bot.WorkJob(98765406, "gif", "running", 1, 2),
+    }
+    monkeypatch.setattr(bot, "_work_jobs", jobs)
+    monkeypatch.setattr(bot, "_shared_jobs", {
+        ("video", "https://youtube.com/private", 456789, None, None, None): object(),
+    })
+    messages = []
+
+    async def send_message(content, *, ephemeral):
+        messages.append((content, ephemeral))
+
+    interaction = SimpleNamespace(response=SimpleNamespace(send_message=send_message))
+    running, waiting = bot._job_queue_status()
+    asyncio.run(bot.status_cmd.callback(interaction))
+    content, ephemeral = messages[0]
+    assert ephemeral is True
+    assert f"Running: **{running}/{bot.MAX_CONCURRENT_JOBS}**" in content
+    assert f"Waiting: **{waiting}/{bot.MAX_QUEUED_JOBS}**" in content
+    for line in (
+        "Processing - Video: queued=2 running=1",
+        "Processing - Audio: queued=0 running=1",
+        "Processing - Clip: queued=1 running=0",
+        "Processing - Gif: queued=0 running=1",
+        "Shared work: 1",
+    ):
+        assert line in content
+    for private in (*map(str, jobs), "youtube.com", "https://", "456789", "81001", "user", "channel"):
+        assert private not in content

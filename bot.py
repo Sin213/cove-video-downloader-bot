@@ -18,6 +18,8 @@ import sys
 import tempfile
 import json
 import sqlite3
+import itertools
+from dataclasses import dataclass
 from http.cookiejar import MozillaCookieJar
 from html import unescape as html_unescape
 from pathlib import Path
@@ -444,6 +446,25 @@ _cookie_warning_sent_at: float = 0
 COOKIE_WARNING_COOLDOWN = 6 * 3600
 _queued_jobs = 0
 
+
+@dataclass
+class WorkJob:
+    job_id: int
+    kind: str
+    state: str
+    created_at: float
+    started_at: float | None = None
+
+
+_work_jobs: dict[int, WorkJob] = {}
+_next_work_job_id = itertools.count(1)
+
+
+def _register_work_job(kind: str) -> int:
+    job_id = next(_next_work_job_id)
+    _work_jobs[job_id] = WorkJob(job_id, kind, "queued", monotonic())
+    return job_id
+
 # yt-dlp info.json cache: keyed by canonical URL, TTL in seconds.
 _ytdlp_info_cache: dict[str, tuple[dict, float]] = {}
 YT_DLP_INFO_CACHE_TTL = 1800
@@ -581,8 +602,9 @@ WorkKey = tuple[str, str, float, str | None, float | None, float | None]
 
 
 class SharedJob:
-    def __init__(self, task: asyncio.Task):
+    def __init__(self, task: asyncio.Task, job_id: int):
         self.task = task
+        self.job_id = job_id
         self.subscribers = 0
 
 
@@ -4211,6 +4233,7 @@ async def _run_download_phase(
     too_big_msg: str | None = None,
     no_file_msg: str = "Download failed.",
     kind: str = "video",
+    job_id: int | None = None,
 ) -> tuple[str, str] | None:
     """Run a download coroutine under JOB_SEMAPHORE and release it before returning.
 
@@ -4219,6 +4242,10 @@ async def _run_download_phase(
     """
     global _temp_reserved_mb
     async with JOB_SEMAPHORE:
+        work_job = _work_jobs.get(job_id) if job_id is not None else None
+        if work_job is not None and work_job.started_at is None:
+            work_job.state = "running"
+            work_job.started_at = monotonic()
         charged_mb = _try_reserve_temp_storage()
         if charged_mb is None:
             download_coro.close()
@@ -4265,7 +4292,7 @@ async def _run_download_phase(
             _temp_reserved_mb = max(0, _temp_reserved_mb - charged_mb)
 
 
-async def _run_shared_download(download_coro_factory, *, kind, too_big_msg, no_file_msg):
+async def _run_shared_download(download_coro_factory, *, kind, too_big_msg, no_file_msg, job_id):
     notices = []
 
     async def record_error(message):
@@ -4285,6 +4312,7 @@ async def _run_shared_download(download_coro_factory, *, kind, too_big_msg, no_f
         too_big_msg=too_big_msg,
         no_file_msg=no_file_msg,
         kind=kind,
+        job_id=job_id,
     )
     return result, notices
 
@@ -4307,6 +4335,7 @@ def _finalize_shared_job(work_key: WorkKey, job: SharedJob) -> str | None:
 
 
 def _on_shared_job_done(work_key: WorkKey, job: SharedJob) -> None:
+    _work_jobs.pop(job.job_id, None)
     if _shared_jobs.get(work_key) is job and job.subscribers == 0:
         filepath = _finalize_shared_job(work_key, job)
         if filepath is not None:
@@ -4342,6 +4371,7 @@ async def _process_shared_url(
             if not _try_reserve_job_slot():
                 await _safe_notify(on_error, kind, busy_msg() if callable(busy_msg) else busy_msg)
                 return
+            job_id = _register_work_job(kind)
             try:
                 task = spawn_tracked(
                     _run_shared_download(
@@ -4349,12 +4379,14 @@ async def _process_shared_url(
                         kind=kind,
                         too_big_msg=too_big_msg,
                         no_file_msg=no_file_msg,
+                        job_id=job_id,
                     )
                 )
             except BaseException:
+                _work_jobs.pop(job_id, None)
                 _release_job_slot()
                 raise
-            job = SharedJob(task)
+            job = SharedJob(task, job_id)
             _shared_jobs[work_key] = job
             task.add_done_callback(lambda _task: _on_shared_job_done(work_key, job))
             running, waiting = _job_queue_status()
@@ -4469,16 +4501,21 @@ async def process_clip_url(
             await _safe_notify(on_error, "clip", BUSY_MESSAGE)
             return
         reserved_slot = True
+        job_id = _register_work_job("clip")
         running, waiting = _job_queue_status()
         log.info("[queue] Accepted clip job running=%d waiting=%d", running, waiting)
 
-        result = await _run_download_phase(
-            download_and_clip(url, guild, start, end, youtube_quality=effective_quality),
-            on_error,
-            on_no_video,
-            no_file_msg="Clip failed.",
-            kind="clip",
-        )
+        try:
+            result = await _run_download_phase(
+                download_and_clip(url, guild, start, end, youtube_quality=effective_quality),
+                on_error,
+                on_no_video,
+                no_file_msg="Clip failed.",
+                kind="clip",
+                job_id=job_id,
+            )
+        finally:
+            _work_jobs.pop(job_id, None)
         if result is None:
             return
         filepath, log_text = result
@@ -4519,17 +4556,22 @@ async def process_gif_url(
             await _safe_notify(on_error, "gif", BUSY_MESSAGE)
             return
         reserved_slot = True
+        job_id = _register_work_job("gif")
         running, waiting = _job_queue_status()
         log.info("[queue] Accepted gif job running=%d waiting=%d", running, waiting)
 
-        result = await _run_download_phase(
-            download_and_gif(url, guild, youtube_quality=effective_quality),
-            on_error,
-            on_no_video,
-            too_big_msg="Source video too long ({toobig_str}, max {max_min}min)",
-            no_file_msg="GIF conversion failed.",
-            kind="gif",
-        )
+        try:
+            result = await _run_download_phase(
+                download_and_gif(url, guild, youtube_quality=effective_quality),
+                on_error,
+                on_no_video,
+                too_big_msg="Source video too long ({toobig_str}, max {max_min}min)",
+                no_file_msg="GIF conversion failed.",
+                kind="gif",
+                job_id=job_id,
+            )
+        finally:
+            _work_jobs.pop(job_id, None)
         if result is None:
             return
         filepath, log_text = result
@@ -5357,10 +5399,22 @@ async def gif_cmd(interaction: discord.Interaction, url: str):
 )
 async def status_cmd(interaction: discord.Interaction):
     running, waiting = _job_queue_status()
+    work_snapshot = tuple((job.kind, job.state) for job in _work_jobs.values())
+    counts = {
+        kind: (sum(item == (kind, "queued") for item in work_snapshot),
+               sum(item == (kind, "running") for item in work_snapshot))
+        for kind in ("video", "audio", "clip", "gif")
+    }
+    shared_work = len(_shared_jobs)
     await interaction.response.send_message(
         (
             f"Running: **{running}/{MAX_CONCURRENT_JOBS}**\n"
-            f"Waiting: **{waiting}/{MAX_QUEUED_JOBS}**"
+            f"Waiting: **{waiting}/{MAX_QUEUED_JOBS}**\n"
+            f"Processing - Video: queued={counts['video'][0]} running={counts['video'][1]}\n"
+            f"Processing - Audio: queued={counts['audio'][0]} running={counts['audio'][1]}\n"
+            f"Processing - Clip: queued={counts['clip'][0]} running={counts['clip'][1]}\n"
+            f"Processing - Gif: queued={counts['gif'][0]} running={counts['gif'][1]}\n"
+            f"Shared work: {shared_work}"
         ),
         ephemeral=True,
     )

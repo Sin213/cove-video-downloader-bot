@@ -2,6 +2,7 @@ import asyncio
 import gc
 import json
 import os
+import signal
 import sqlite3
 import subprocess
 import sys
@@ -603,6 +604,12 @@ def test_shared_video_waits_for_both_deliveries_before_cleanup(monkeypatch, tmp_
     cleaned = []
     calls = []
     errors = []
+    release_calls = []
+    original_release = bot._release_job_slot
+
+    def release_slot():
+        release_calls.append(True)
+        original_release()
 
     async def fake_download(*args, **kwargs):
         calls.append(args)
@@ -626,6 +633,7 @@ def test_shared_video_waits_for_both_deliveries_before_cleanup(monkeypatch, tmp_
 
     monkeypatch.setattr(bot, "download_and_compress", fake_download)
     monkeypatch.setattr(bot, "cleanup_tmp", cleanup)
+    monkeypatch.setattr(bot, "_release_job_slot", release_slot)
 
     async def runner():
         before = bot._queued_jobs
@@ -645,6 +653,7 @@ def test_shared_video_waits_for_both_deliveries_before_cleanup(monkeypatch, tmp_
         await first
         assert cleaned == [str(path)]
         assert bot._queued_jobs == before
+        assert release_calls == [True]
 
     asyncio.run(runner())
 
@@ -2263,3 +2272,529 @@ def test_status_reports_work_snapshot_without_private_identity(monkeypatch):
         assert line in content
     for private in (*map(str, jobs), "youtube.com", "https://", "456789", "81001", "user", "channel"):
         assert private not in content
+
+
+def _shutdown_test_interaction(guild_id=1):
+    async def noop(*args, **kwargs):
+        pass
+
+    return SimpleNamespace(
+        guild=SimpleNamespace(id=guild_id, premium_tier=0),
+        user=SimpleNamespace(id=guild_id, display_name="tester"),
+        response=SimpleNamespace(defer=noop),
+        followup=SimpleNamespace(send=noop),
+    )
+
+
+def _allow_manual_media(monkeypatch):
+    async def valid_dns(url):
+        return True, None
+
+    monkeypatch.setattr(bot, "_validate_manual_url_syntax", lambda url: (True, None))
+    monkeypatch.setattr(bot, "_validate_manual_url_dns", valid_dns)
+    monkeypatch.setattr(bot, "_check_user_rate_limit", lambda user_id: True)
+    monkeypatch.setattr(bot, "is_friend_server", lambda guild: False)
+
+
+def test_setup_hook_registers_only_sigterm(monkeypatch):
+    handlers = []
+
+    class FakeLoop:
+        def add_signal_handler(self, signum, callback):
+            handlers.append((signum, callback))
+
+        async def run_in_executor(self, executor, function):
+            pass
+
+    async def sync(*args):
+        pass
+
+    def discard_periodic(coro):
+        coro.close()
+
+    async def runner():
+        client = bot.CoveBot()
+        monkeypatch.setattr(asyncio, "get_running_loop", lambda: FakeLoop())
+        monkeypatch.setattr(bot, "spawn_tracked", discard_periodic)
+        monkeypatch.setattr(client, "_sync_tree_with_timeout", sync)
+        await client.setup_hook()
+
+    asyncio.run(runner())
+    assert handlers == [(signal.SIGTERM, bot._request_shutdown)]
+    assert all(signum != signal.SIGINT for signum, _ in handlers)
+
+
+def test_shutdown_blocks_job_reservation_and_shared_admission(monkeypatch):
+    monkeypatch.setattr(bot, "_shutting_down", True)
+    monkeypatch.setattr(bot, "_queued_jobs", 0)
+    monkeypatch.setattr(bot, "_shared_jobs", {})
+    monkeypatch.setattr(bot, "_work_jobs", {})
+    monkeypatch.setattr(bot, "_inflight_urls", set())
+    assert bot._try_reserve_job_slot() is False
+    assert bot._queued_jobs == 0
+    errors = []
+
+    async def forbidden_download(*args, **kwargs):
+        pytest.fail("shutdown admitted a downloader")
+
+    async def on_error(message):
+        errors.append(message)
+
+    monkeypatch.setattr(bot, "download_and_compress", forbidden_download)
+    asyncio.run(bot.process_url("https://example.com/shutdown", None, lambda path: None, on_error))
+    assert len(errors) == 1 and errors[0].startswith(bot.BUSY_MESSAGE)
+    assert "Queue:" in errors[0]
+    assert bot._queued_jobs == 0
+    assert bot._shared_jobs == {}
+    assert bot._work_jobs == {}
+    assert not bot._inflight_urls
+
+
+def test_shutdown_rejects_join_to_existing_shared_job(monkeypatch, tmp_path):
+    _mock_temp_capacity(monkeypatch, total_mb=31719, free_mb=31000)
+    monkeypatch.setattr(bot, "_shutting_down", False)
+    monkeypatch.setattr(bot, "_shared_jobs", {})
+    monkeypatch.setattr(bot, "_work_jobs", {})
+    monkeypatch.setattr(bot, "_inflight_urls", set())
+    path = tmp_path / "shared.mp4"
+    path.write_bytes(b"media")
+    downloading, finish_download = asyncio.Event(), asyncio.Event()
+    first_events, second_events = [], []
+
+    async def download(*args, **kwargs):
+        downloading.set()
+        await finish_download.wait()
+        return str(path), ""
+
+    async def cleanup(filepath):
+        assert filepath == str(path)
+
+    monkeypatch.setattr(bot, "download_and_compress", download)
+    monkeypatch.setattr(bot, "cleanup_tmp", cleanup)
+
+    async def runner():
+        before_slots = bot._queued_jobs
+        url = "https://example.com/shared-shutdown"
+        first = asyncio.create_task(bot.process_url(
+            url, SimpleNamespace(id=1, premium_tier=0), *_inflight_callbacks(first_events)
+        ))
+        await asyncio.wait_for(downloading.wait(), 1)
+        job = next(iter(bot._shared_jobs.values()))
+        assert job.subscribers == 1 and not job.task.done()
+        tracked_before = set(bot._active_tasks)
+        monkeypatch.setattr(bot, "_shutting_down", True)
+        await asyncio.wait_for(bot.process_url(
+            url, SimpleNamespace(id=2, premium_tier=0), *_inflight_callbacks(second_events)
+        ), 1)
+        assert job.subscribers == 1
+        assert not job.task.done()
+        assert set(bot._active_tasks) == tracked_before
+        assert len(bot._shared_jobs) == 1
+        assert bot._queued_jobs == before_slots + 1
+        assert len(second_events) == 1 and second_events[0][0] == "error"
+        assert second_events[0][1].startswith(bot.BUSY_MESSAGE)
+        finish_download.set()
+        await asyncio.wait_for(first, 1)
+        assert first_events == [("success", str(path))]
+        assert bot._shared_jobs == {}
+        assert bot._queued_jobs == before_slots
+
+    asyncio.run(runner())
+
+
+@pytest.mark.parametrize(("kind", "download_name"), [
+    ("clip", "download_and_clip"),
+    ("gif", "download_and_gif"),
+])
+def test_slash_clip_gif_lifecycle_drains_on_cancellation(monkeypatch, kind, download_name):
+    _allow_manual_media(monkeypatch)
+    _mock_temp_capacity(monkeypatch, total_mb=31719, free_mb=31000)
+    monkeypatch.setattr(bot, "_work_jobs", {})
+    started = asyncio.Event()
+    cancelled = asyncio.Event()
+
+    async def slow_download(*args, **kwargs):
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            cancelled.set()
+
+    monkeypatch.setattr(bot, download_name, slow_download)
+
+    async def runner():
+        before_slots = bot._queued_jobs
+        before_permits = bot.JOB_SEMAPHORE._value
+        command = getattr(bot, f"{kind}_cmd").callback
+        interaction = _shutdown_test_interaction()
+        args = (interaction, "https://example.com/media", "1", "2") if kind == "clip" else (
+            interaction, "https://example.com/media"
+        )
+        command_task = asyncio.create_task(command(*args))
+        await asyncio.wait_for(started.wait(), 1)
+        lifecycle = [task for task in bot._active_tasks if task.get_coro().__name__ == f"process_{kind}_url"]
+        assert len(lifecycle) == 1
+        assert bot._temp_reserved_mb > 0
+        assert len(bot._work_jobs) == 1
+        lifecycle[0].cancel()
+        drained = await asyncio.gather(*lifecycle, return_exceptions=True)
+        command_result = await asyncio.gather(command_task, return_exceptions=True)
+        assert isinstance(drained[0], asyncio.CancelledError)
+        assert isinstance(command_result[0], asyncio.CancelledError)
+        assert cancelled.is_set()
+        assert bot._temp_reserved_mb == 0
+        assert bot.JOB_SEMAPHORE._value == before_permits
+        assert bot._queued_jobs == before_slots
+        assert bot._work_jobs == {}
+
+    asyncio.run(runner())
+
+
+@pytest.mark.parametrize(("kind", "download_name"), [
+    ("download", "download_and_compress"),
+    ("audio", "download_audio"),
+])
+@pytest.mark.parametrize("phase", ["processing", "delivery"])
+def test_slash_shared_subscriber_drains_and_releases_once(monkeypatch, tmp_path, kind, download_name, phase):
+    _allow_manual_media(monkeypatch)
+    _mock_temp_capacity(monkeypatch, total_mb=31719, free_mb=31000)
+    monkeypatch.setattr(bot, "_work_jobs", {})
+    path = tmp_path / "media.bin"
+    path.write_bytes(b"media")
+    downloading, finish_download = asyncio.Event(), asyncio.Event()
+    delivering = asyncio.Event()
+    release_calls = []
+    original_release = bot._release_job_slot
+
+    def release_slot():
+        release_calls.append(True)
+        original_release()
+
+    async def slow_download(*args, **kwargs):
+        downloading.set()
+        await finish_download.wait()
+        return str(path), ""
+
+    async def slow_delivery(*args, **kwargs):
+        delivering.set()
+        await asyncio.Event().wait()
+
+    async def cleanup(filepath):
+        assert filepath == str(path)
+
+    monkeypatch.setattr(bot, download_name, slow_download)
+    monkeypatch.setattr(bot, "send_file_with_retry", slow_delivery)
+    monkeypatch.setattr(bot, "cleanup_tmp", cleanup)
+    monkeypatch.setattr(bot, "_release_job_slot", release_slot)
+
+    async def runner():
+        before_slots = bot._queued_jobs
+        command = getattr(bot, f"{kind}_cmd").callback
+        command_task = asyncio.create_task(command(_shutdown_test_interaction(), "https://example.com/media"))
+        await asyncio.wait_for(downloading.wait(), 1)
+        process_name = "process_url" if kind == "download" else "process_audio_url"
+        subscribers = [task for task in bot._active_tasks if task.get_coro().__name__ == process_name]
+        assert len(subscribers) == 1
+        job = next(iter(bot._shared_jobs.values()))
+        assert job.subscribers == 1
+        assert job.task in bot._active_tasks
+        assert bot._queued_jobs == before_slots + 1
+        if phase == "delivery":
+            finish_download.set()
+            await asyncio.wait_for(delivering.wait(), 1)
+            assert job.task.done()
+        subscribers[0].cancel()
+        drained = await asyncio.gather(*subscribers, return_exceptions=True)
+        command_result = await asyncio.gather(command_task, return_exceptions=True)
+        assert isinstance(drained[0], asyncio.CancelledError)
+        assert isinstance(command_result[0], asyncio.CancelledError)
+        assert job.subscribers == 0
+        if phase == "processing":
+            assert not job.task.done()  # shield kept processing alive after subscriber cancellation
+            assert bot._queued_jobs == before_slots + 1
+            job.task.cancel()
+            await asyncio.gather(job.task, return_exceptions=True)
+        await asyncio.sleep(0)
+        assert release_calls == [True]
+        assert bot._queued_jobs == before_slots
+        assert bot._shared_jobs == {}
+        assert bot._work_jobs == {}
+        assert bot._temp_reserved_mb == 0
+
+    asyncio.run(runner())
+
+
+def test_repeated_sigterm_schedules_one_close(monkeypatch):
+    monkeypatch.setattr(bot, "_shutdown_task", None)
+    calls = []
+    started = asyncio.Event()
+
+    async def fake_close():
+        calls.append(True)
+        started.set()
+        await asyncio.Event().wait()
+
+    monkeypatch.setattr(bot.client, "close", fake_close)
+
+    async def runner():
+        bot._request_shutdown()
+        first = bot._shutdown_task
+        bot._request_shutdown()
+        assert bot._shutdown_task is first
+        await started.wait()
+        assert calls == [True]
+        first.cancel()
+        await asyncio.gather(first, return_exceptions=True)
+
+    asyncio.run(runner())
+    monkeypatch.setattr(bot, "_shutdown_task", None)
+
+
+def test_close_is_reentrant_and_empty_drain_completes(monkeypatch):
+    monkeypatch.setattr(bot, "_shutting_down", False)
+    monkeypatch.setattr(bot, "_active_tasks", set())
+    monkeypatch.setattr(bot, "_cache_write_queue", [])
+    closing_session = asyncio.Event()
+    finish_session = asyncio.Event()
+    calls = []
+
+    async def close_session():
+        calls.append("session")
+        closing_session.set()
+        await finish_session.wait()
+
+    async def close_discord(self):
+        calls.append("discord")
+
+    monkeypatch.setattr(bot, "_close_http_session", close_session)
+    monkeypatch.setattr(discord.Client, "close", close_discord)
+
+    async def runner():
+        client = bot.CoveBot()
+        first = asyncio.create_task(client.close())
+        await asyncio.wait_for(closing_session.wait(), 1)
+        second = asyncio.create_task(client.close())
+        await asyncio.sleep(0)
+        assert not second.done()
+        assert bot._shutting_down is True
+        assert calls == ["session"]
+        finish_session.set()
+        await asyncio.wait_for(asyncio.gather(first, second), 1)
+        assert calls == ["session", "discord"]
+        await client.close()
+        assert calls == ["session", "discord"]
+
+    asyncio.run(runner())
+
+
+def test_overlapping_close_callers_wait_through_base_close(monkeypatch):
+    monkeypatch.setattr(bot, "_shutting_down", False)
+    monkeypatch.setattr(bot, "_active_tasks", set())
+    monkeypatch.setattr(bot, "_cache_write_queue", [])
+    session_started, finish_session = asyncio.Event(), asyncio.Event()
+    discord_started, finish_discord = asyncio.Event(), asyncio.Event()
+    second_entered = asyncio.Event()
+    order = []
+
+    async def close_session():
+        session_started.set()
+        await finish_session.wait()
+        order.append("session")
+
+    async def close_discord(self):
+        discord_started.set()
+        await finish_discord.wait()
+        order.append("discord")
+
+    monkeypatch.setattr(bot, "_close_http_session", close_session)
+    monkeypatch.setattr(discord.Client, "close", close_discord)
+
+    async def runner():
+        client = bot.CoveBot()
+
+        async def first_close():
+            await client.close()
+            order.append("first returned")
+            await second
+
+        first = asyncio.create_task(first_close())
+        await asyncio.wait_for(session_started.wait(), 1)
+
+        async def second_close():
+            second_entered.set()
+            await client.close()
+            order.append("second returned")
+
+        second = asyncio.create_task(second_close())
+        await second_entered.wait()
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(asyncio.shield(second), .05)
+        assert order == []
+        finish_session.set()
+        await asyncio.wait_for(discord_started.wait(), 1)
+        assert not second.done()
+        finish_discord.set()
+        await asyncio.wait_for(asyncio.gather(first, second), 1)
+        assert order == ["session", "discord", "first returned", "second returned"]
+
+    asyncio.run(runner())
+
+
+def test_close_waits_for_tracked_task_before_session_close(monkeypatch):
+    monkeypatch.setattr(bot, "_shutting_down", False)
+    monkeypatch.setattr(bot, "_active_tasks", set())
+    monkeypatch.setattr(bot, "_cache_write_queue", [])
+    started, cancelled, finish = asyncio.Event(), asyncio.Event(), asyncio.Event()
+    order = []
+
+    async def tracked_work():
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled.set()
+            await finish.wait()
+            order.append("task")
+            raise
+
+    async def close_session():
+        order.append("session")
+
+    async def close_discord(self):
+        order.append("discord")
+
+    monkeypatch.setattr(bot, "_close_http_session", close_session)
+    monkeypatch.setattr(discord.Client, "close", close_discord)
+
+    async def runner():
+        client = bot.CoveBot()
+        work = bot.spawn_tracked(tracked_work())
+        await started.wait()
+        closing = asyncio.create_task(client.close())
+        await cancelled.wait()
+        assert order == []
+        finish.set()
+        await asyncio.wait_for(closing, 1)
+        await asyncio.gather(work, return_exceptions=True)
+        assert order == ["task", "session", "discord"]
+
+    asyncio.run(runner())
+
+
+def test_close_blocks_admission_during_tracked_task_drain(monkeypatch):
+    monkeypatch.setattr(bot, "_shutting_down", False)
+    monkeypatch.setattr(bot, "_queued_jobs", 0)
+    monkeypatch.setattr(bot, "_active_tasks", set())
+    monkeypatch.setattr(bot, "_cache_write_queue", [])
+    started, cancelling, finish = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def tracked_work():
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelling.set()
+            await finish.wait()
+            raise
+
+    async def close_session():
+        pass
+
+    async def close_discord(self):
+        pass
+
+    monkeypatch.setattr(bot, "_close_http_session", close_session)
+    monkeypatch.setattr(discord.Client, "close", close_discord)
+
+    async def runner():
+        client = bot.CoveBot()
+        work = bot.spawn_tracked(tracked_work())
+        await asyncio.wait_for(started.wait(), 1)
+        closing = asyncio.create_task(client.close())
+        await asyncio.wait_for(cancelling.wait(), 1)
+        try:
+            assert not closing.done()  # The tracked-task gather is still in progress.
+            assert bot._shutting_down is True
+            assert bot._try_reserve_job_slot() is False
+            assert bot._queued_jobs == 0
+        finally:
+            finish.set()
+            await asyncio.wait_for(closing, 1)
+            await asyncio.gather(work, return_exceptions=True)
+
+    asyncio.run(runner())
+
+
+def test_stale_shared_job_finalization_does_not_release_replacement_slot(monkeypatch, tmp_path):
+    _mock_temp_capacity(monkeypatch, total_mb=31719, free_mb=31000)
+    monkeypatch.setattr(bot, "_shutting_down", False)
+    monkeypatch.setattr(bot, "_queued_jobs", 0)
+    monkeypatch.setattr(bot, "_shared_jobs", {})
+    monkeypatch.setattr(bot, "_work_jobs", {})
+    monkeypatch.setattr(bot, "_inflight_urls", set())
+    path = tmp_path / "shared.mp4"
+    path.write_bytes(b"media")
+    second_started, finish_second = asyncio.Event(), asyncio.Event()
+    release_calls, observed_jobs, delivered = [], [], []
+    original_release = bot._release_job_slot
+    guild = SimpleNamespace(id=1, premium_tier=0)
+    url = "https://example.com/reused-work-key"
+    work_key = bot._work_key(bot._inflight_key("video", url, guild))
+    downloads = 0
+
+    def release_slot():
+        release_calls.append(True)
+        original_release()
+
+    async def download(*args, **kwargs):
+        nonlocal downloads
+        downloads += 1
+        if downloads == 2:
+            second_started.set()
+            await finish_second.wait()
+        return str(path), ""
+
+    async def on_success(filepath):
+        observed_jobs.append(bot._shared_jobs[work_key])
+        delivered.append(filepath)
+
+    async def on_error(message):
+        pytest.fail(f"unexpected download error: {message}")
+
+    async def cleanup(filepath):
+        assert filepath == str(path)
+
+    monkeypatch.setattr(bot, "_release_job_slot", release_slot)
+    monkeypatch.setattr(bot, "download_and_compress", download)
+    monkeypatch.setattr(bot, "cleanup_tmp", cleanup)
+
+    async def runner():
+        await bot.process_url(url, guild, on_success, on_error)
+        old_job = observed_jobs[0]
+        assert old_job.task.done() and old_job.subscribers == 0
+        assert bot._shared_jobs == {}
+        assert release_calls == [True]
+        assert bot._queued_jobs == 0
+
+        assert bot._finalize_shared_job(work_key, old_job) is None
+        assert release_calls == [True]
+        assert bot._queued_jobs == 0
+
+        second = asyncio.create_task(bot.process_url(url, guild, on_success, on_error))
+        await asyncio.wait_for(second_started.wait(), 1)
+        new_job = bot._shared_jobs[work_key]
+        assert new_job is not old_job and new_job.subscribers == 1
+        assert bot._queued_jobs == 1
+        assert bot._finalize_shared_job(work_key, old_job) is None
+        assert release_calls == [True]
+        assert bot._queued_jobs == 1
+        assert bot._shared_jobs[work_key] is new_job
+
+        finish_second.set()
+        await asyncio.wait_for(second, 1)
+        assert delivered == [str(path), str(path)]
+        assert release_calls == [True, True]
+        assert bot._queued_jobs == 0
+        assert bot._shared_jobs == {}
+
+    asyncio.run(runner())

@@ -410,6 +410,8 @@ _friend_neet_skip_users: dict[tuple[int, int], float] = {}
 _processed_source_messages: dict[int, float] = {}
 _user_request_times: dict[int, list[float]] = {}
 _active_tasks: set[asyncio.Task] = set()
+_shutdown_task: asyncio.Task | None = None
+_shutting_down: bool = False
 _http_session: aiohttp.ClientSession | None = None
 _reddit_cookie_header_cache: tuple[float, str | None, float] | None = None
 
@@ -982,6 +984,13 @@ def spawn_tracked(coro) -> asyncio.Task:
     return task
 
 
+def _request_shutdown() -> None:
+    global _shutdown_task
+    if _shutdown_task is not None:
+        return
+    _shutdown_task = asyncio.create_task(client.close())
+
+
 class PipelineTimer:
     def __init__(self, label: str):
         self.label = label
@@ -1011,6 +1020,8 @@ class PipelineTimer:
 
 def _try_reserve_job_slot() -> bool:
     global _queued_jobs
+    if _shutting_down:
+        return False
     if _queued_jobs >= MAX_CONCURRENT_JOBS + MAX_QUEUED_JOBS:
         return False
     _queued_jobs += 1
@@ -4366,6 +4377,9 @@ async def _process_shared_url(
     work_key = _work_key(request_key)
     job = None
     try:
+        if _shutting_down:
+            await _safe_notify(on_error, kind, busy_msg() if callable(busy_msg) else busy_msg)
+            return
         job = _shared_jobs.get(work_key)
         if job is None:
             if not _try_reserve_job_slot():
@@ -4626,6 +4640,7 @@ class CoveBot(discord.Client):
         intents.reactions = True
         super().__init__(intents=intents)
         self.tree = app_commands.CommandTree(self)
+        self._close_future: asyncio.Future[None] | None = None
 
     async def _sync_tree_with_timeout(self, guild: discord.Object, label: str) -> None:
         try:
@@ -4654,6 +4669,7 @@ class CoveBot(discord.Client):
                     log.warning("[Cove] Periodic cache flush failed: %s", e)
 
     async def setup_hook(self):
+        asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, _request_shutdown)
         await asyncio.get_running_loop().run_in_executor(None, _sweep_orphaned_tmpdirs)
         spawn_tracked(self._periodic_temp_sweep())
         spawn_tracked(self._periodic_cache_flush())
@@ -4692,28 +4708,42 @@ class CoveBot(discord.Client):
                     log.warning("[Cove] Could not DM yt-dlp warning to guild owner: %s", e)
 
     async def close(self):
-        # Stop background/processing tasks before tearing down the shared
-        # sessions they may still be using.
-        pending = [t for t in _active_tasks if not t.done()]
-        for task in pending:
-            task.cancel()
-        if pending:
-            try:
-                await asyncio.wait_for(
-                    asyncio.gather(*pending, return_exceptions=True), timeout=10
-                )
-            except asyncio.TimeoutError:
-                log.warning("[Cove] Some background tasks did not stop within 10s.")
-        if _cache_write_queue:
-            try:
-                await asyncio.get_running_loop().run_in_executor(None, _flush_cache_writes)
-            except Exception as e:
-                log.warning("[Cove] Final cache flush failed: %s", e)
+        global _shutting_down
+        _shutting_down = True
+        if self._close_future is not None:
+            await asyncio.shield(self._close_future)
+            return
+        close_future = asyncio.get_running_loop().create_future()
+        self._close_future = close_future
         try:
-            await _close_http_session()
-        except Exception as e:
-            log.warning("[Cove] HTTP session close failed: %s", e)
-        await super().close()
+            # Stop background/processing tasks before tearing down the shared
+            # sessions they may still be using.
+            pending = [t for t in _active_tasks if not t.done()]
+            for task in pending:
+                task.cancel()
+            if pending:
+                try:
+                    await asyncio.wait_for(
+                        asyncio.gather(*pending, return_exceptions=True), timeout=10
+                    )
+                except asyncio.TimeoutError:
+                    log.warning("[Cove] Some background tasks did not stop within 10s.")
+            if _cache_write_queue:
+                try:
+                    await asyncio.get_running_loop().run_in_executor(None, _flush_cache_writes)
+                except Exception as e:
+                    log.warning("[Cove] Final cache flush failed: %s", e)
+            try:
+                await _close_http_session()
+            except Exception as e:
+                log.warning("[Cove] HTTP session close failed: %s", e)
+            await super().close()
+        except BaseException as e:
+            close_future.set_exception(e)
+            close_future.exception()  # Avoid an unobserved error if no other caller awaited it.
+            raise
+        else:
+            close_future.set_result(None)
 
     async def on_message(self, message: discord.Message):
         if message.author.bot:
@@ -5113,7 +5143,7 @@ async def download_cmd(
             f"Video too big {NYO_EMOJI} ({duration_str}, max {MAX_DURATION_SECONDS // 60}min)"
         )
 
-    await process_url(
+    task = spawn_tracked(process_url(
         url,
         interaction.guild,
         on_success,
@@ -5121,7 +5151,8 @@ async def download_cmd(
         on_too_big=on_too_big,
         on_no_video=on_no_video,
         youtube_quality=resolution.value if resolution else None,
-    )
+    ))
+    await task
 
 
 @client.tree.command(
@@ -5195,14 +5226,15 @@ async def audio_cmd(interaction: discord.Interaction, url: str):
             f"Audio too big {NYO_EMOJI} ({size_str}, max {get_target_mb(interaction.guild)}MB)"
         )
 
-    await process_audio_url(
+    task = spawn_tracked(process_audio_url(
         url,
         interaction.guild,
         on_success,
         on_error,
         on_too_big=on_too_big,
         on_no_video=on_no_video,
-    )
+    ))
+    await task
 
 
 @client.tree.command(
@@ -5307,7 +5339,7 @@ async def clip_cmd(interaction: discord.Interaction, url: str, start: str, end: 
             return
         await interaction.followup.send("❌ No video found at that link.")
 
-    await process_clip_url(
+    task = spawn_tracked(process_clip_url(
         url,
         interaction.guild,
         start_sec,
@@ -5315,7 +5347,8 @@ async def clip_cmd(interaction: discord.Interaction, url: str, start: str, end: 
         on_success,
         on_error,
         on_no_video=on_no_video,
-    )
+    ))
+    await task
 
 
 @client.tree.command(
@@ -5384,13 +5417,14 @@ async def gif_cmd(interaction: discord.Interaction, url: str):
             return
         await interaction.followup.send("❌ No video found at that link.")
 
-    await process_gif_url(
+    task = spawn_tracked(process_gif_url(
         url,
         interaction.guild,
         on_success,
         on_error,
         on_no_video=on_no_video,
-    )
+    ))
+    await task
 
 
 @client.tree.command(

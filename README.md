@@ -6,6 +6,10 @@ A self-hosted Discord bot that automatically detects video links in chat and dow
 ![Platform](https://img.shields.io/badge/platform-Linux%20%28Arch%2FEOS%29-blue?style=flat-square&logo=archlinux)
 ![License](https://img.shields.io/badge/license-MIT-green?style=flat-square)
 
+[![Watch the promo video](docs/media/cvdb-promo.jpg)](docs/media/cvdb-promo.mp4)
+
+*Click the image to watch the 90-second promo video.*
+
 ---
 
 ## Features

@@ -410,7 +410,8 @@ _friend_neet_skip_users: dict[tuple[int, int], float] = {}
 _processed_source_messages: dict[int, float] = {}
 _user_request_times: dict[int, list[float]] = {}
 _active_tasks: set[asyncio.Task] = set()
-_shutdown_task: asyncio.Task | None = None
+_client_run_task: asyncio.Task | None = None
+_shutdown_requested: bool = False
 _shutting_down: bool = False
 _http_session: aiohttp.ClientSession | None = None
 _reddit_cookie_header_cache: tuple[float, str | None, float] | None = None
@@ -985,10 +986,18 @@ def spawn_tracked(coro) -> asyncio.Task:
 
 
 def _request_shutdown() -> None:
-    global _shutdown_task
-    if _shutdown_task is not None:
+    global _shutdown_requested, _shutting_down
+    if _shutdown_requested:
         return
-    _shutdown_task = asyncio.create_task(client.close())
+    _shutdown_requested = True
+    _shutting_down = True
+    task = _client_run_task
+    if (
+        task is not None
+        and not task.done()
+        and client._close_future is None
+    ):
+        task.cancel()
 
 
 class PipelineTimer:
@@ -4669,7 +4678,13 @@ class CoveBot(discord.Client):
                     log.warning("[Cove] Periodic cache flush failed: %s", e)
 
     async def setup_hook(self):
-        asyncio.get_running_loop().add_signal_handler(signal.SIGTERM, _request_shutdown)
+        global _client_run_task
+        task = asyncio.current_task()
+        if task is None:
+            raise RuntimeError("Cove setup_hook has no current asyncio task")
+        _client_run_task = task
+        loop = asyncio.get_running_loop()
+        loop.add_signal_handler(signal.SIGTERM, _request_shutdown)
         await asyncio.get_running_loop().run_in_executor(None, _sweep_orphaned_tmpdirs)
         spawn_tracked(self._periodic_temp_sweep())
         spawn_tracked(self._periodic_cache_flush())
@@ -4710,40 +4725,56 @@ class CoveBot(discord.Client):
     async def close(self):
         global _shutting_down
         _shutting_down = True
-        if self._close_future is not None:
-            await asyncio.shield(self._close_future)
-            return
-        close_future = asyncio.get_running_loop().create_future()
-        self._close_future = close_future
-        try:
-            # Stop background/processing tasks before tearing down the shared
-            # sessions they may still be using.
-            pending = [t for t in _active_tasks if not t.done()]
-            for task in pending:
-                task.cancel()
-            if pending:
+        if self._close_future is None:
+            close_future = asyncio.get_running_loop().create_future()
+            self._close_future = close_future
+
+            async def finish_close():
                 try:
-                    await asyncio.wait_for(
-                        asyncio.gather(*pending, return_exceptions=True), timeout=10
-                    )
-                except asyncio.TimeoutError:
-                    log.warning("[Cove] Some background tasks did not stop within 10s.")
-            if _cache_write_queue:
+                    # Stop background/processing tasks before tearing down the shared
+                    # sessions they may still be using.
+                    pending = [t for t in _active_tasks if not t.done()]
+                    for task in pending:
+                        task.cancel()
+                    if pending:
+                        try:
+                            await asyncio.wait_for(
+                                asyncio.gather(*pending, return_exceptions=True), timeout=10
+                            )
+                        except asyncio.TimeoutError:
+                            log.warning("[Cove] Some background tasks did not stop within 10s.")
+                    if _cache_write_queue:
+                        try:
+                            await asyncio.get_running_loop().run_in_executor(None, _flush_cache_writes)
+                        except Exception as e:
+                            log.warning("[Cove] Final cache flush failed: %s", e)
+                    try:
+                        await _close_http_session()
+                    except Exception as e:
+                        log.warning("[Cove] HTTP session close failed: %s", e)
+                    await super(CoveBot, self).close()
+                except BaseException as e:
+                    close_future.set_exception(e)
+                    close_future.exception()  # Avoid an unobserved error if no other caller awaited it.
+                else:
+                    close_future.set_result(None)
+
+            asyncio.create_task(finish_close())
+
+        close_future = self._close_future
+
+        async def wait_for_close():
+            cancelled = False
+            while not close_future.done():
                 try:
-                    await asyncio.get_running_loop().run_in_executor(None, _flush_cache_writes)
-                except Exception as e:
-                    log.warning("[Cove] Final cache flush failed: %s", e)
-            try:
-                await _close_http_session()
-            except Exception as e:
-                log.warning("[Cove] HTTP session close failed: %s", e)
-            await super().close()
-        except BaseException as e:
-            close_future.set_exception(e)
-            close_future.exception()  # Avoid an unobserved error if no other caller awaited it.
-            raise
-        else:
-            close_future.set_result(None)
+                    await asyncio.shield(close_future)
+                except asyncio.CancelledError:
+                    cancelled = True
+            await asyncio.shield(close_future)
+            if cancelled:
+                raise asyncio.CancelledError
+
+        await wait_for_close()
 
     async def on_message(self, message: discord.Message):
         if message.author.bot:
@@ -5564,4 +5595,9 @@ if EFFECTIVE_FRIEND_GUILD_IDS:
 
 
 if __name__ == "__main__":
-    client.run(TOKEN)
+    try:
+        client.run(TOKEN)
+    except asyncio.CancelledError:
+        if not _shutdown_requested:
+            raise
+        log.info("[Cove] Shutdown complete.")

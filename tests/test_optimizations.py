@@ -1,3 +1,4 @@
+import ast
 import asyncio
 import gc
 import json
@@ -2298,6 +2299,7 @@ def _allow_manual_media(monkeypatch):
 
 def test_setup_hook_registers_only_sigterm(monkeypatch):
     handlers = []
+    monkeypatch.setattr(bot, "_client_run_task", None, raising=False)
 
     class FakeLoop:
         def add_signal_handler(self, signum, callback):
@@ -2318,10 +2320,79 @@ def test_setup_hook_registers_only_sigterm(monkeypatch):
         monkeypatch.setattr(bot, "spawn_tracked", discard_periodic)
         monkeypatch.setattr(client, "_sync_tree_with_timeout", sync)
         await client.setup_hook()
+        assert bot._client_run_task is asyncio.current_task()
 
     asyncio.run(runner())
     assert handlers == [(signal.SIGTERM, bot._request_shutdown)]
     assert all(signum != signal.SIGINT for signum, _ in handlers)
+
+
+def test_capture_before_registration(monkeypatch):
+    monkeypatch.setattr(bot, "_client_run_task", None, raising=False)
+    monkeypatch.setattr(bot, "_shutdown_requested", False, raising=False)
+    monkeypatch.setattr(bot, "_shutting_down", False)
+    registered = []
+
+    class FakeLoop:
+        def add_signal_handler(self, signum, callback):
+            assert signum == signal.SIGTERM
+            assert bot._client_run_task is asyncio.current_task()
+            registered.append(callback)
+
+        async def run_in_executor(self, executor, function):
+            pass
+
+    async def sync(*args):
+        pass
+
+    def discard_periodic(coro):
+        coro.close()
+
+    async def runner():
+        client = bot.CoveBot()
+        monkeypatch.setattr(bot, "client", client)
+        monkeypatch.setattr(asyncio, "get_running_loop", lambda: FakeLoop())
+        monkeypatch.setattr(bot, "spawn_tracked", discard_periodic)
+        monkeypatch.setattr(client, "_sync_tree_with_timeout", sync)
+        await client.setup_hook()
+        task = asyncio.current_task()
+        assert registered
+        registered[0]()
+        assert task.cancelling() == 1
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.sleep(0)
+
+    asyncio.run(runner())
+
+
+def test_synchronous_admission_barrier(monkeypatch):
+    monkeypatch.setattr(bot, "_shutdown_requested", False, raising=False)
+    monkeypatch.setattr(bot, "_shutting_down", False)
+    monkeypatch.setattr(bot, "_queued_jobs", 0)
+    monkeypatch.setattr(bot, "_inflight_urls", set())
+    url = "https://example.com/shared-shutdown-barrier"
+    guild = SimpleNamespace(id=1, premium_tier=0)
+    key = bot._work_key(bot._inflight_key("video", url, guild))
+    shared = SimpleNamespace(subscribers=1, task=SimpleNamespace(done=lambda: False))
+    monkeypatch.setattr(bot, "_shared_jobs", {key: shared})
+    run_task = SimpleNamespace(done=lambda: False, cancel=MagicMock())
+    monkeypatch.setattr(bot, "_client_run_task", run_task, raising=False)
+    monkeypatch.setattr(bot.client, "_close_future", None)
+
+    async def runner():
+        bot._request_shutdown()
+        assert bot._shutdown_requested is True
+        assert bot._shutting_down is True
+        assert bot._try_reserve_job_slot() is False
+        assert bot._queued_jobs == 0
+
+        events = []
+        await bot.process_url(url, guild, *_inflight_callbacks(events))
+        assert shared.subscribers == 1
+        assert len(events) == 1 and events[0][0] == "error"
+        assert events[0][1].startswith(bot.BUSY_MESSAGE)
+
+    asyncio.run(runner())
 
 
 def test_shutdown_blocks_job_reservation_and_shared_admission(monkeypatch):
@@ -2524,30 +2595,282 @@ def test_slash_shared_subscriber_drains_and_releases_once(monkeypatch, tmp_path,
     asyncio.run(runner())
 
 
-def test_repeated_sigterm_schedules_one_close(monkeypatch):
-    monkeypatch.setattr(bot, "_shutdown_task", None)
-    calls = []
-    started = asyncio.Event()
+def test_sigterm_wakes_reconnect_backoff(monkeypatch):
+    class FakeClient:
+        def __init__(self):
+            self._close_future = None
+            self.closed = False
+            self.close_calls = 0
+            self.sleeping = asyncio.Event()
 
-    async def fake_close():
-        calls.append(True)
-        started.set()
-        await asyncio.Event().wait()
+        async def __aenter__(self):
+            return self
 
-    monkeypatch.setattr(bot.client, "close", fake_close)
+        async def __aexit__(self, exc_type, exc_value, traceback):
+            await self.close()
+
+        async def close(self):
+            if self._close_future is not None:
+                await asyncio.shield(self._close_future)
+                return
+            self._close_future = asyncio.get_running_loop().create_future()
+            self.close_calls += 1
+            self.closed = True
+            self._close_future.set_result(None)
+
+    async def reconnect_runner(client):
+        monkeypatch.setattr(bot, "_client_run_task", asyncio.current_task(), raising=False)
+        async with client:
+            while not client.closed:
+                try:
+                    client.sleeping.set()
+                    await asyncio.sleep(3600)
+                except asyncio.CancelledError:
+                    raise
 
     async def runner():
-        bot._request_shutdown()
-        first = bot._shutdown_task
-        bot._request_shutdown()
-        assert bot._shutdown_task is first
-        await started.wait()
-        assert calls == [True]
-        first.cancel()
-        await asyncio.gather(first, return_exceptions=True)
+        # S16 closes separately; a sleeping Client.connect() runner stays pending.
+        old_client = FakeClient()
+        old_runner = asyncio.create_task(reconnect_runner(old_client))
+        await old_client.sleeping.wait()
+        await old_client.close()
+        assert old_client.closed and old_client.close_calls == 1
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(asyncio.shield(old_runner), 0.02)
+        assert not old_runner.done()
+        old_runner.cancel()
+        await asyncio.gather(old_runner, return_exceptions=True)
+
+        client = FakeClient()
+        monkeypatch.setattr(bot, "client", client)
+        monkeypatch.setattr(bot, "_shutdown_requested", False, raising=False)
+        monkeypatch.setattr(bot, "_shutting_down", False)
+        run_task = asyncio.create_task(reconnect_runner(client))
+        try:
+            await client.sleeping.wait()
+            bot._request_shutdown()
+            result = await asyncio.wait_for(asyncio.gather(run_task, return_exceptions=True), 0.2)
+            assert isinstance(result[0], asyncio.CancelledError)
+            assert client.closed and client.close_calls == 1
+        finally:
+            if not run_task.done():
+                run_task.cancel()
+                await asyncio.gather(run_task, return_exceptions=True)
 
     asyncio.run(runner())
-    monkeypatch.setattr(bot, "_shutdown_task", None)
+
+
+def test_close_future_guard_prevents_second_cancel(monkeypatch):
+    monkeypatch.setattr(bot, "_shutdown_requested", False, raising=False)
+    monkeypatch.setattr(bot, "_shutting_down", False)
+
+    async def runner():
+        close_future = asyncio.get_running_loop().create_future()
+        client = SimpleNamespace(_close_future=close_future)
+        monkeypatch.setattr(bot, "client", client)
+        run_task = asyncio.create_task(asyncio.Event().wait())
+        monkeypatch.setattr(bot, "_client_run_task", run_task, raising=False)
+        try:
+            await asyncio.sleep(0)
+            bot._request_shutdown()
+            assert bot._shutdown_requested is True
+            assert run_task.cancelling() == 0
+        finally:
+            run_task.cancel()
+            await asyncio.gather(run_task, return_exceptions=True)
+            close_future.set_result(None)
+
+    asyncio.run(runner())
+
+
+def test_shutdown_during_close_does_not_interrupt_close(monkeypatch):
+    monkeypatch.setattr(bot, "_shutdown_requested", False, raising=False)
+    monkeypatch.setattr(bot, "_shutting_down", False)
+    monkeypatch.setattr(bot, "_active_tasks", set())
+    monkeypatch.setattr(bot, "_cache_write_queue", [])
+    entered = asyncio.Event()
+    release = asyncio.Event()
+    calls = []
+
+    async def close_session():
+        entered.set()
+        await release.wait()
+        calls.append("session")
+
+    async def close_discord(self):
+        self._fake_base_closed = True
+        calls.append("discord")
+
+    monkeypatch.setattr(bot, "_close_http_session", close_session)
+    monkeypatch.setattr(discord.Client, "close", close_discord)
+
+    async def runner():
+        client = bot.CoveBot()
+        monkeypatch.setattr(bot, "client", client)
+        run_task = asyncio.create_task(client.close())
+        monkeypatch.setattr(bot, "_client_run_task", run_task, raising=False)
+        await asyncio.wait_for(entered.wait(), 1)
+        assert client._close_future is not None
+        bot._request_shutdown()
+        assert bot._shutdown_requested is True
+        assert run_task.cancelling() == 0
+        release.set()
+        await asyncio.wait_for(run_task, 1)
+        assert client._close_future.done()
+        assert client._fake_base_closed is True
+        assert calls == ["session", "discord"]
+
+    asyncio.run(runner())
+
+
+def test_second_cancel_during_close_finishes_cleanup(monkeypatch):
+    monkeypatch.setattr(bot, "_shutting_down", False)
+    monkeypatch.setattr(bot, "_active_tasks", set())
+    monkeypatch.setattr(bot, "_cache_write_queue", ["pending"])
+    started = asyncio.Event()
+    in_session = asyncio.Event()
+    release_session = asyncio.Event()
+    order = []
+
+    async def tracked_work():
+        started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            order.append("drain")
+            raise
+
+    def flush_cache():
+        order.append("cache")
+
+    async def close_session():
+        in_session.set()
+        await release_session.wait()
+        order.append("session")
+
+    async def close_discord(self):
+        order.append("discord")
+
+    monkeypatch.setattr(bot, "_flush_cache_writes", flush_cache)
+    monkeypatch.setattr(bot, "_close_http_session", close_session)
+    monkeypatch.setattr(discord.Client, "close", close_discord)
+
+    async def runner():
+        client = bot.CoveBot()
+        loop = asyncio.get_running_loop()
+
+        def run_cache(executor, function):
+            assert executor is None
+            result = loop.create_future()
+            function()
+            result.set_result(None)
+            return result
+
+        monkeypatch.setattr(loop, "run_in_executor", run_cache)
+        work = bot.spawn_tracked(tracked_work())
+        await started.wait()
+
+        async def run_client():
+            try:
+                await asyncio.Event().wait()
+            finally:
+                await client.close()
+
+        run_task = asyncio.create_task(run_client())
+        await asyncio.sleep(0)
+        run_task.cancel()  # SIGTERM starts close() in the client runner.
+        await asyncio.wait_for(in_session.wait(), 1)
+        assert order == ["drain", "cache"]
+        run_task.cancel()  # Native SIGINT cancels the same runner again.
+        await asyncio.sleep(0)
+        assert not run_task.done()
+        assert not client._close_future.done()
+
+        release_session.set()
+        result = await asyncio.wait_for(
+            asyncio.gather(run_task, return_exceptions=True), 1
+        )
+        assert isinstance(result[0], asyncio.CancelledError)
+        await asyncio.gather(work, return_exceptions=True)
+        assert order == ["drain", "cache", "session", "discord"]
+        assert client._close_future.done()
+        assert client._close_future.exception() is None
+        await client.close()
+        assert order == ["drain", "cache", "session", "discord"]
+
+    asyncio.run(runner())
+
+
+def test_repeated_request_shutdown_cancels_once(monkeypatch):
+    monkeypatch.setattr(bot, "_shutdown_requested", False, raising=False)
+    monkeypatch.setattr(bot, "_shutting_down", False)
+    task = SimpleNamespace(done=lambda: False, cancel=MagicMock())
+    monkeypatch.setattr(bot, "_client_run_task", task, raising=False)
+    monkeypatch.setattr(bot.client, "_close_future", None)
+
+    bot._request_shutdown()
+    bot._request_shutdown()
+    task.cancel.assert_called_once_with()
+    assert bot._shutdown_requested is True
+    assert not hasattr(bot, "_shutdown_task")
+
+
+def _execute_main_with_run(run, shutdown_requested):
+    source = Path(bot.__file__).read_text()
+    main = next(
+        node for node in ast.parse(source).body
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.Compare)
+        and isinstance(node.test.left, ast.Name)
+        and node.test.left.id == "__name__"
+    )
+    code = compile(ast.Module(body=[main], type_ignores=[]), bot.__file__, "exec")
+    namespace = {
+        "__name__": "__main__",
+        "client": SimpleNamespace(run=run),
+        "TOKEN": "test-token",
+        "asyncio": asyncio,
+        "_shutdown_requested": shutdown_requested,
+        "log": SimpleNamespace(info=lambda *args: None),
+    }
+    exec(code, namespace)
+    return main
+
+
+def test_intentional_cancelled_error_clean_exit():
+    def cancelled(token):
+        raise asyncio.CancelledError
+
+    _execute_main_with_run(cancelled, True)
+
+
+def test_unexpected_cancelled_error_propagates():
+    def cancelled(token):
+        raise asyncio.CancelledError
+
+    with pytest.raises(asyncio.CancelledError):
+        _execute_main_with_run(cancelled, False)
+
+
+def test_fatal_exception_propagates():
+    error = RuntimeError("fatal Discord error")
+
+    def fatal(token):
+        raise error
+
+    with pytest.raises(RuntimeError) as raised:
+        _execute_main_with_run(fatal, True)
+    assert raised.value is error
+
+
+def test_normal_reconnect_default_unchanged():
+    calls = []
+
+    def record_run(*args, **kwargs):
+        calls.append((args, kwargs))
+
+    _execute_main_with_run(record_run, False)
+    assert calls == [(('test-token',), {})]
 
 
 def test_close_is_reentrant_and_empty_drain_completes(monkeypatch):

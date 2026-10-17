@@ -3121,3 +3121,182 @@ def test_stale_shared_job_finalization_does_not_release_replacement_slot(monkeyp
         assert bot._shared_jobs == {}
 
     asyncio.run(runner())
+
+
+# ── S18: transient network/rate-limit failures must classify as ERROR, not NOVIDEO ──
+
+TRANSIENT_MESSAGE = "Download temporarily failed due to a network or rate-limit issue. Try again shortly."
+
+_S18_DOWNLOAD_CALLS = {
+    "video": lambda url: bot.download_and_compress(url, None),
+    "audio": lambda url: bot.download_audio(url, None),
+    "clip": lambda url: bot.download_and_clip(url, None, 1.0, 2.0),
+    "gif": lambda url: bot.download_and_gif(url, None),
+}
+
+
+def _s18_run(monkeypatch, tmp_path, kind, code, out, url="https://example.com/media"):
+    async def fake_ytdlp(url, cmd, tmp, timeout, **kwargs):
+        return code, out
+
+    monkeypatch.setattr(bot, "_make_job_tmpdir", lambda: str(tmp_path / kind))
+    monkeypatch.setattr(bot, "_run_ytdlp_with_info_cache", fake_ytdlp)
+
+    return asyncio.run(_S18_DOWNLOAD_CALLS[kind](url))
+
+
+@pytest.mark.parametrize("kind", ["video", "audio", "clip", "gif"])
+@pytest.mark.parametrize("timeout_line", [
+    "[ERROR] Subprocess timed out.",
+    "[ERROR] Subprocess timed out and did not exit cleanly.",
+], ids=["timeout", "unclean-timeout"])
+@pytest.mark.parametrize("specific", ["", "ERROR: This post is private\n"], ids=["plain", "specific"])
+def test_s18_subprocess_timeout_is_transient_error_not_novideo(monkeypatch, tmp_path, kind, timeout_line, specific):
+    out = f"[INFO] Downloading...\n{specific}{timeout_line}"
+    _, log_text = _s18_run(monkeypatch, tmp_path, kind, 124, out)
+    assert "[NOVIDEO]" not in log_text
+    assert f"[ERROR] {TRANSIENT_MESSAGE}" in log_text
+    novideo, _, error = bot._parse_log_markers(log_text)
+    assert error == TRANSIENT_MESSAGE
+    assert novideo is False
+    assert "Subprocess timed out" not in log_text
+    assert "[INFO] Downloading..." in log_text
+    assert specific.strip() in log_text
+
+
+@pytest.mark.parametrize("kind", ["video", "audio", "clip", "gif"])
+@pytest.mark.parametrize("out", [
+    "ERROR: HTTP Error 429: Too Many Requests",
+    "ERROR: Too Many Requests",
+])
+def test_s18_rate_limit_is_transient_error_not_novideo(monkeypatch, tmp_path, kind, out):
+    _, log_text = _s18_run(monkeypatch, tmp_path, kind, 1, out)
+    assert "[NOVIDEO]" not in log_text
+    assert f"[ERROR] {TRANSIENT_MESSAGE}" in log_text
+    assert bot._parse_log_markers(log_text) == (False, None, TRANSIENT_MESSAGE)
+
+
+@pytest.mark.parametrize("kind", ["video", "audio", "clip", "gif"])
+def test_s18_generic_unable_to_download_webpage_is_transient(monkeypatch, tmp_path, kind):
+    out = "ERROR: Unable to download webpage: <urlopen error [Errno -3] Temporary failure in name resolution>"
+    _, log_text = _s18_run(monkeypatch, tmp_path, kind, 1, out)
+    assert "[NOVIDEO]" not in log_text
+    assert f"[ERROR] {TRANSIENT_MESSAGE}" in log_text
+    assert bot._parse_log_markers(log_text) == (False, None, TRANSIENT_MESSAGE)
+
+
+@pytest.mark.parametrize("kind", ["video", "audio", "clip", "gif"])
+@pytest.mark.parametrize("out", [
+    "WARNING: Read timed out, retrying\nERROR: This post is private",
+    "ERROR: HTTP Error 429: Too Many Requests\nHTTP Error 403: Forbidden",
+    "WARNING: Connection timed out\nERROR: Sign in to confirm you're not a bot",
+], ids=["private", "403", "sign-in"])
+def test_s18_specific_error_beats_transient(monkeypatch, tmp_path, kind, out):
+    _, log_text = _s18_run(monkeypatch, tmp_path, kind, 1, out)
+    novideo, _, error = bot._parse_log_markers(log_text)
+    assert error is not None
+    assert error != TRANSIENT_MESSAGE
+    assert novideo is False
+
+
+@pytest.mark.parametrize("kind", ["video", "audio", "clip", "gif"])
+@pytest.mark.parametrize("prefix", ["", "WARNING: Read timed out, retrying\n"], ids=["plain", "retry"])
+@pytest.mark.parametrize("diagnostic, expected", [
+    ("HTTP Error 401: Unauthorized", "401"),
+    ("[SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: unable to get local issuer certificate", "CERTIFICATE_VERIFY_FAILED"),
+    ("certificate verify failed: unable to get local issuer certificate", "certificate verify failed"),
+    ("[SSL: WRONG_VERSION_NUMBER] wrong version number", "WRONG_VERSION_NUMBER"),
+], ids=["401", "certificate-code", "certificate-text", "ssl"])
+def test_s18_generic_wrapper_preserves_specific_diagnostic(monkeypatch, tmp_path, kind, prefix, diagnostic, expected):
+    out = f"{prefix}ERROR: Unable to download webpage: {diagnostic}"
+    _, log_text = _s18_run(monkeypatch, tmp_path, kind, 1, out)
+    novideo, _, error = bot._parse_log_markers(log_text)
+    assert error is not None
+    assert error != TRANSIENT_MESSAGE
+    assert expected in error
+    assert novideo is False
+
+
+@pytest.mark.parametrize("kind", ["video", "audio", "clip", "gif"])
+@pytest.mark.parametrize("diagnostic", [
+    "SSL certificate problem: unable to get local issuer certificate (caused by CertificateVerifyError('x'))",
+    "<urlopen error CertificateVerifyError: x>",
+    "self-signed certificate in certificate chain",
+    "certificate has expired",
+], ids=["curl-certificate", "certificate-verify-error", "self-signed", "expired"])
+def test_s18_tls_wrapper_preserves_diagnostic(monkeypatch, tmp_path, kind, diagnostic):
+    out = f"ERROR: Unable to download webpage: {diagnostic}"
+    _, log_text = _s18_run(monkeypatch, tmp_path, kind, 1, out)
+    novideo, _, error = bot._parse_log_markers(log_text)
+    assert error is not None
+    assert error != TRANSIENT_MESSAGE
+    assert diagnostic in error
+    assert novideo is False
+
+
+@pytest.mark.parametrize("kind", ["video", "audio", "clip", "gif"])
+def test_s18_ssl_read_timeout_stays_transient(monkeypatch, tmp_path, kind):
+    out = "ERROR: Unable to download webpage: The read operation timed out (caused by SSLError('x'))"
+    _, log_text = _s18_run(monkeypatch, tmp_path, kind, 1, out)
+    assert bot._parse_log_markers(log_text) == (False, None, TRANSIENT_MESSAGE)
+
+
+@pytest.mark.parametrize("kind", ["video", "audio", "clip", "gif"])
+def test_s18_runtime_timeout_overrides_certificate_verify_error(monkeypatch, tmp_path, kind):
+    out = "ERROR: CertificateVerifyError: x\n[download] x\n[ERROR] Subprocess timed out."
+    _, log_text = _s18_run(monkeypatch, tmp_path, kind, 124, out)
+    assert bot._parse_log_markers(log_text) == (False, None, TRANSIENT_MESSAGE)
+    assert "Subprocess timed out" not in log_text
+
+
+def test_s18_twitter_unsupported_url_stays_silent_after_retry(monkeypatch, tmp_path):
+    async def has_video(url):
+        return True
+
+    monkeypatch.setattr(bot, "twitter_has_video", has_video)
+    url = "https://x.com/user/status/1"
+    out = f"WARNING: Read timed out, retrying\nERROR: Unsupported URL: {url}"
+    _, log_text = _s18_run(monkeypatch, tmp_path, "video", 1, out, url=url)
+    assert bot._parse_log_markers(log_text) == (True, None, None)
+    assert "[ERROR]" not in log_text
+
+
+@pytest.mark.parametrize("kind", ["video", "audio", "clip", "gif"])
+@pytest.mark.parametrize("out", ["ERROR: connect timeout=20", "ERROR: TransportError"], ids=["connect-timeout", "transport-error"])
+def test_s18_direct_transient_phrases(monkeypatch, tmp_path, kind, out):
+    _, log_text = _s18_run(monkeypatch, tmp_path, kind, 1, out)
+    assert bot._parse_log_markers(log_text) == (False, None, TRANSIENT_MESSAGE)
+
+
+@pytest.mark.parametrize("kind", ["video", "audio", "clip", "gif"])
+def test_s18_mixed_rate_limit_and_no_media_prefers_transient(monkeypatch, tmp_path, kind):
+    out = "ERROR: HTTP Error 429: Too Many Requests. There is no video in this post"
+    _, log_text = _s18_run(monkeypatch, tmp_path, kind, 1, out)
+    assert "[NOVIDEO]" not in log_text
+    assert f"[ERROR] {TRANSIENT_MESSAGE}" in log_text
+
+
+@pytest.mark.parametrize("kind", ["video", "audio", "clip", "gif"])
+def test_s18_generic_wrapper_does_not_steal_specific_404(monkeypatch, tmp_path, kind):
+    out = "ERROR: Unable to download webpage: HTTP Error 404: Not Found"
+    _, log_text = _s18_run(monkeypatch, tmp_path, kind, 1, out)
+    assert "[NOVIDEO]" not in log_text
+    assert TRANSIENT_MESSAGE not in log_text
+    assert "404" in log_text or "not found" in log_text.lower()
+
+
+@pytest.mark.parametrize("kind", ["video", "audio", "clip", "gif"])
+def test_s18_generic_wrapper_does_not_steal_specific_403(monkeypatch, tmp_path, kind):
+    out = "ERROR: Unable to download webpage: HTTP Error 403: Forbidden"
+    _, log_text = _s18_run(monkeypatch, tmp_path, kind, 1, out)
+    assert "[NOVIDEO]" not in log_text
+    assert TRANSIENT_MESSAGE not in log_text
+    assert "403" in log_text or "denied" in log_text.lower()
+
+
+@pytest.mark.parametrize("kind", ["video", "audio", "clip", "gif"])
+def test_s18_true_no_media_phrases_still_classify_as_novideo(monkeypatch, tmp_path, kind):
+    out = "ERROR: No video could be found in this post"
+    _, log_text = _s18_run(monkeypatch, tmp_path, kind, 1, out)
+    assert "[NOVIDEO]" in log_text
+    assert "[ERROR]" not in log_text

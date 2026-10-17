@@ -260,13 +260,30 @@ NO_VIDEO_PHRASES = (
     "is not a video",
     "does not have a video",
     "no media",
+)
+
+DEFINITE_TRANSIENT_FAILURE_PHRASES = (
     "HTTP Error 429",
     "Too Many Requests",
     "Connection timed out",
     "connect timeout",
     "timed out",
     "TransportError",
-    "Unable to download webpage",
+)
+
+TLS_FAILURE_SIGNALS = (
+    "certificate_verify_failed",
+    "certificate verify failed",
+    "certificateverifyerror",
+    "ssl certificate problem",
+    "certificate has expired",
+    "self signed certificate",
+    "self-signed certificate",
+    "[ssl:",
+)
+
+TRANSIENT_DOWNLOAD_MESSAGE = (
+    "Download temporarily failed due to a network or rate-limit issue. Try again shortly."
 )
 
 REDDIT_NO_MEDIA_PHRASES = (
@@ -2111,6 +2128,32 @@ def user_facing_download_error(output: str, *, media: str = "video") -> str | No
     return None
 
 
+def _is_transient_download_failure(output: str, *, webpage_fallback: bool = False) -> bool:
+    if any(line.startswith("[ERROR] Subprocess timed out") for line in output.splitlines()):
+        return True
+    lowered = output.lower()
+    if (
+        user_facing_download_error(output) is not None
+        or "http error 401" in lowered
+        or any(signal in lowered for signal in TLS_FAILURE_SIGNALS)
+    ):
+        return False
+    return webpage_fallback or any(
+        phrase.lower() in lowered for phrase in DEFINITE_TRANSIENT_FAILURE_PHRASES
+    )
+
+
+def _append_transient_error(_log: list[str]) -> None:
+    _log[:] = [
+        "".join(
+            line for line in entry.splitlines(keepends=True)
+            if not line.startswith("[ERROR] Subprocess timed out")
+        )
+        for entry in _log
+    ]
+    _log.append(f"[ERROR] {TRANSIENT_DOWNLOAD_MESSAGE}")
+
+
 def user_facing_upload_error(error: Exception) -> str:
     text = str(error)
     lowered = text.lower()
@@ -3582,6 +3625,8 @@ async def download_and_compress(
             or "confirm you're not a bot" in out.lower()
         ):
             _log.append("[ERROR] YouTube bot detection triggered.")
+        elif _is_transient_download_failure(out):
+            _append_transient_error(_log)
         elif any(phrase.lower() in out.lower() for phrase in NO_VIDEO_PHRASES):
             if is_instagram:
                 log.info("[cove] Instagram no-video response was unavailable, replying without rewrite.")
@@ -3650,6 +3695,8 @@ async def download_and_compress(
             _log.append("[ERROR] Access denied (403). Cookies may be needed or expired.")
         elif "HTTP Error 404" in out:
             _log.append("[ERROR] Video not found (404).")
+        elif "Unable to download webpage" in out and _is_transient_download_failure(out, webpage_fallback=True):
+            _append_transient_error(_log)
         else:
             raw_last = out.strip().splitlines()[-1] if out.strip() else ""
             _log.append(f"[ERROR] {_sanitize_error_line(raw_last)}")
@@ -3864,7 +3911,9 @@ async def download_and_clip(
                 log.info("[yt-dlp clip] Mirror fallback trim failed (%d) for %s", t_code, url)
 
     if code != 0:
-        if any(phrase.lower() in out.lower() for phrase in NO_VIDEO_PHRASES):
+        if _is_transient_download_failure(out):
+            _append_transient_error(_log)
+        elif any(phrase.lower() in out.lower() for phrase in NO_VIDEO_PHRASES):
             _log.append("[NOVIDEO]")
         elif "Unsupported URL" in out and is_reddit and any(p in unquote(out) for p in REDDIT_SILENT_URL_PATTERNS):
             _log.append("[NOVIDEO]")
@@ -3878,6 +3927,8 @@ async def download_and_clip(
             _log.append("[ERROR] Access denied (403). Cookies may be needed or expired.")
         elif "HTTP Error 404" in out:
             _log.append("[ERROR] Video not found (404).")
+        elif "Unable to download webpage" in out and _is_transient_download_failure(out, webpage_fallback=True):
+            _append_transient_error(_log)
         else:
             raw_last = out.strip().splitlines()[-1] if out.strip() else ""
             _log.append(f"[ERROR] {_sanitize_error_line(raw_last)}")
@@ -4011,7 +4062,9 @@ async def download_and_gif(
             code = 0
 
     if code != 0:
-        if any(phrase.lower() in out.lower() for phrase in NO_VIDEO_PHRASES):
+        if _is_transient_download_failure(out):
+            _append_transient_error(_log)
+        elif any(phrase.lower() in out.lower() for phrase in NO_VIDEO_PHRASES):
             _log.append("[NOVIDEO]")
         elif "Unsupported URL" in out and is_reddit and any(p in unquote(out) for p in REDDIT_SILENT_URL_PATTERNS):
             _log.append("[NOVIDEO]")
@@ -4025,6 +4078,8 @@ async def download_and_gif(
             _log.append("[ERROR] Access denied (403). Cookies may be needed or expired.")
         elif "HTTP Error 404" in out:
             _log.append("[ERROR] Video not found (404).")
+        elif "Unable to download webpage" in out and _is_transient_download_failure(out, webpage_fallback=True):
+            _append_transient_error(_log)
         else:
             raw_last = out.strip().splitlines()[-1] if out.strip() else ""
             _log.append(f"[ERROR] {_sanitize_error_line(raw_last)}")
@@ -4146,7 +4201,9 @@ async def download_audio(
             return None, "\n".join(_log)
 
         if code != 0:
-            if any(phrase.lower() in out.lower() for phrase in NO_VIDEO_PHRASES):
+            if _is_transient_download_failure(out):
+                _append_transient_error(_log)
+            elif any(phrase.lower() in out.lower() for phrase in NO_VIDEO_PHRASES):
                 log.info("[cove] No audio / network issue — ignoring silently.")
                 _log.append("[NOVIDEO]")
             elif is_reddit and "[generic]" in out and not is_reddit_short:
@@ -4178,6 +4235,8 @@ async def download_audio(
                 _log.append("[ERROR] Access denied (403). Cookies may be needed or expired.")
             elif "HTTP Error 404" in out:
                 _log.append("[ERROR] Video not found (404).")
+            elif "Unable to download webpage" in out and _is_transient_download_failure(out, webpage_fallback=True):
+                _append_transient_error(_log)
             else:
                 raw_last = out.strip().splitlines()[-1] if out.strip() else ""
                 _log.append(f"[ERROR] {_sanitize_error_line(raw_last)}")

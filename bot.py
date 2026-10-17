@@ -139,6 +139,9 @@ if COOKIES_EXIST:
 
 AUDIO_KBPS           = 128
 MAX_DURATION_SECONDS = 600
+# --trim-filenames counts chars and only trims before the second-to-last dot; B caps bytes before sanitizing.
+# Sanitizing can triple ASCII punctuation bytes, so 70*3 + extension/suffixes stays below NAME_MAX=255.
+YTDLP_OUTPUT_NAME    = "%(title).70B.%(ext)s"
 NYO_EMOJI            = "<:NYO:1312902725750624316>"
 
 MAX_CONCURRENT_JOBS    = _require_int_env("MAX_CONCURRENT_JOBS", default="8")
@@ -3522,7 +3525,7 @@ async def download_and_compress(
             return None, "\n".join(_log)
 
     tmp = _make_job_tmpdir()
-    output_template = str(Path(tmp) / "%(title)s.%(ext)s")
+    output_template = str(Path(tmp) / YTDLP_OUTPUT_NAME)
 
     if FAST_SOURCE_MODE:
         log.info("[cove] Fast source mode enabled; applying site-specific fast selectors.")
@@ -3784,7 +3787,7 @@ async def download_and_compress(
             "--extractor-retries", "3",
             "--max-filesize", f"{MAX_FILESIZE_MB}M",
             "--no-playlist",
-            "-o", str(Path(tmp2) / "%(title)s.%(ext)s"),
+            "-o", str(Path(tmp2) / YTDLP_OUTPUT_NAME),
         ]
         if COOKIES_EXIST:
             cmd_720.extend(["--cookies", COOKIES_FILE])
@@ -3886,7 +3889,7 @@ async def download_and_clip(
             return None, "\n".join(_log)
 
     tmp = _make_job_tmpdir()
-    output_template = str(Path(tmp) / "%(title)s.%(ext)s")
+    output_template = str(Path(tmp) / YTDLP_OUTPUT_NAME)
 
     if is_reddit:
         fmt = FORMAT_REDDIT_FAST if FAST_SOURCE_MODE else FORMAT_REDDIT
@@ -4044,7 +4047,7 @@ async def download_and_gif(
             return None, "\n".join(_log)
 
     tmp = _make_job_tmpdir()
-    output_template = str(Path(tmp) / "%(title)s.%(ext)s")
+    output_template = str(Path(tmp) / YTDLP_OUTPUT_NAME)
 
     if is_reddit:
         fmt = FORMAT_REDDIT_FAST if FAST_SOURCE_MODE else FORMAT_REDDIT
@@ -4194,7 +4197,7 @@ async def download_audio(
     tmp = _make_job_tmpdir()
     keep_tmp = False
     try:
-        output_template = str(Path(tmp) / "%(title)s.%(ext)s")
+        output_template = str(Path(tmp) / YTDLP_OUTPUT_NAME)
 
         cmd = ["yt-dlp", "--no-config", "--user-agent", YT_DLP_UA]
 

@@ -1027,7 +1027,7 @@ def test_process_url_instagram_video_success_sends_no_rewrite(monkeypatch):
         assert "--playlist-items" in cmd
         assert cmd[cmd.index("--playlist-items") + 1] == "5"
         assert "--no-playlist" not in cmd
-        output_path = Path(cmd[cmd.index("-o") + 1].replace("%(title)s.%(ext)s", "clip.mp4"))
+        output_path = Path(cmd[cmd.index("-o") + 1].replace(bot.YTDLP_OUTPUT_NAME, "clip.mp4"))
         output_path.write_bytes(b"video")
         return 0, "downloaded"
 

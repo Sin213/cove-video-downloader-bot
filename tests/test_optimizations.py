@@ -3135,6 +3135,154 @@ _S18_DOWNLOAD_CALLS = {
 }
 
 
+@pytest.fixture
+def filename_download(monkeypatch, tmp_path):
+    calls = []
+    jobs = []
+
+    def make_tmpdir():
+        job = tmp_path / f"job{len(jobs)}"
+        job.mkdir()
+        jobs.append(job)
+        return str(job)
+
+    async def identity(url):
+        return url
+
+    async def media_info(path):
+        return {"format": {"duration": "2"}, "streams": []}
+
+    async def convert(src, dest, target_mb):
+        Path(dest).write_bytes(b"gif")
+        return True, "converted"
+
+    async def probe(url, quality, target_size):
+        return quality
+
+    monkeypatch.setattr(bot, "_make_job_tmpdir", make_tmpdir)
+    monkeypatch.setattr(bot, "resolve_arazu", identity)
+    monkeypatch.setattr(bot, "resolve_reddit_shortlink", identity)
+    monkeypatch.setattr(bot, "get_media_info", media_info)
+    monkeypatch.setattr(bot, "convert_to_gif", convert)
+    monkeypatch.setattr(bot, "_probe_youtube_quality", probe)
+    monkeypatch.setattr(bot, "get_target_mb", lambda guild: 1)
+    monkeypatch.setattr(bot, "USE_ARIA2C", True)
+    monkeypatch.setattr(bot, "COOKIES_EXIST", True)
+    monkeypatch.setattr(bot, "COOKIES_FILE", str(tmp_path / "cookies.txt"))
+
+    def run(kind="video", error=None):
+        async def subprocess(cmd, timeout):
+            assert cmd[0] == "yt-dlp"
+            calls.append((cmd, timeout))
+            output = Path(cmd[cmd.index("-o") + 1])
+            suffix = ".mp3" if kind == "audio" else ".mp4"
+            if error:
+                (output.parent / ("Partial" + suffix)).write_bytes(b"partial media")
+                return 1, error
+            with (output.parent / ("My Video" + suffix)).open("wb") as stream:
+                stream.write(b"media")
+                if kind == "video_720" and len(calls) == 1:
+                    stream.truncate(2 * 1024 * 1024)
+            return 0, "downloaded"
+
+        monkeypatch.setattr(bot, "run_subprocess_timeout", subprocess)
+        if kind == "video_720":
+            result = asyncio.run(bot.download_and_compress(
+                "https://youtube.com/watch?v=abc", None, youtube_quality="1080",
+            ))
+        else:
+            result = asyncio.run(_S18_DOWNLOAD_CALLS[kind](
+                "https://www.facebook.com/reel/4010805205882836",
+            ))
+        return result, calls, jobs
+
+    return run
+
+
+@pytest.mark.parametrize("title", [
+    "Roadster. " + "😎 " * 180,
+    "Roadster. " + "·" * 400,
+    "Roadster. " + "｜" * 150,
+    "Roadster. " + "many spaces " * 40,
+    "Roadster. " + "'quoted' " * 50,
+    "Roadster. ¿Tráfico. " + "🤣 Led " * 180,
+    "Roadster. " + "A" * 400,
+    "Roadster. " + "|" * 180,
+    "Roadster. " + "/" * 180,
+    "Roadster. " + ":" * 180,
+    "Roadster. " + '\"*:<>?|/\\' * 40,
+    '\"*:<>?|/\\' * 40,
+    "日本語" * 100,
+    "日本語. " + "日本語" * 100,
+    "My Video",
+], ids=["emoji", "middle-dot", "full-width-bar", "spaces", "quotes",
+        "mid-title-dots", "ascii", "pipe", "slash", "colon", "mixed-punctuation",
+        "only-punctuation", "cjk", "cjk-dots", "short"])
+def test_ytdlp_filename_byte_bound(filename_download, title):
+    from yt_dlp import YoutubeDL
+
+    _, calls, jobs = filename_download()
+    # Capture the actual production template so RED exercises the old filename behavior.
+    template = calls[0][0][calls[0][0].index("-o") + 1]
+    with YoutubeDL({"outtmpl": template, "trim_file_name": 150}) as ydl:
+        output = Path(ydl.prepare_filename({"id": "synthetic", "title": title, "ext": "mp4"}))
+    assert output.parent == jobs[0]
+    assert output.suffix == ".mp4"
+    assert "\ufffd" not in output.name
+    assert output.name.encode("utf-8").decode("utf-8") == output.name
+    with output.open("wb") as stream:
+        stream.write(b"synthetic video")
+    for suffix in ("", ".info.json", ".f12345-dash.mp4", ".aria2"):
+        assert len((output.name + suffix).encode("utf-8")) <= 255
+    if title == "My Video":
+        assert output.name == "My Video.mp4"
+
+
+@pytest.mark.parametrize("kind", ["video", "clip", "gif", "audio", "video_720"])
+def test_ytdlp_filename_template_per_route(filename_download, kind):
+    (path, _), calls, _ = filename_download(kind)
+    assert path is not None and Path(path).is_file()
+    assert len(calls) == (2 if kind == "video_720" else 1)
+    for index, (cmd, timeout) in enumerate(calls):
+        template = Path(cmd[cmd.index("-o") + 1]).name
+        assert template == "%(title).70B.%(ext)s"
+        assert template == bot.YTDLP_OUTPUT_NAME
+        assert "%(title)s.%(ext)s" not in " ".join(cmd)
+        assert cmd[cmd.index("--trim-filenames") + 1] == "150"
+        assert cmd[cmd.index("--max-filesize") + 1] == f"{bot.MAX_FILESIZE_MB}M"
+        assert cmd[cmd.index("--cookies") + 1] == bot.COOKIES_FILE
+        assert timeout == bot.SUBPROCESS_TIMEOUT
+        assert "--no-config" in cmd and "--no-part" in cmd and "--no-playlist" in cmd
+        assert cmd[cmd.index("-N") + 1] == str(bot.YT_DLP_FRAGMENTS)
+        filters = [cmd[i + 1] for i, flag in enumerate(cmd) if flag == "--match-filter"]
+        assert filters == ([] if kind == "clip" or index == 1 else [
+            "!duration", f"duration <= {bot.MAX_DURATION_SECONDS}",
+        ])
+        if kind == "video_720":
+            assert "--downloader" not in cmd
+            assert cmd[cmd.index("-f") + 1] == bot.YOUTUBE_QUALITY_FORMATS["720" if index else "1080"]
+        else:
+            assert cmd[cmd.index("--downloader") + 1] == "aria2c"
+            assert cmd[cmd.index("--downloader-args") + 1] == "aria2c:-x16 -s16 -k1M"
+            assert cmd[cmd.index("-f") + 1] == ("bestaudio/best" if kind == "audio" else bot.FORMAT_DEFAULT)
+        if kind == "clip":
+            assert cmd[cmd.index("--download-sections") + 1] == "*1.0-2.0"
+        if kind == "audio":
+            assert "-x" in cmd
+            assert cmd[cmd.index("--audio-format") + 1] == "mp3"
+
+
+@pytest.mark.parametrize("kind", ["video", "clip", "gif", "audio"])
+def test_ytdlp_filename_error_does_not_retry(filename_download, kind):
+    error = "ERROR: aria2c exited with code 16: errorCode=16 File name too long"
+    (path, log_text), calls, jobs = filename_download(kind, error=error)
+    assert path is None
+    assert "[ERROR]" in log_text and "File name too long" in log_text
+    assert len(calls) == 1
+    assert calls[0][0][calls[0][0].index("--downloader") + 1] == "aria2c"
+    assert all(not job.exists() for job in jobs)
+
+
 def _s18_run(monkeypatch, tmp_path, kind, code, out, url="https://example.com/media"):
     async def fake_ytdlp(url, cmd, tmp, timeout, **kwargs):
         return code, out

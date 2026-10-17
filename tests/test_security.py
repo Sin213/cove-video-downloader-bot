@@ -1,5 +1,7 @@
 import asyncio
 from pathlib import Path
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, Mock
 
 import pytest
 
@@ -68,6 +70,168 @@ class FakeMessage:
 
 class FakeDiscordError(Exception):
     pass
+
+
+INSTAGRAM_LINK_REEL = "https://www.instagram.com/reel/DehcAu1uCuG/?vrfl=MXhhbDM5ejRkNzQxeQ%3D%3D"
+
+
+@pytest.mark.parametrize("url, expected", [
+    (INSTAGRAM_LINK_REEL, "https://oginstagram.com/reel/DehcAu1uCuG/?vrfl=MXhhbDM5ejRkNzQxeQ%3D%3D"),
+    ("https://www.instagram.com/p/DeaRUvoq4Ro/?xtok=MTRiYXQ1NG83ZGM1dA==",
+     "https://oginstagram.com/p/DeaRUvoq4Ro/?xtok=MTRiYXQ1NG83ZGM1dA=="),
+])
+def test_instagram_link_rewrite_preserves_post_and_query(url, expected):
+    assert bot.rewrite_instagram_link_url(url, "[INSTAGRAM_LINK]\n[NOVIDEO]") == expected
+
+
+@pytest.mark.parametrize("url, log_text", [
+    (INSTAGRAM_LINK_REEL, "[NOVIDEO]"),
+    (INSTAGRAM_LINK_REEL, "[INSTAGRAM_IMAGE]\n[NOVIDEO]"),
+    (INSTAGRAM_LINK_REEL, "prefix [INSTAGRAM_LINK]"),
+    (INSTAGRAM_LINK_REEL, " [INSTAGRAM_LINK] "),
+    ("https://www.instagram.com/profile/", "[INSTAGRAM_LINK]"),
+    ("https://example.com/reel/abc/", "[INSTAGRAM_LINK]"),
+])
+def test_instagram_link_rewrite_requires_exact_marker_and_supported_url(url, log_text):
+    assert bot.rewrite_instagram_link_url(url, log_text) is None
+    assert bot.rewrite_instagram_image_url(INSTAGRAM_LINK_REEL, "[INSTAGRAM_LINK]\n[NOVIDEO]") is None
+
+
+@pytest.mark.parametrize("failure", [None, "send", "forbidden-delete", "http-delete"])
+def test_instagram_link_send_once_without_gallery(monkeypatch, failure):
+    events = []
+    monkeypatch.setattr(bot.discord, "HTTPException", FakeDiscordError)
+    def forbidden_gallery(*args):
+        raise AssertionError("Link fallback must never try a gallery")
+    monkeypatch.setattr(bot, "send_instagram_gallery", forbidden_gallery)
+    error = FakeDiscordError("Discord failure")
+    if failure == "forbidden-delete":
+        monkeypatch.setattr(bot.discord, "Forbidden", FakeDiscordError)
+    message = FakeMessage(events, send_error=error if failure == "send" else None,
+                          delete_error=error if failure in ("forbidden-delete", "http-delete") else None)
+    result = asyncio.run(bot.send_instagram_link_rewrite(message, INSTAGRAM_LINK_REEL, "[INSTAGRAM_LINK]\n[NOVIDEO]"))
+    assert result is (failure != "send")
+    expected = [("send", INSTAGRAM_LINK_REEL.replace("www.instagram.com", "oginstagram.com"))]
+    assert events == (expected if failure == "send" else expected + [("delete", None)])
+
+
+def test_oginstagram_link_is_ignored_to_prevent_reprocessing():
+    assert extract_supported_url("https://oginstagram.com/reel/abc/") is None
+
+
+@pytest.mark.parametrize("diagnostic", ["empty media response", "CERTIFICATE_VERIFY_FAILED"])
+def test_process_url_instagram_verified_video_link_or_specific_error(monkeypatch, tmp_path, diagnostic):
+    events, markers = [], []
+    job = tmp_path / "job"
+    job.mkdir()
+    monkeypatch.setattr(bot, "_make_job_tmpdir", lambda: str(job))
+
+    async def probe(url):
+        return False, None, None  # defer classification to extraction / mirrors
+
+    async def ytdlp(*args, **kwargs):
+        return 1, f"ERROR: Unable to download webpage: {diagnostic}"
+
+    async def mirror(url):
+        return ("video", "https://media.example/clip") if diagnostic == "empty media response" else ("error", None)
+
+    class Session:
+        def get(self, *args, **kwargs):
+            raise OSError("media fetch failed")
+
+    async def unexpected(*args):
+        raise AssertionError(f"Unexpected callback: {args}")
+
+    async def on_error(message):
+        assert diagnostic != "empty media response"
+        events.append(("error", message))
+
+    async def on_no_video(log_text):
+        markers.extend(log_text.splitlines())
+        assert await bot.send_instagram_link_rewrite(FakeMessage(events), INSTAGRAM_LINK_REEL, log_text)
+
+    monkeypatch.setattr(bot, "instagram_post_probe", probe)
+    monkeypatch.setattr(bot, "_run_ytdlp_with_info_cache", ytdlp)
+    monkeypatch.setattr(bot, "_instagram_mirror_media", mirror)
+    monkeypatch.setattr(bot, "_get_http_session", Session)
+    asyncio.run(process_url(INSTAGRAM_LINK_REEL, None, unexpected, on_error, unexpected, on_no_video))
+    assert not job.exists()
+    if diagnostic == "empty media response":
+        assert bot.INSTAGRAM_LINK_MARKER == "[INSTAGRAM_LINK]"
+        assert "[INSTAGRAM_LINK]" in markers and "[NOVIDEO]" in markers
+        assert events == [("send", INSTAGRAM_LINK_REEL.replace("www.instagram.com", "oginstagram.com")), ("delete", None)]
+    else:
+        assert len(events) == 1 and events[0][0] == "error" and diagnostic in events[0][1]
+        assert markers == []
+
+
+def test_process_url_unsupported_instagram_shape_keeps_existing_error(monkeypatch, tmp_path):
+    url = "https://www.instagram.com/someuser/reel/DehcAu1uCuG/"
+    job = tmp_path / "job"
+    job.mkdir()
+    monkeypatch.setattr(bot, "_make_job_tmpdir", lambda: str(job))
+    monkeypatch.setattr(bot, "_run_ytdlp_with_info_cache", AsyncMock(return_value=(1, "ERROR: empty media response")))
+    monkeypatch.setattr(bot, "_instagram_mirror_media", AsyncMock(return_value=("video", "https://media.example/clip")))
+    monkeypatch.setattr(bot, "_get_http_session", lambda: SimpleNamespace(get=Mock(side_effect=OSError("media fetch failed"))))
+    logs = []
+    original_download = bot.download_and_compress
+
+    async def record_download(*args, **kwargs):
+        result = await original_download(*args, **kwargs)
+        logs.append(result[1])
+        return result
+
+    monkeypatch.setattr(bot, "download_and_compress", record_download)
+    success, error, no_video = AsyncMock(), AsyncMock(), AsyncMock()
+    asyncio.run(process_url(url, None, success, error, on_no_video=no_video))
+    no_video.assert_not_awaited()
+    success.assert_not_awaited()
+    error.assert_awaited_once()
+    assert error.await_args.args[0].startswith("Instagram refused to serve this post to the bot.")
+    assert bot.INSTAGRAM_LINK_MARKER not in logs[0].splitlines()
+    assert not job.exists()
+
+
+@pytest.mark.parametrize("entrypoint", ["message", "slash"])
+def test_instagram_link_discord_callback_wiring(monkeypatch, entrypoint):
+    events, tasks = [], []
+    expected = INSTAGRAM_LINK_REEL.replace("www.instagram.com", "oginstagram.com")
+    forbidden = AsyncMock(side_effect=AssertionError("Link path must bypass image/gallery helpers"))
+    monkeypatch.setattr(bot, "send_instagram_gallery", forbidden)
+    monkeypatch.setattr(bot, "send_instagram_image_rewrite", forbidden)
+    monkeypatch.setattr(bot, "rewrite_instagram_image_url", Mock(side_effect=AssertionError("Image rewrite reached")))
+    monkeypatch.setattr(bot, "_validate_manual_url_dns", AsyncMock(return_value=(True, "")))
+
+    async def process(url, guild, on_success, on_error, on_too_big=None, on_no_video=None, **kwargs):
+        assert url == INSTAGRAM_LINK_REEL
+        await on_no_video("[INSTAGRAM_LINK]\n[NOVIDEO]")
+
+    def spawn(coro):
+        task = asyncio.create_task(coro)
+        tasks.append(task)
+        return task
+
+    monkeypatch.setattr(bot, "process_url", process)
+    monkeypatch.setattr(bot, "spawn_tracked", spawn)
+    author = SimpleNamespace(bot=False, id=12345, display_name="Tester")
+    message = FakeMessage(events)
+    message.author, message.content, message.id, message.mentions = author, INSTAGRAM_LINK_REEL, 67890, []
+    message.add_reaction = AsyncMock(side_effect=lambda emoji: events.append(("add", emoji)))
+    message.remove_reaction = AsyncMock(side_effect=lambda emoji, user: events.append(("remove", emoji)))
+    interaction = SimpleNamespace(user=author, guild=None, response=SimpleNamespace(defer=AsyncMock()),
+                                  followup=FakeChannel(events))
+
+    async def run():
+        if entrypoint == "message":
+            await bot.client.on_message(message)
+        else:
+            await bot.download_cmd.callback(interaction, INSTAGRAM_LINK_REEL)
+        await asyncio.gather(*tasks)
+
+    asyncio.run(run())
+    forbidden.assert_not_awaited()
+    assert events == ([("add", "\u23f3"), ("remove", "\u23f3"), ("send", expected), ("delete", None)]
+                      if entrypoint == "message" else [("send", expected)])
 
 
 class FakePermissions:

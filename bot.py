@@ -324,6 +324,7 @@ INSTAGRAM_IMAGE_NO_VIDEO_PHRASES = (
 )
 
 INSTAGRAM_IMAGE_MARKER = "[INSTAGRAM_IMAGE]"
+INSTAGRAM_LINK_MARKER = "[INSTAGRAM_LINK]"
 INFLIGHT_MARKER = "[INFLIGHT]"
 REDDIT_GIF_MARKER = "[REDDIT_GIF]"
 REDDIT_IMAGE_MARKER = "[REDDIT_IMAGE]"
@@ -451,6 +452,7 @@ TWITTER_PROBE_CACHE_TTL = 10 * 60
 FXTWITTER_API_TIMEOUT = 8
 INSTAGRAM_MIRROR_PROBE_TIMEOUT = 8
 INSTAGRAM_MIRROR_CACHE_TTL = 10 * 60
+INSTAGRAM_MIRROR_RECHECK_DELAY = 1.5
 PROBE_FAILURE_CACHE_TTL = 2 * 60
 # Embed-proxy mirrors tried in order; first one that reports media wins.
 # oginstagram is the offload backend itself; zzinstagram fronts the same one
@@ -1355,6 +1357,33 @@ def rewrite_instagram_image_url(url: str, log_text: str) -> str | None:
     ):
         return replace_hostname(url, INSTAGRAM_MIRROR_HOST)
     return None
+
+
+def rewrite_instagram_link_url(url: str, log_text: str) -> str | None:
+    if (
+        INSTAGRAM_LINK_MARKER in log_text.splitlines()
+        and _is_supported_instagram_post_url(url)
+    ):
+        return replace_hostname(url, INSTAGRAM_MIRROR_HOST)
+    return None
+
+
+async def send_instagram_link_rewrite(message: discord.Message, url: str, log_text: str) -> bool:
+    rewritten = rewrite_instagram_link_url(url, log_text)
+    if not rewritten:
+        return False
+    try:
+        await message.channel.send(rewritten)
+    except discord.HTTPException as e:
+        log.warning("[cove] Failed to send Instagram link rewrite: %s", e)
+        return False
+    try:
+        await message.delete()
+    except discord.Forbidden as e:
+        log.info("[cove] Could not delete original Instagram link message: %s", e)
+    except discord.HTTPException as e:
+        log.warning("[cove] Failed to delete original Instagram link message: %s", e)
+    return True
 
 
 async def send_instagram_image_rewrite(message: discord.Message, url: str, log_text: str) -> bool:
@@ -2543,7 +2572,7 @@ async def _instagram_mirror_media_from_host(url: str, host: str) -> tuple[str | 
             # The mirror intermittently omits og:video while og:image still
             # points at the video's thumbnail endpoint; dropping the thumbnail
             # param yields the video itself.
-            return "video", urlunparse(parsed._replace(query=urlencode(params)))
+            return "inferred_video", urlunparse(parsed._replace(query=urlencode(params)))
         return "image", image_url
     log.info("[instagram-mirror] No media tags from %s for %s", host, url)
     return None, None
@@ -2552,19 +2581,19 @@ async def _instagram_mirror_media_from_host(url: str, host: str) -> tuple[str | 
 async def _instagram_mirror_media(url: str) -> tuple[str | None, str | None]:
     """Ask the embed-proxy mirrors, in order, what media a post has.
 
-    Returns ("video", media_url), ("image", media_url), ("error", None) when no
-    mirror could be reached, or (None, None) when the mirrors have no media for
-    the post (deleted, private, or restricted).
+    Returns ("video", media_url) for explicit og:video, ("inferred_video", media_url)
+    for a thumbnail-derived video, ("image", media_url), ("error", None) when no
+    mirror could be reached, or (None, None) when the mirrors have no media.
     """
     cache_key = canonical_url_for_key(url)
     cached = _cache_get(_instagram_mirror_cache, cache_key)
     if cached is not None:
         return cached
     image_result = None
-    saw_no_media = False
+    no_media_hosts = []
     for host in INSTAGRAM_MIRROR_HOSTS:
         kind, media_url = await _instagram_mirror_media_from_host(url, host)
-        if kind == "video":
+        if kind in ("video", "inferred_video"):
             if host != INSTAGRAM_MIRROR_HOSTS[0]:
                 log.info("[instagram-mirror] %s served media for %s", host, url)
             _cache_set(_instagram_mirror_cache, cache_key, (kind, media_url), INSTAGRAM_MIRROR_CACHE_TTL)
@@ -2574,11 +2603,22 @@ async def _instagram_mirror_media(url: str) -> tuple[str | None, str | None]:
             # turn a video post into an image verdict.
             image_result = (kind, media_url)
         elif kind is None:
-            saw_no_media = True
+            no_media_hosts.append(host)
+    if image_result is None and no_media_hosts:
+        # A cold mirror may answer 200 before its metadata is ready. Only
+        # recheck those hosts, once, before caching an unavailable verdict.
+        await asyncio.sleep(INSTAGRAM_MIRROR_RECHECK_DELAY)
+        for host in no_media_hosts:
+            kind, media_url = await _instagram_mirror_media_from_host(url, host)
+            if kind in ("video", "inferred_video"):
+                _cache_set(_instagram_mirror_cache, cache_key, (kind, media_url), INSTAGRAM_MIRROR_CACHE_TTL)
+                return kind, media_url
+            if kind == "image" and image_result is None:
+                image_result = (kind, media_url)
     if image_result is not None:
         _cache_set(_instagram_mirror_cache, cache_key, image_result, INSTAGRAM_MIRROR_CACHE_TTL)
         return image_result
-    if saw_no_media:
+    if no_media_hosts:
         _cache_set(_instagram_mirror_cache, cache_key, (None, None), INSTAGRAM_PROBE_UNAVAIL_TTL)
         return None, None
     return "error", None
@@ -2747,14 +2787,16 @@ async def download_instagram_via_mirror(url: str, tmp: str) -> tuple[str | None,
     """Fetch post media via the embed-proxy mirrors when direct extraction fails.
 
     Returns ("video", filepath) when a video was saved into tmp, ("image", None)
-    when the post resolves to image media (caller should send the link rewrite),
-    or (None, None) when the mirror has no media either.
+    when the post resolves to image media, or ("link", None) when the mirror
+    supplied explicit og:video but its media file could not be saved. Returns
+    (None, None) for other failures, including failed thumbnail-derived video.
     """
     kind, media_url = await _instagram_mirror_media(url)
     if kind == "image":
         return "image", None
-    if kind != "video" or not media_url:
+    if kind not in ("video", "inferred_video") or not media_url:
         return None, None
+    failure_kind = "link" if kind == "video" else None
     parts = [p for p in urlparse(url).path.split("/") if p]
     shortcode = _sanitize_filename(parts[-1]) if parts else "video"
     filepath = str(Path(tmp) / f"instagram_{shortcode}.mp4")
@@ -2769,12 +2811,12 @@ async def download_instagram_via_mirror(url: str, tmp: str) -> tuple[str | None,
             content_type = (resp.content_type or "").lower()
             if resp.status != 200:
                 log.info("[instagram-mirror-fallback] HTTP %d for %s", resp.status, url)
-                return None, None
+                return failure_kind, None
             # vxinstagram serves mp4 as application/octet-stream; only reject
             # clearly non-media responses like HTML error/ad pages.
             if "video" not in content_type and content_type not in ("application/octet-stream", "binary/octet-stream"):
                 log.info("[instagram-mirror-fallback] Non-video response (%s) for %s", content_type, url)
-                return None, None
+                return failure_kind, None
             max_bytes = MAX_FILESIZE_MB * 1024 * 1024
             size = 0
             with open(filepath, "wb") as f:
@@ -2782,15 +2824,15 @@ async def download_instagram_via_mirror(url: str, tmp: str) -> tuple[str | None,
                     size += len(chunk)
                     if size > max_bytes:
                         log.info("[instagram-mirror-fallback] Video exceeded %dMB cap for %s", MAX_FILESIZE_MB, url)
-                        return None, None
+                        return failure_kind, None
                     f.write(chunk)
         if size == 0:
-            return None, None
+            return failure_kind, None
         log.info("[instagram-mirror-fallback] Downloaded %.1f MB for %s", size / (1024 * 1024), url)
         return "video", filepath
     except Exception as e:
         log.warning("[instagram-mirror-fallback] Download failed (%s) for %s", e, url)
-        return None, None
+        return failure_kind, None
 
 
 async def instagram_is_image_post(url: str) -> bool:
@@ -3612,6 +3654,12 @@ async def download_and_compress(
             log.info("[cove] Instagram extraction failed, mirror video fallback succeeded: %s", url)
             _log.append("[INFO] Downloaded via instagram7 mirror fallback.")
             code = 0
+        elif kk_kind == "link" and _is_supported_instagram_post_url(url):
+            log.info("[cove] Instagram mirror verified video but download failed, sending link: %s", url)
+            _log.append(INSTAGRAM_LINK_MARKER)
+            _log.append("[NOVIDEO]")
+            shutil.rmtree(tmp, ignore_errors=True)
+            return None, "\n".join(_log)
         elif kk_kind == "image":
             log.info("[cove] Instagram extraction failed, mirror has image media, sending rewrite: %s", url)
             _log.append(INSTAGRAM_IMAGE_MARKER)
@@ -4968,6 +5016,8 @@ class CoveBot(discord.Client):
                 await message.remove_reaction("\u23f3", self.user)
             except discord.HTTPException:
                 pass
+            if await send_instagram_link_rewrite(message, url, log_text):
+                return
             if await send_instagram_image_rewrite(message, url, log_text):
                 return
             vx_url = reddit_vxreddit_url_from_log(log_text)
@@ -5200,6 +5250,10 @@ async def download_cmd(
             await interaction.followup.send(
                 "\u23f3 That link is already being processed - the result will be posted shortly."
             )
+            return
+        instagram_link = rewrite_instagram_link_url(url, log_text)
+        if instagram_link:
+            await interaction.followup.send(instagram_link)
             return
         instagram_rewrite = rewrite_instagram_image_url(url, log_text)
         if instagram_rewrite:

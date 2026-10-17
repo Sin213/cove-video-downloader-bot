@@ -211,7 +211,7 @@ Friend server mode pings users who were tagged in the original message, adds the
 - `/neet` (friend server) — exempt your next message from auto-download and deletion
 - `/download` now handles Reddit image and gif posts (reposted as media), not just videos
 - Instagram and Reddit galleries are posted as native multi-image attachments
-- Image-only Instagram posts and reels are rewritten through a mirror chain (instagram7 / vxinstagram / zzinstagram) so they embed instead of erroring; Instagram profile links are silently ignored
+- Image-only Instagram posts and reels are rewritten through a mirror chain (oginstagram / zzinstagram / vxinstagram) so they embed instead of erroring; Instagram profile links are silently ignored
 - Non-video Reddit posts rewrite to an embed-friendly link instead of failing; arazu.io links are retried directly when Reddit returns 403
 - Streamable, Vimeo, and Threads links now auto-download
 

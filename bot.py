@@ -216,6 +216,7 @@ AUTO_DOWNLOAD_DOMAINS = {
 BLACKLISTED_DOMAINS = {
     "kkinstagram.com",
     "instagram7.com",
+    "oginstagram.com",
     "vxinstagram.com",
     "zzinstagram.com",
     "fixupx.com",
@@ -435,9 +436,10 @@ INSTAGRAM_MIRROR_PROBE_TIMEOUT = 8
 INSTAGRAM_MIRROR_CACHE_TTL = 10 * 60
 PROBE_FAILURE_CACHE_TTL = 2 * 60
 # Embed-proxy mirrors tried in order; first one that reports media wins.
-# instagram7 and zzinstagram share the oginstagram offload backend while
-# vxinstagram runs its own, so one backend outage does not kill the chain.
-INSTAGRAM_MIRROR_HOSTS = ("instagram7.com", "vxinstagram.com", "zzinstagram.com")
+# oginstagram is the offload backend itself; zzinstagram fronts the same one
+# and vxinstagram runs its own, so one backend outage does not kill the chain.
+# instagram7.com no longer resolves (NXDOMAIN as of 2026-10-09).
+INSTAGRAM_MIRROR_HOSTS = ("oginstagram.com", "zzinstagram.com", "vxinstagram.com")
 INSTAGRAM_MIRROR_HOST = INSTAGRAM_MIRROR_HOSTS[0]
 INSTAGRAM_MIRROR_DISCORD_UA = "Mozilla/5.0 (compatible; Discordbot/2.0; +https://discordapp.com)"
 CACHE_MAX_ENTRIES = 512
@@ -2585,6 +2587,7 @@ async def fetch_instagram_gallery_image_urls(url: str) -> list[str]:
             api_url,
             timeout=aiohttp.ClientTimeout(total=INSTAGRAM_GALLERY_TIMEOUT),
             headers=headers,
+            allow_redirects=False,  # logged-out sessions 302 to the login page
         ) as resp:
             if resp.status != 200:
                 log.info("[instagram-gallery] API returned %d for %s", resp.status, url)
@@ -2698,7 +2701,7 @@ async def send_instagram_gallery(message: discord.Message, url: str) -> bool:
 
 
 async def download_instagram_via_mirror(url: str, tmp: str) -> tuple[str | None, str | None]:
-    """Fetch post media via the instagram7 embed proxy when direct extraction fails.
+    """Fetch post media via the embed-proxy mirrors when direct extraction fails.
 
     Returns ("video", filepath) when a video was saved into tmp, ("image", None)
     when the post resolves to image media (caller should send the link rewrite),

@@ -32,6 +32,7 @@ Anything yt-dlp supports, with auto-download triggered for:
 - Reddit (videos, image posts, gifs, and galleries; arazu.io links get a direct retry when Reddit 403s)
 - TikTok
 - Instagram (videos, reels, image posts, and galleries; profile links are ignored)
+- Facebook Reels (reel links only)
 - Threads
 - Twitch (incl. clips)
 - Streamable

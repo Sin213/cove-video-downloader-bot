@@ -24,7 +24,7 @@ from http.cookiejar import MozillaCookieJar
 from html import unescape as html_unescape
 from pathlib import Path
 from time import monotonic, time
-from urllib.parse import parse_qsl, urlencode, unquote, urlparse, urlunparse
+from urllib.parse import parse_qsl, urlencode, unquote, urlparse, urlsplit, urlunparse
 from dotenv import load_dotenv
 from cove_attribution import friend_post_content, friend_target_post_content
 
@@ -1751,6 +1751,24 @@ def parse_timestamp(ts: str) -> float | None:
     return None
 
 
+def is_facebook_reel_url(url: str) -> bool:
+    """Allow only direct Reel links on Facebook's two supported hosts."""
+    try:
+        parsed = urlsplit(url)
+        if parsed.scheme not in ("http", "https"):
+            return False
+        if parsed.hostname not in ("facebook.com", "www.facebook.com"):
+            return False
+        if parsed.username is not None or parsed.password is not None:
+            return False
+        port = parsed.port
+        if port is not None and port != (80 if parsed.scheme == "http" else 443):
+            return False
+        return re.fullmatch(r"/reel/[0-9]{1,32}/?", parsed.path) is not None
+    except ValueError:
+        return False
+
+
 def is_instagram_noncontent_url(url: str) -> bool:
     """True for Instagram links that are not a specific post/reel/story, e.g.
     profile pages (/username), profile tabs (/username/reels), or bare instagram.com."""
@@ -1783,7 +1801,7 @@ def extract_supported_url(content: str) -> str | None:
         if is_instagram_noncontent_url(url):
             log.info("[cove] Ignoring Instagram profile/non-post link: %s", url)
             continue
-        if host_matches(host, AUTO_DOWNLOAD_DOMAINS):
+        if is_facebook_reel_url(url) or host_matches(host, AUTO_DOWNLOAD_DOMAINS):
             return url
     return None
 

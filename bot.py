@@ -1199,7 +1199,10 @@ def _sweep_orphaned_tmpdirs(min_age_seconds: float = 900) -> None:
 # ── Hostname helpers ────────────────────────────────────────────────────────────
 
 def hostname_for(url: str) -> str:
-    host = (urlparse(url).hostname or "").lower()
+    try:
+        host = (urlparse(url).hostname or "").lower()
+    except ValueError:
+        return ""
     if host.startswith("www."):
         host = host[4:]
     return host
@@ -1789,6 +1792,10 @@ def extract_supported_url(content: str) -> str | None:
     for match in URL_RE.finditer(content):
         url = match.group(0).rstrip(").,>;:!?'\"]}")
         if len(url) > MAX_URL_LENGTH:
+            continue
+        try:
+            urlparse(url).hostname
+        except ValueError:
             continue
         host = hostname_for(url)
         if host_matches(host, BLACKLISTED_DOMAINS):

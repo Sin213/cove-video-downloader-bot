@@ -3061,9 +3061,24 @@ def reddit_api_url(url: str) -> str:
     return urlunparse(("https", "www.reddit.com", path, "", "limit=1", ""))
 
 
+def is_reddit_share_url(url: str) -> bool:
+    """True only for Reddit URLs whose path starts with a /r/.../s/... route."""
+    if re.search(r"[\x00-\x20\x7f]", url):
+        return False
+    try:
+        parsed = urlparse(url)
+    except ValueError:
+        return False
+    return (
+        parsed.scheme in ("http", "https")
+        and re.fullmatch(r"(?:[a-z0-9-]+\.)*reddit\.com", parsed.netloc, re.I | re.A) is not None
+        and re.match(r"/r/[^/]+/s/[^/?#]+", parsed.path) is not None
+    )
+
+
 async def resolve_reddit_shortlink(url: str) -> str:
     """Resolve a Reddit /s/ share shortlink to the real /comments/ URL."""
-    if not REDDIT_SHORT_RE.search(url):
+    if not is_reddit_share_url(url):
         return url
 
     cached = _cache_get(_reddit_shortlink_cache, url)

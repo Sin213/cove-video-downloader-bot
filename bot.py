@@ -1589,7 +1589,10 @@ def reddit_gallery_image_urls_from_post(post: dict) -> list[str]:
 
 
 def _is_valid_reddit_gallery_url(image_url: str) -> bool:
-    parsed = urlparse(image_url)
+    try:
+        parsed = urlparse(image_url)
+    except ValueError:
+        return False
     if parsed.scheme != "https" or hostname_for(image_url) not in REDDIT_IMAGE_HOSTS:
         return False
     ext = parsed.path.rsplit(".", 1)[-1].lower()

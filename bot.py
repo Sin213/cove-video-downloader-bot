@@ -1427,7 +1427,10 @@ def reddit_vxreddit_url_from_log(log_text: str) -> str | None:
 def reddit_media_url_from_text(text: str, extensions: set[str]) -> str | None:
     for match in URL_RE.finditer(unquote(text)):
         url = match.group(0).rstrip(").,>;:!?'\"]}")
-        parsed = urlparse(url)
+        try:
+            parsed = urlparse(url)
+        except ValueError:
+            continue
         ext = parsed.path.rsplit(".", 1)[-1].lower()
         if hostname_for(url) in REDDIT_IMAGE_HOSTS and ext in extensions:
             return url
@@ -1437,7 +1440,11 @@ def reddit_media_url_from_text(text: str, extensions: set[str]) -> str | None:
             continue
         for part in parsed.query.split("&"):
             key, _, value = part.partition("=")
-            ext = urlparse(value).path.rsplit(".", 1)[-1].lower()
+            try:
+                parsed_value = urlparse(value)
+            except ValueError:
+                continue
+            ext = parsed_value.path.rsplit(".", 1)[-1].lower()
             if key == "url" and ext in extensions:
                 return value
     return None

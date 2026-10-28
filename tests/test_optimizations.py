@@ -1792,6 +1792,56 @@ def test_send_file_with_retry_retries_timeout():
     asyncio.run(runner())
 
 
+def test_send_file_with_retry_retries_connection_reset():
+    import aiohttp
+
+    call_count = 0
+
+    async def fake_send(*, file, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count < 2:
+            raise aiohttp.ClientOSError(104, "Connection reset by peer")
+        return "sent"
+
+    async def runner():
+        with tempfile.NamedTemporaryFile(delete=False) as f:
+            f.write(b"fake")
+            path = f.name
+        try:
+            result = await send_file_with_retry(fake_send, path, backoff_seconds=(0.0,))
+            assert result == "sent"
+            assert call_count == 2
+        finally:
+            os.unlink(path)
+
+    asyncio.run(runner())
+
+
+def test_send_file_with_retry_raises_connection_reset_after_max_attempts():
+    import aiohttp
+
+    call_count = 0
+
+    async def fake_send(*, file, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        raise aiohttp.ClientOSError(104, "Connection reset by peer")
+
+    async def runner():
+        with tempfile.NamedTemporaryFile(delete=False) as f:
+            f.write(b"fake")
+            path = f.name
+        try:
+            with pytest.raises(aiohttp.ClientOSError):
+                await send_file_with_retry(fake_send, path, backoff_seconds=(0.0,))
+            assert call_count == 3
+        finally:
+            os.unlink(path)
+
+    asyncio.run(runner())
+
+
 # ── PR C: info_dict cache ────────────────────────────────────────────────────
 
 

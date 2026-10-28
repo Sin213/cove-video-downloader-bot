@@ -2243,7 +2243,8 @@ async def send_file_with_retry(
 ):
     """Send a file via ``send_method(file=discord.File(file_path), **send_kwargs)`` with retries.
 
-    Retries on Discord 5xx or asyncio.TimeoutError. Does not retry 4xx.
+    Retries on Discord 5xx, asyncio.TimeoutError, or aiohttp connection errors
+    (e.g. connection reset). Does not retry 4xx.
     The discord.File handle is closed after each attempt to avoid fd leaks.
     """
     kwargs = send_kwargs or {}
@@ -2252,7 +2253,7 @@ async def send_file_with_retry(
         file = discord.File(file_path)
         try:
             return await send_method(file=file, **kwargs)
-        except (discord.HTTPException, asyncio.TimeoutError) as e:
+        except (discord.HTTPException, asyncio.TimeoutError, aiohttp.ClientError) as e:
             last_error = e
             status = getattr(e, "status", None)
             if status is not None and 400 <= status < 500:

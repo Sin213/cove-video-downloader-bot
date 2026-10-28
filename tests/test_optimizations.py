@@ -2377,6 +2377,57 @@ def test_setup_hook_registers_only_sigterm(monkeypatch):
     assert all(signum != signal.SIGINT for signum, _ in handlers)
 
 
+def test_setup_hook_tolerates_loop_without_signal_handlers(monkeypatch):
+    # Windows event loops raise NotImplementedError from add_signal_handler.
+    monkeypatch.setattr(bot, "_client_run_task", None, raising=False)
+    calls = []
+
+    class WindowsLikeLoop:
+        def add_signal_handler(self, signum, callback):
+            calls.append(signum)
+            raise NotImplementedError
+
+        async def run_in_executor(self, executor, function):
+            pass
+
+    async def sync(*args):
+        pass
+
+    def discard_periodic(coro):
+        coro.close()
+
+    async def runner():
+        client = bot.CoveBot()
+        monkeypatch.setattr(asyncio, "get_running_loop", lambda: WindowsLikeLoop())
+        monkeypatch.setattr(bot, "spawn_tracked", discard_periodic)
+        monkeypatch.setattr(client, "_sync_tree_with_timeout", sync)
+        await client.setup_hook()
+        assert bot._client_run_task is asyncio.current_task()
+
+    asyncio.run(runner())
+    assert calls == [signal.SIGTERM]
+
+
+@pytest.mark.skipif(not hasattr(signal, "SIGKILL"), reason="POSIX-only process groups")
+def test_kill_process_group_uses_killpg_when_available(monkeypatch):
+    killed = []
+    proc = MagicMock()
+    proc.pid = 4242
+    monkeypatch.setattr(bot.os, "killpg", lambda pid, sig: killed.append((pid, sig)), raising=False)
+    bot._kill_process_group(proc)
+    assert killed == [(4242, signal.SIGKILL)]
+    proc.kill.assert_not_called()
+
+
+def test_kill_process_group_falls_back_to_kill_without_killpg(monkeypatch):
+    # Windows has no os.killpg (or signal.SIGKILL).
+    proc = MagicMock()
+    proc.pid = 4242
+    monkeypatch.delattr(bot.os, "killpg", raising=False)
+    bot._kill_process_group(proc)
+    proc.kill.assert_called_once_with()
+
+
 def test_capture_before_registration(monkeypatch):
     monkeypatch.setattr(bot, "_client_run_task", None, raising=False)
     monkeypatch.setattr(bot, "_shutdown_requested", False, raising=False)

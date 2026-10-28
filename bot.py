@@ -2293,13 +2293,17 @@ def _sanitize_filename(name: str) -> str:
 def _kill_process_group(proc: asyncio.subprocess.Process) -> None:
     # The child runs in its own session, so killing the group also reaps
     # descendants (yt-dlp's ffmpeg/aria2c helpers) that proc.kill() would miss.
-    try:
-        os.killpg(proc.pid, signal.SIGKILL)
-    except (ProcessLookupError, PermissionError, OSError):
+    # Windows has no process groups (os.killpg/SIGKILL), so it uses proc.kill().
+    if hasattr(os, "killpg"):
         try:
-            proc.kill()
-        except ProcessLookupError:
+            os.killpg(proc.pid, signal.SIGKILL)
+            return
+        except (ProcessLookupError, PermissionError, OSError):
             pass
+    try:
+        proc.kill()
+    except ProcessLookupError:
+        pass
 
 
 async def run_subprocess(
@@ -4848,7 +4852,11 @@ class CoveBot(discord.Client):
             raise RuntimeError("Cove setup_hook has no current asyncio task")
         _client_run_task = task
         loop = asyncio.get_running_loop()
-        loop.add_signal_handler(signal.SIGTERM, _request_shutdown)
+        try:
+            loop.add_signal_handler(signal.SIGTERM, _request_shutdown)
+        except NotImplementedError:
+            # Windows event loops have no signal handlers; Ctrl+C still stops client.run().
+            pass
         await asyncio.get_running_loop().run_in_executor(None, _sweep_orphaned_tmpdirs)
         spawn_tracked(self._periodic_temp_sweep())
         spawn_tracked(self._periodic_cache_flush())

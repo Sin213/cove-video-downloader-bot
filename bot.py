@@ -1798,6 +1798,21 @@ def is_instagram_noncontent_url(url: str) -> bool:
     return True
 
 
+def is_twitch_stream_url(url: str) -> bool:
+    """True for twitch.tv links that are not a clip or VOD (e.g. a live channel page)."""
+    host = hostname_for(url)
+    if host != "twitch.tv" and not host.endswith(".twitch.tv"):
+        return False
+    if host == "clips.twitch.tv":
+        return False
+    parts = [p for p in urlparse(url).path.split("/") if p]
+    if len(parts) >= 2 and parts[0].lower() == "videos":
+        return False
+    if len(parts) >= 3 and parts[1].lower() == "clip":
+        return False
+    return True
+
+
 def extract_supported_url(content: str) -> str | None:
     for match in URL_RE.finditer(content):
         url = match.group(0).rstrip(").,>;:!?'\"]}")
@@ -1817,6 +1832,9 @@ def extract_supported_url(content: str) -> str | None:
             continue
         if is_instagram_noncontent_url(url):
             log.info("[cove] Ignoring Instagram profile/non-post link: %s", url)
+            continue
+        if is_twitch_stream_url(url):
+            log.info("[cove] Ignoring Twitch stream/channel link: %s", url)
             continue
         if is_facebook_reel_url(url) or host_matches(host, AUTO_DOWNLOAD_DOMAINS):
             return url

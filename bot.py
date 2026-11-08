@@ -1939,6 +1939,8 @@ def _check_bot_permissions(channel: discord.abc.GuildChannel, bot_member: discor
 _SUBPROCESS_ENV_NAMES = {
     "PATH", "HOME", "LANG", "SSL_CERT_FILE", "SSL_CERT_DIR",
     "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE",
+    # Windows: Python/Winsock fail to initialise without these.
+    "SYSTEMROOT", "WINDIR", "TEMP", "TMP",
 }
 
 

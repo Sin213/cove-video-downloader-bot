@@ -3273,7 +3273,7 @@ def filename_download(monkeypatch, tmp_path):
 
     def run(kind="video", error=None):
         async def subprocess(cmd, timeout):
-            assert cmd[0] == "yt-dlp"
+            assert cmd[:3] == bot.YTDLP_CMD
             calls.append((cmd, timeout))
             output = Path(cmd[cmd.index("-o") + 1])
             suffix = ".mp3" if kind == "audio" else ".mp4"

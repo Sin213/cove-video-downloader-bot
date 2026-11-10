@@ -48,6 +48,11 @@ except ImportError:
     )
 
 
+# Run yt-dlp from the same interpreter (and venv) as the bot. A bare "yt-dlp" resolves via PATH and can
+# pick up a global install that lacks curl_cffi, which breaks --impersonate.
+YTDLP_CMD = [sys.executable, "-m", "yt_dlp"]
+
+
 def reddit_impersonation_args() -> list[str]:
     return ["--impersonate", "chrome"] if CURL_CFFI_AVAILABLE else []
 
@@ -1303,7 +1308,7 @@ async def _probe_youtube_quality(url: str, requested_quality: str, target_size: 
         info = cached
     else:
         cmd = [
-            "yt-dlp", "--no-config", "--user-agent", YT_DLP_UA,
+            *YTDLP_CMD, "--no-config", "--user-agent", YT_DLP_UA,
             "--no-download",
             "--no-playlist",
             "--dump-json",
@@ -1970,7 +1975,7 @@ def _check_ytdlp_version() -> tuple[bool, str]:
     global _ytdlp_version_status
     try:
         result = subprocess.run(
-            ["yt-dlp", "--version"],
+            [*YTDLP_CMD, "--version"],
             capture_output=True, text=True, timeout=5, env=ENV,
         )
         version = result.stdout.strip()
@@ -2518,7 +2523,7 @@ async def instagram_post_probe(url: str) -> tuple[bool, int | None, str | None]:
         return cached
 
     cmd = [
-        "yt-dlp",
+        *YTDLP_CMD,
         "--no-config",
         "--dump-single-json",
         "--ignore-no-formats",
@@ -3633,7 +3638,7 @@ async def download_and_compress(
                 if youtube_quality is not None:
                     _log.append(f"[INFO] YouTube resolution override: {fitted_quality}p")
 
-        cmd = ["yt-dlp", "--no-config", "--user-agent", YT_DLP_UA]
+        cmd = [*YTDLP_CMD, "--no-config", "--user-agent", YT_DLP_UA]
 
         cmd += [
             "-f", fmt,
@@ -3854,7 +3859,7 @@ async def download_and_compress(
         _log.append(f"[INFO] {orig_mb:.0f}MB over limit — re-downloading at 720p...")
         tmp2 = _make_job_tmpdir()
         cmd_720 = [
-            "yt-dlp", "--no-config", "--user-agent", YT_DLP_UA,
+            *YTDLP_CMD, "--no-config", "--user-agent", YT_DLP_UA,
             "-f", YOUTUBE_QUALITY_FORMATS["720"],
             "--merge-output-format", "mp4",
             "-N", str(YT_DLP_FRAGMENTS),
@@ -3974,7 +3979,7 @@ async def download_and_clip(
         if yt_fmt is not None:
             fmt = yt_fmt
 
-    cmd = ["yt-dlp", "--no-config", "--user-agent", YT_DLP_UA]
+    cmd = [*YTDLP_CMD, "--no-config", "--user-agent", YT_DLP_UA]
 
     cmd += [
         "-f", fmt,
@@ -4132,7 +4137,7 @@ async def download_and_gif(
         if yt_fmt is not None:
             fmt = yt_fmt
 
-    cmd = ["yt-dlp", "--no-config", "--user-agent", YT_DLP_UA]
+    cmd = [*YTDLP_CMD, "--no-config", "--user-agent", YT_DLP_UA]
 
     cmd += [
         "-f", fmt,
@@ -4274,7 +4279,7 @@ async def download_audio(
     try:
         output_template = str(Path(tmp) / YTDLP_OUTPUT_NAME)
 
-        cmd = ["yt-dlp", "--no-config", "--user-agent", YT_DLP_UA]
+        cmd = [*YTDLP_CMD, "--no-config", "--user-agent", YT_DLP_UA]
 
         cmd += [
             "-f", "bestaudio/best",

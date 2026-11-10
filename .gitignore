@@ -17,3 +17,9 @@ cache.db-wal
 AGENTS.md
 runtime_settings.json
 data/
+
+# Local machine setup
+.venv/
+*.log
+start-cove.bat
+refresh_cookies.py

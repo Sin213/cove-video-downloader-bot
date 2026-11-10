@@ -34,7 +34,7 @@ Anything yt-dlp supports, with auto-download triggered for:
 - Instagram (videos, reels, image posts, and galleries; profile links are ignored)
 - Facebook Reels (reel links only)
 - Threads
-- Twitch (incl. clips)
+- Twitch (clips and VODs; live channel/stream links are ignored)
 - Streamable
 - Vimeo
 - arazu.io
@@ -76,8 +76,13 @@ If the file is already under the limit, compression is skipped. Videos over 10 m
 
 ```bash
 sudo pacman -S python ffmpeg
-pip install discord.py python-dotenv yt-dlp yt-dlp-ejs curl_cffi
+python -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt
 ```
+
+On Windows, install Python and ffmpeg, then use `python -m venv .venv`, `.\.venv\Scripts\activate`, and the same `pip install -r requirements.txt`.
+
+Install everything into the same environment that runs the bot. Cove launches yt-dlp through its own Python (`python -m yt_dlp`), so it always uses that environment's yt-dlp and `curl_cffi`, not a global `yt-dlp` on your PATH.
 
 ### 2. Configure your environment
 
@@ -116,6 +121,8 @@ Cookies need write access because downloader tools may update them, and SQLite s
 ```bash
 python bot.py
 ```
+
+On Windows, run it from the project's venv, e.g. `.\.venv\Scripts\python -u bot.py`.
 
 #### Running as a systemd service (recommended for always-on)
 
@@ -199,7 +206,18 @@ Friend server mode pings users who were tagged in the original message, adds the
 
 ---
 
-## Recent Changes (July 2026)
+## Recent Changes
+
+### October - November 2026
+
+- Twitch live channel and stream links are ignored; clips and VODs still auto-download
+- The bot now runs on Windows (no SIGTERM handler or process-group kill required)
+- yt-dlp runs through the bot's own Python, so a global yt-dlp without `curl_cffi` can no longer break Reddit `--impersonate`
+- A 403 on an optional manifest (e.g. Reddit's HLS m3u8) no longer discards a download that succeeded through another format
+- Discord uploads retry on connection resets
+- Reddit share-link resolution only accepts real Reddit URLs, and malformed URLs from Reddit are handled without errors
+
+### July 2026
 
 **Features**
 

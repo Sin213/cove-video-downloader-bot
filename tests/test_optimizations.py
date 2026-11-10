@@ -3549,3 +3549,19 @@ def test_s18_true_no_media_phrases_still_classify_as_novideo(monkeypatch, tmp_pa
     _, log_text = _s18_run(monkeypatch, tmp_path, kind, 1, out)
     assert "[NOVIDEO]" in log_text
     assert "[ERROR]" not in log_text
+
+
+def test_has_fatal_403_ignores_manifest_fallback_warning():
+    out = (
+        "WARNING: [Reddit] 1xsxtln: Failed to download m3u8 information: HTTP Error 403: Forbidden\n"
+        "[Merger] Merging formats into \"x.mp4\"\n"
+    )
+    assert bot._has_fatal_403(out) is False
+
+
+def test_has_fatal_403_detects_real_failures():
+    assert bot._has_fatal_403("[download] Got error: HTTP Error 403: Forbidden") is True
+    assert bot._has_fatal_403(
+        "WARNING: Failed to download m3u8 information: HTTP Error 403: Forbidden\n"
+        "ERROR: unable to download video data: HTTP Error 403: Forbidden"
+    ) is True

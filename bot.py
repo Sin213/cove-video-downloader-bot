@@ -53,6 +53,18 @@ except ImportError:
 YTDLP_CMD = [sys.executable, "-m", "yt_dlp"]
 
 
+# yt-dlp logs a 403 on an optional manifest (e.g. Reddit's HLS m3u8) as a WARNING and falls back to another
+# format, so that line alone doesn't mean the download failed.
+_MANIFEST_403_RE = re.compile(r"Failed to download (?:m3u8|MPD|DASH|HLS)[^\n]*HTTP Error 403", re.IGNORECASE)
+
+
+def _has_fatal_403(out: str) -> bool:
+    return any(
+        "HTTP Error 403" in line and not _MANIFEST_403_RE.search(line)
+        for line in out.splitlines()
+    )
+
+
 def reddit_impersonation_args() -> list[str]:
     return ["--impersonate", "chrome"] if CURL_CFFI_AVAILABLE else []
 
@@ -3718,7 +3730,7 @@ async def download_and_compress(
         shutil.rmtree(tmp, ignore_errors=True)
         _log.append(f"[TOOBIG] >{MAX_FILESIZE_MB}MB")
         return None, "\n".join(_log)
-    if code == 0 and "HTTP Error 403" in out:
+    if code == 0 and _has_fatal_403(out):
         log.warning("[cove] yt-dlp exited 0 but reported 403 — partial download, treating as failure.")
         shutil.rmtree(tmp, ignore_errors=True)
         _log.append("[ERROR] Access denied (403). Cookies may be needed or expired.")
